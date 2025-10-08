@@ -1,0 +1,181 @@
+use std.mem;
+use std.types.bool;
+use std.types.string;
+
+use json;
+use state;
+use transport;
+use util;
+
+pub fun send_initialize_response(id: []u8, id_is_string: bool) {
+    val prefix: string = "{\"jsonrpc\":\"2.0\",\"id\":";
+    val suffix: string = ",\"result\":{\"capabilities\":{\"textDocumentSync\":{\"openClose\":true,\"change\":0},\"hoverProvider\":true},\"serverInfo\":{\"name\":\"mach-lsp\",\"version\":\"0.1.0\"}}}";
+
+    var id_data: []u8 = id;
+    var quoted_id: []u8 = []u8{ nil, 0 };
+
+    if (id_is_string) {
+        quoted_id = json_quote(id);
+        id_data = quoted_id;
+    }
+
+    val total: u64 = prefix.length + id_data.length + suffix.length;
+    val buf: *u8 = allocate(total);
+    if (buf == nil) {
+        slice_free(quoted_id);
+        ret;
+    }
+
+    var offset: u64 = 0;
+    mem_copy(buf + offset, prefix.data, prefix.length);
+    offset = offset + prefix.length;
+    mem_copy(buf + offset, id_data.data, id_data.length);
+    offset = offset + id_data.length;
+    mem_copy(buf + offset, suffix.data, suffix.length);
+
+    val body: []u8 = []u8{ buf, total };
+    send_message(body);
+    slice_free(body);
+    slice_free(quoted_id);
+}
+
+pub fun send_shutdown_response(id: []u8, id_is_string: bool) {
+    val prefix: string = "{\"jsonrpc\":\"2.0\",\"id\":";
+    val suffix: string = ",\"result\":null}";
+
+    var id_data: []u8 = id;
+    var quoted: []u8 = []u8{ nil, 0 };
+    if (id_is_string) {
+        quoted = json_quote(id);
+        id_data = quoted;
+    }
+
+    val total: u64 = prefix.length + id_data.length + suffix.length;
+    val buf: *u8 = allocate(total);
+    if (buf == nil) {
+        slice_free(quoted);
+        ret;
+    }
+
+    var offset: u64 = 0;
+    mem_copy(buf + offset, prefix.data, prefix.length);
+    offset = offset + prefix.length;
+    mem_copy(buf + offset, id_data.data, id_data.length);
+    offset = offset + id_data.length;
+    mem_copy(buf + offset, suffix.data, suffix.length);
+
+    val body: []u8 = []u8{ buf, total };
+    send_message(body);
+    slice_free(body);
+    slice_free(quoted);
+}
+
+pub fun send_hover_response(state_ptr: *ServerState, id: []u8, id_is_string: bool) {
+    var message: []u8 = []u8{ nil, 0 };
+    val stored_text: []u8 = state_get_text(state_ptr);
+
+    if (stored_text.data == nil || stored_text.length == 0) {
+        message = clone_slice("mach lsp: no document loaded");
+    }
+    or {
+        val prefix: string = "mach lsp: document bytes = ";
+        val len_str: []u8 = u64_to_string(stored_text.length);
+        if (len_str.data == nil && len_str.length == 0) {
+            message = clone_slice("mach lsp: document bytes = ?");
+        }
+        or {
+            val total: u64 = prefix.length + len_str.length;
+            val buf: *u8 = allocate(total);
+            if (buf == nil) {
+                message = clone_slice("mach lsp: document bytes = ?");
+            }
+            or {
+                mem_copy(buf, prefix.data, prefix.length);
+                mem_copy(buf + prefix.length, len_str.data, len_str.length);
+                message = []u8{ buf, total };
+            }
+
+            slice_free(len_str);
+        }
+    }
+
+    val quoted_message: []u8 = json_quote(message);
+    slice_free(message);
+
+    var id_data: []u8 = id;
+    var quoted_id: []u8 = []u8{ nil, 0 };
+    if (id_is_string) {
+        quoted_id = json_quote(id);
+        id_data = quoted_id;
+    }
+
+    val prefix: string = "{\"jsonrpc\":\"2.0\",\"id\":";
+    val middle: string = ",\"result\":{\"contents\":{\"kind\":\"markdown\",\"value\":";
+    val suffix: string = "}}}";
+
+    val total: u64 = prefix.length + id_data.length + middle.length + quoted_message.length + suffix.length;
+    val buf: *u8 = allocate(total);
+    if (buf == nil) {
+        slice_free(quoted_id);
+        slice_free(quoted_message);
+        ret;
+    }
+
+    var offset: u64 = 0;
+    mem_copy(buf + offset, prefix.data, prefix.length);
+    offset = offset + prefix.length;
+    mem_copy(buf + offset, id_data.data, id_data.length);
+    offset = offset + id_data.length;
+    mem_copy(buf + offset, middle.data, middle.length);
+    offset = offset + middle.length;
+    mem_copy(buf + offset, quoted_message.data, quoted_message.length);
+    offset = offset + quoted_message.length;
+    mem_copy(buf + offset, suffix.data, suffix.length);
+
+    val body: []u8 = []u8{ buf, total };
+    send_message(body);
+    slice_free(body);
+    slice_free(quoted_id);
+    slice_free(quoted_message);
+}
+
+pub fun send_error_response(id: []u8, id_is_string: bool) {
+    val error_message: []u8 = "method not supported";
+    val quoted_message: []u8 = json_quote(error_message);
+
+    var id_data: []u8 = id;
+    var quoted_id: []u8 = []u8{ nil, 0 };
+    if (id_is_string) {
+        quoted_id = json_quote(id);
+        id_data = quoted_id;
+    }
+
+    val prefix: string = "{\"jsonrpc\":\"2.0\",\"id\":";
+    val middle: string = ",\"error\":{\"code\":-32601,\"message\":";
+    val suffix: string = "}}";
+
+    val total: u64 = prefix.length + id_data.length + middle.length + quoted_message.length + suffix.length;
+    val buf: *u8 = allocate(total);
+    if (buf == nil) {
+        slice_free(quoted_id);
+        slice_free(quoted_message);
+        ret;
+    }
+
+    var offset: u64 = 0;
+    mem_copy(buf + offset, prefix.data, prefix.length);
+    offset = offset + prefix.length;
+    mem_copy(buf + offset, id_data.data, id_data.length);
+    offset = offset + id_data.length;
+    mem_copy(buf + offset, middle.data, middle.length);
+    offset = offset + middle.length;
+    mem_copy(buf + offset, quoted_message.data, quoted_message.length);
+    offset = offset + quoted_message.length;
+    mem_copy(buf + offset, suffix.data, suffix.length);
+
+    val body: []u8 = []u8{ buf, total };
+    send_message(body);
+    slice_free(body);
+    slice_free(quoted_id);
+    slice_free(quoted_message);
+}

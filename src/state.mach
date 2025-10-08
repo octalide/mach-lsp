@@ -1,0 +1,61 @@
+use std.types.bool;
+use std.types.string;
+
+use util;
+
+pub str ServerState {
+    uri_data: *u8;
+    uri_len: u64;
+    text_data: *u8;
+    text_len: u64;
+    shutdown_requested: bool;
+    running: bool;
+    exit_status: i32;
+}
+
+pub fun state_init(state: *ServerState) {
+    state->uri_data = nil;
+    state->uri_len = 0;
+    state->text_data = nil;
+    state->text_len = 0;
+    state->shutdown_requested = false;
+    state->running = true;
+    state->exit_status = 0;
+}
+
+pub fun state_get_uri(state: *ServerState) []u8 {
+    ret []u8{ state->uri_data, state->uri_len };
+}
+
+pub fun state_clear_uri(state: *ServerState) {
+    state->uri_data = nil;
+    state->uri_len = 0;
+}
+
+pub fun state_replace_uri(state: *ServerState, value: []u8) {
+    slice_free(state_get_uri(state));
+    state->uri_data = value.data;
+    state->uri_len = value.length;
+}
+
+pub fun state_get_text(state: *ServerState) []u8 {
+    ret []u8{ state->text_data, state->text_len };
+}
+
+pub fun state_clear_text(state: *ServerState) {
+    state->text_data = nil;
+    state->text_len = 0;
+}
+
+pub fun state_replace_text(state: *ServerState, value: []u8) {
+    slice_free(state_get_text(state));
+    state->text_data = value.data;
+    state->text_len = value.length;
+}
+
+pub fun state_dnit(state: *ServerState) {
+    slice_free(state_get_uri(state));
+    state_clear_uri(state);
+    slice_free(state_get_text(state));
+    state_clear_text(state);
+}

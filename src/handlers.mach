@@ -1,0 +1,139 @@
+use std.types.bool;
+
+use json;
+use protocol;
+use state;
+use util;
+
+fun handle_initialize(state_ptr: *ServerState, body: []u8) {
+    var id_is_string: bool = false;
+    var id: []u8 = json_extract_number(body, "\"id\"");
+    if (id.data == nil && id.length == 0) {
+        id = json_extract_string(body, "\"id\"");
+        if (id.data != nil || id.length > 0) {
+            id_is_string = true;
+        }
+    }
+
+    if (id.data != nil || id.length > 0) {
+        send_initialize_response(id, id_is_string);
+    }
+
+    state_clear_uri(state_ptr);
+    state_clear_text(state_ptr);
+    state_ptr->shutdown_requested = false;
+    state_ptr->exit_status = 0;
+
+    slice_free(id);
+}
+
+fun handle_shutdown(state_ptr: *ServerState, body: []u8) {
+    var id_is_string: bool = false;
+    var id: []u8 = json_extract_number(body, "\"id\"");
+    if (id.data == nil && id.length == 0) {
+        id = json_extract_string(body, "\"id\"");
+        if (id.data != nil || id.length > 0) {
+            id_is_string = true;
+        }
+    }
+
+    if (id.data != nil || id.length > 0) {
+        send_shutdown_response(id, id_is_string);
+    }
+
+    slice_free(id);
+    state_ptr->shutdown_requested = true;
+}
+
+fun handle_did_open(state_ptr: *ServerState, body: []u8) {
+    val anchor: []u8 = "\"textDocument\"";
+    val uri: []u8 = json_extract_after(body, anchor, "\"uri\"");
+    if (uri.data != nil || uri.length > 0) {
+        state_replace_uri(state_ptr, uri);
+    }
+    or {
+        slice_free(uri);
+    }
+
+    val text: []u8 = json_extract_after(body, anchor, "\"text\"");
+    if (text.data != nil || text.length > 0) {
+        state_replace_text(state_ptr, text);
+    }
+    or {
+        slice_free(text);
+    }
+}
+
+fun handle_hover(state_ptr: *ServerState, body: []u8) {
+    var id_is_string: bool = false;
+    var id: []u8 = json_extract_number(body, "\"id\"");
+    if (id.data == nil && id.length == 0) {
+        id = json_extract_string(body, "\"id\"");
+        if (id.data != nil || id.length > 0) {
+            id_is_string = true;
+        }
+    }
+
+    if (id.data != nil || id.length > 0) {
+        send_hover_response(state_ptr, id, id_is_string);
+    }
+
+    slice_free(id);
+}
+
+fun handle_exit(state_ptr: *ServerState) {
+    if (state_ptr->shutdown_requested == false) {
+        state_ptr->exit_status = 1;
+    }
+
+    state_ptr->running = false;
+}
+
+fun handle_unknown(state_ptr: *ServerState, body: []u8) {
+    var id_is_string: bool = false;
+    var id: []u8 = json_extract_number(body, "\"id\"");
+    if (id.data == nil && id.length == 0) {
+        id = json_extract_string(body, "\"id\"");
+        if (id.data != nil || id.length > 0) {
+            id_is_string = true;
+        }
+    }
+
+    if (id.data == nil && id.length == 0) {
+        ret;
+    }
+
+    send_error_response(id, id_is_string);
+    slice_free(id);
+}
+
+pub fun handle_message(state_ptr: *ServerState, body: []u8) {
+    val method: []u8 = json_extract_string(body, "\"method\"");
+    if (method.data == nil && method.length == 0) {
+        slice_free(method);
+        ret;
+    }
+
+    if (slice_equals(method, "initialize")) {
+        handle_initialize(state_ptr, body);
+    }
+    or (slice_equals(method, "shutdown")) {
+        handle_shutdown(state_ptr, body);
+    }
+    or (slice_equals(method, "exit")) {
+        handle_exit(state_ptr);
+    }
+    or (slice_equals(method, "textDocument/didOpen")) {
+        handle_did_open(state_ptr, body);
+    }
+    or (slice_equals(method, "textDocument/hover")) {
+        handle_hover(state_ptr, body);
+    }
+    or (slice_equals(method, "initialized")) {
+    }
+    or {
+        handle_unknown(state_ptr, body);
+    }
+
+    slice_free(method);
+}

@@ -1,0 +1,15 @@
+[project]
+name = "mach-lsp"
+version = "0.1.0"
+entrypoint = "main.mach"
+
+[directories]
+src-dir = "src"
+dep-dir = "dep"
+out-dir = "out"
+
+[deps]
+std = { path = "../mach-std", src = "src" }
+
+[modules]
+std = "std"

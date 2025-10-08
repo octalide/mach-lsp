@@ -1,0 +1,157 @@
+use std.io.console;
+use std.mem;
+use std.text.parse;
+use std.types.bool;
+use std.types.string;
+
+use util;
+
+fun parse_content_length(header: []u8) i64 {
+    val key: []u8 = "Content-Length";
+    val idx: i64 = find_subslice(header, key);
+    if (idx < 0) {
+        ret -1;
+    }
+
+    var pos: u64 = (idx::u64) + key.length;
+    var colon_found: bool = false;
+    for (pos < header.length) {
+        val ch: u8 = header[pos];
+        if (ch == ':') {
+            colon_found = true;
+            pos = pos + 1;
+            brk;
+        }
+
+        pos = pos + 1;
+    }
+
+    if (colon_found == false) {
+        ret -1;
+    }
+
+    for (pos < header.length) {
+        val ch: u8 = header[pos];
+        if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') {
+            pos = pos + 1;
+        }
+        or {
+            brk;
+        }
+    }
+
+    if (pos >= header.length) {
+        ret -1;
+    }
+
+    val start: u64 = pos;
+    for (pos < header.length) {
+        val ch: u8 = header[pos];
+        if (ch >= '0' && ch <= '9') {
+            pos = pos + 1;
+        }
+        or {
+            brk;
+        }
+    }
+
+    val digits_len: u64 = pos - start;
+    if (digits_len == 0) {
+        ret -1;
+    }
+
+    val digits: []u8 = []u8{ header.data + start, digits_len };
+    val result: u64 = parse_u64_dec(digits);
+    ret result::i64;
+}
+
+pub fun read_message() []u8 {
+    var header_cap: u64 = 256;
+    var header_buf: *u8 = allocate(header_cap);
+    if (header_buf == nil) {
+        ret []u8{ nil, 0 };
+    }
+
+    var header_len: u64 = 0;
+    for {
+        val got: i64 = read_into(header_buf + header_len, 1);
+        if (got <= 0) {
+            deallocate(header_buf, header_cap);
+            ret []u8{ nil, 0 };
+        }
+
+        header_len = header_len + 1;
+
+        if (header_len == header_cap) {
+            val new_cap: u64 = header_cap + 256;
+            val new_buf: *u8 = reallocate(header_buf, header_cap, new_cap);
+            if (new_buf == nil) {
+                deallocate(header_buf, header_cap);
+                ret []u8{ nil, 0 };
+            }
+
+            header_buf = new_buf;
+            header_cap = new_cap;
+        }
+
+        if (header_len >= 4) {
+            val a: u8 = @(header_buf + header_len - 4);
+            val b: u8 = @(header_buf + header_len - 3);
+            val c: u8 = @(header_buf + header_len - 2);
+            val d: u8 = @(header_buf + header_len - 1);
+            if (a == '\r' && b == '\n' && c == '\r' && d == '\n') {
+                brk;
+            }
+        }
+    }
+
+    val header_slice: []u8 = []u8{ header_buf, header_len };
+    val body_len_i64: i64 = parse_content_length(header_slice);
+    deallocate(header_buf, header_cap);
+
+    if (body_len_i64 <= 0) {
+        ret read_message();
+    }
+
+    val body_len: u64 = body_len_i64::u64;
+    if (body_len == 0) {
+        ret read_message();
+    }
+
+    val body_buf: *u8 = allocate(body_len);
+    if (body_buf == nil) {
+        ret []u8{ nil, 0 };
+    }
+
+    var received: u64 = 0;
+    for (received < body_len) {
+        val chunk: i64 = read_into(body_buf + received, (body_len - received));
+        if (chunk <= 0) {
+            deallocate(body_buf, body_len);
+            ret []u8{ nil, 0 };
+        }
+
+        received = received + (chunk::u64);
+    }
+
+    ret []u8{ body_buf, body_len };
+}
+
+pub fun send_message(body: []u8) {
+    val len_str: []u8 = u64_to_string(body.length);
+
+    print("Content-Length: ");
+    if (len_str.data != nil && len_str.length > 0) {
+        val len_view: string = string{ len_str.data, len_str.length };
+        write_to(STDOUT, len_view);
+    }
+
+    print("\r\n\r\n");
+
+    if (body.data != nil && body.length > 0) {
+        val body_view: string = string{ body.data, body.length };
+        write_to(STDOUT, body_view);
+    }
+
+    slice_free(len_str);
+}

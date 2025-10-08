@@ -1,0 +1,113 @@
+use std.mem;
+use std.types.bool;
+
+pub fun slice_free(s: []u8) {
+    if (s.data == nil || s.length == 0) {
+        ret;
+    }
+
+    deallocate(s.data, s.length);
+}
+
+pub fun clone_slice(src: []u8) []u8 {
+    if (src.length == 0) {
+        ret []u8{ nil, 0 };
+    }
+
+    val buf: *u8 = allocate(src.length);
+    if (buf == nil) {
+        ret []u8{ nil, 0 };
+    }
+
+    mem_copy(buf, src.data, src.length);
+    ret []u8{ buf, src.length };
+}
+
+pub fun slice_equals(a: []u8, b: []u8) bool {
+    if (a.length != b.length) {
+        ret false;
+    }
+
+    var i: u64 = 0;
+    for (i < a.length) {
+        if (a[i] != b[i]) {
+            ret false;
+        }
+
+        i = i + 1;
+    }
+
+    ret true;
+}
+
+pub fun find_subslice(data: []u8, pattern: []u8) i64 {
+    if (pattern.length == 0) {
+        ret 0;
+    }
+
+    if (pattern.length > data.length) {
+        ret -1;
+    }
+
+    var i: u64 = 0;
+    val limit: u64 = data.length - pattern.length;
+    for (i <= limit) {
+        var j: u64 = 0;
+        var match: bool = true;
+        for (j < pattern.length) {
+            if (data[i + j] != pattern[j]) {
+                match = false;
+                brk;
+            }
+
+            j = j + 1;
+        }
+
+        if (match) {
+            ret i::i64;
+        }
+
+        i = i + 1;
+    }
+
+    ret -1;
+}
+
+pub fun u64_to_string(value: u64) []u8 {
+    val cap: u64 = 32;
+    val tmp: *u8 = allocate(cap);
+    if (tmp == nil) {
+        ret []u8{ nil, 0 };
+    }
+
+    val buf: *u8 = allocate(cap);
+    if (buf == nil) {
+        deallocate(tmp, cap);
+        ret []u8{ nil, 0 };
+    }
+
+    if (value == 0) {
+        @(buf) = '0';
+        deallocate(tmp, cap);
+        ret []u8{ buf, 1 };
+    }
+
+    var len: u64 = 0;
+    var v: u64 = value;
+    for (v > 0) {
+        val rem: u64 = v % 10;
+        @(tmp + len) = ('0' + rem)::u8;
+        len = len + 1;
+        v = v / 10;
+    }
+
+    var i: u64 = 0;
+    for (i < len) {
+        val ch: u8 = @(tmp + (len - 1 - i));
+        @(buf + i) = ch;
+        i = i + 1;
+    }
+
+    deallocate(tmp, cap);
+    ret []u8{ buf, len };
+}
