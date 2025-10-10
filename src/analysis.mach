@@ -1,0 +1,380 @@
+use std.system.memory;
+use std.types.bool;
+
+use documents;
+use util;
+
+pub val SYMBOL_ENTRY_BYTES: u64 = 24;
+
+pub val SYMBOL_KIND_NONE: u8 = 0;
+pub val SYMBOL_KIND_FUNCTION: u8 = 1;
+pub val SYMBOL_KIND_VALUE: u8 = 2;
+pub val SYMBOL_KIND_ALIAS: u8 = 3;
+pub val SYMBOL_KIND_STRUCT: u8 = 4;
+pub val SYMBOL_KIND_UNION: u8 = 5;
+
+pub str SymbolEntry {
+    name_start: u64;
+    name_end: u64;
+    kind: u8;
+}
+
+pub str SymbolList {
+    items: *SymbolEntry;
+    count: u64;
+    capacity: u64;
+}
+
+pub fun symbol_list_init(list: *SymbolList) {
+    list->items = nil;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+pub fun symbol_list_dnit(list: *SymbolList) {
+    if (list->items != nil && list->capacity > 0) {
+        val bytes: u64 = list->capacity * SYMBOL_ENTRY_BYTES;
+        deallocate((list->items) :: *u8, bytes);
+    }
+
+    list->items = nil;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+fun symbol_list_reserve(list: *SymbolList, needed: u64) bool {
+    if (needed <= list->capacity) {
+        ret true;
+    }
+
+    var new_cap: u64 = list->capacity;
+    if (new_cap == 0) {
+        new_cap = 8;
+    }
+
+    for (new_cap < needed) {
+        new_cap = new_cap + (new_cap >> 1) + 4;
+    }
+
+    val bytes_new: u64 = new_cap * SYMBOL_ENTRY_BYTES;
+
+    var new_buf: *u8 = nil;
+    if (list->items == nil) {
+        new_buf = allocate(bytes_new);
+    }
+    or {
+        val bytes_old: u64 = list->capacity * SYMBOL_ENTRY_BYTES;
+        new_buf = reallocate((list->items) :: *u8, bytes_old, bytes_new);
+    }
+
+    if (new_buf == nil) {
+        ret false;
+    }
+
+    list->items = new_buf :: *SymbolEntry;
+    list->capacity = new_cap;
+    ret true;
+}
+
+fun symbol_list_push(list: *SymbolList, start: u64, end: u64, kind: u8) bool {
+    if (symbol_list_reserve(list, list->count + 1) == false) {
+        ret false;
+    }
+
+    val entry: *SymbolEntry = list->items + list->count;
+    entry->name_start = start;
+    entry->name_end = end;
+    entry->kind = kind;
+
+    list->count = list->count + 1;
+    ret true;
+}
+
+fun is_ident_start(ch: u8) bool {
+    if (ch >= 'a' && ch <= 'z') { ret true; }
+    if (ch >= 'A' && ch <= 'Z') { ret true; }
+    if (ch == '_') { ret true; }
+    ret false;
+}
+
+fun is_ident_char(ch: u8) bool {
+    if (is_ident_start(ch)) { ret true; }
+    if (ch >= '0' && ch <= '9') { ret true; }
+    ret false;
+}
+
+fun skip_line(data: *u8, length: u64, index: u64) u64 {
+    var i: u64 = index;
+    for (i < length) {
+        if (data[i] == '\n') {
+            ret i + 1;
+        }
+        i = i + 1;
+    }
+
+    ret length;
+}
+
+fun skip_string(data: *u8, length: u64, index: u64) u64 {
+    var i: u64 = index + 1;
+    for (i < length) {
+        val ch: u8 = data[i];
+        if (ch == '\\') {
+            i = i + 2;
+        }
+        or (ch == '"') {
+            ret i + 1;
+        }
+        or {
+            i = i + 1;
+        }
+    }
+
+    ret length;
+}
+
+fun skip_char_literal(data: *u8, length: u64, index: u64) u64 {
+    var i: u64 = index + 1;
+    if (i >= length) {
+        ret length;
+    }
+
+    if (data[i] == '\\') {
+        i = i + 2;
+    }
+    or {
+        i = i + 1;
+    }
+
+    if (i > length) {
+        i = length;
+    }
+
+    if (i < length && data[i] == '\'') {
+        i = i + 1;
+    }
+
+    ret i;
+}
+
+fun token_matches(token: []u8, text: []u8) bool {
+    ret slice_equals(token, text);
+}
+
+fun make_slice(source: *Document, start: u64, end: u64) []u8 {
+    if (source->text.data == nil || end <= start) {
+        ret []u8{ nil, 0 };
+    }
+
+    ret []u8{ source->text.data + start, end - start };
+}
+
+pub fun analyze_collect_symbols(doc: *Document, list: *SymbolList, include_values: bool) bool {
+    val data: *u8 = doc->text.data;
+    val length: u64 = doc->text.length;
+
+    if (data == nil || length == 0) {
+        ret true;
+    }
+
+    var i: u64 = 0;
+    var brace_depth: i64 = 0;
+    var expect_kind: u8 = SYMBOL_KIND_NONE;
+
+    for (i < length) {
+        val ch: u8 = data[i];
+
+        if (ch == '#') {
+            i = skip_line(data, length, i);
+            cnt;
+        }
+
+        if (ch == '"') {
+            i = skip_string(data, length, i);
+            cnt;
+        }
+
+        if (ch == '\'') {
+            i = skip_char_literal(data, length, i);
+            cnt;
+        }
+
+        if (ch == '{') {
+            brace_depth = brace_depth + 1;
+            i = i + 1;
+            cnt;
+        }
+
+        if (ch == '}') {
+            if (brace_depth > 0) {
+                brace_depth = brace_depth - 1;
+            }
+            expect_kind = SYMBOL_KIND_NONE;
+            i = i + 1;
+            cnt;
+        }
+
+        if (ch <= ' ' || ch == ',' || ch == ';') {
+            i = i + 1;
+            cnt;
+        }
+
+        if (is_ident_start(ch) == false) {
+            expect_kind = SYMBOL_KIND_NONE;
+            i = i + 1;
+            cnt;
+        }
+
+        val start: u64 = i;
+        i = i + 1;
+        for (i < length && is_ident_char(data[i])) {
+            i = i + 1;
+        }
+
+        val token: []u8 = []u8{ data + start, i - start };
+
+        if (brace_depth == 0) {
+            if (token_matches(token, "pub")) {
+                cnt;
+            }
+
+            if (token_matches(token, "fun")) {
+                expect_kind = SYMBOL_KIND_FUNCTION;
+                cnt;
+            }
+
+            if (token_matches(token, "def")) {
+                expect_kind = SYMBOL_KIND_ALIAS;
+                cnt;
+            }
+
+            if (token_matches(token, "str")) {
+                expect_kind = SYMBOL_KIND_STRUCT;
+                cnt;
+            }
+
+            if (token_matches(token, "uni")) {
+                expect_kind = SYMBOL_KIND_UNION;
+                cnt;
+            }
+
+            if (include_values && token_matches(token, "val")) {
+                expect_kind = SYMBOL_KIND_VALUE;
+                cnt;
+            }
+
+            if (include_values && token_matches(token, "var")) {
+                expect_kind = SYMBOL_KIND_VALUE;
+                cnt;
+            }
+
+            if (token_matches(token, "use")) {
+                expect_kind = SYMBOL_KIND_NONE;
+                cnt;
+            }
+        }
+
+        if (expect_kind != SYMBOL_KIND_NONE && brace_depth == 0) {
+            if (symbol_list_push(list, start, i, expect_kind) == false) {
+                ret false;
+            }
+
+            expect_kind = SYMBOL_KIND_NONE;
+            cnt;
+        }
+
+        expect_kind = SYMBOL_KIND_NONE;
+    }
+
+    ret true;
+}
+
+pub fun analyze_find_symbol(doc: *Document, name: []u8, info_out: *SymbolEntry, include_values: bool) bool {
+    var list: SymbolList;
+    val list_ptr: *SymbolList = (?list) :: *SymbolList;
+    symbol_list_init(list_ptr);
+
+    if (analyze_collect_symbols(doc, list_ptr, include_values) == false) {
+        symbol_list_dnit(list_ptr);
+        ret false;
+    }
+
+    var found: bool = false;
+    var i: u64 = 0;
+    for (i < list.count) {
+        val entry: *SymbolEntry = list.items + i;
+        val symbol_name: []u8 = make_slice(doc, entry->name_start, entry->name_end);
+        if (slice_equals(symbol_name, name)) {
+            memory_copy((info_out) :: *u8, (entry) :: *u8, SYMBOL_ENTRY_BYTES);
+            found = true;
+            brk;
+        }
+        i = i + 1;
+    }
+
+    symbol_list_dnit(list_ptr);
+    ret found;
+}
+
+pub fun symbol_entry_name(doc: *Document, entry: *SymbolEntry) []u8 {
+    ret make_slice(doc, entry->name_start, entry->name_end);
+}
+
+pub fun symbol_kind_description(kind: u8) []u8 {
+    if (kind == SYMBOL_KIND_FUNCTION) { ret "function"; }
+    if (kind == SYMBOL_KIND_VALUE)    { ret "value"; }
+    if (kind == SYMBOL_KIND_ALIAS)    { ret "type alias"; }
+    if (kind == SYMBOL_KIND_STRUCT)   { ret "struct"; }
+    if (kind == SYMBOL_KIND_UNION)    { ret "union"; }
+    ret "symbol";
+}
+
+pub fun document_identifier_at(doc: *Document, line: u64, character: u64, start_out: *u64, end_out: *u64) []u8 {
+    if (doc->text.data == nil || doc->text.length == 0) {
+        @start_out = 0;
+        @end_out = 0;
+        ret []u8{ nil, 0 };
+    }
+
+    var offset: u64 = document_position_to_offset(doc, line, character);
+    if (offset >= doc->text.length && doc->text.length > 0) {
+        offset = doc->text.length - 1;
+    }
+
+    var index: i64 = offset::i64;
+    if (index < 0) {
+        index = 0;
+    }
+
+    if (index >= doc->text.length::i64) {
+        index = (doc->text.length::i64) - 1;
+    }
+
+    var idx: u64 = index::u64;
+    for (idx > 0 && is_ident_char(doc->text[idx]) == false) {
+        idx = idx - 1;
+        if (is_ident_char(doc->text[idx])) {
+            brk;
+        }
+    }
+
+    if (is_ident_char(doc->text[idx]) == false) {
+        @start_out = idx;
+        @end_out = idx;
+        ret []u8{ nil, 0 };
+    }
+
+    var start: u64 = idx;
+    for (start > 0 && is_ident_char(doc->text[start - 1])) {
+        start = start - 1;
+    }
+
+    var end: u64 = idx + 1;
+    for (end < doc->text.length && is_ident_char(doc->text[end])) {
+        end = end + 1;
+    }
+
+    @start_out = start;
+    @end_out = end;
+    ret make_slice(doc, start, end);
+}

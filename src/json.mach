@@ -1,5 +1,4 @@
-use std.mem;
-use std.text.parse;
+use std.system.memory;
 use std.types.bool;
 
 use util;
@@ -185,7 +184,7 @@ pub fun json_extract_number(data: []u8, key: []u8) []u8 {
         ret []u8{ nil, 0 };
     }
 
-    mem_copy(buf, data.data + start, len);
+    memory_copy(buf, data.data + start, len);
     ret []u8{ buf, len };
 }
 
