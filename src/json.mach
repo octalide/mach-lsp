@@ -3,8 +3,67 @@ use std.types.bool;
 
 use util;
 
+fun json_is_escaped(data: []u8, index: u64) bool {
+    if (index == 0) {
+        ret false;
+    }
+
+    var back: i64 = (index::i64) - 1;
+    var count: u64 = 0;
+
+    for (back >= 0) {
+        val ch: u8 = data[back::u64];
+        if (ch != '\\') {
+            brk;
+        }
+
+        count = count + 1;
+        back = back - 1;
+    }
+
+    if ((count & 1) == 1) {
+        ret true;
+    }
+
+    ret false;
+}
+
+fun json_find_key(data: []u8, key: []u8) i64 {
+    if (key.length == 0) {
+        ret -1;
+    }
+
+    var in_string: bool = false;
+    var i: u64 = 0;
+    for (i < data.length) {
+        val ch: u8 = data[i];
+
+        if (ch == '"') {
+            if (json_is_escaped(data, i) == false) {
+                if (in_string == false) {
+                    if ((i + key.length) <= data.length) {
+                        val slice: []u8 = []u8{ data.data + i, key.length };
+                        if (slice_equals(slice, key)) {
+                            ret i::i64;
+                        }
+                    }
+
+                    in_string = true;
+                }
+                or {
+                    in_string = false;
+                }
+            }
+        }
+
+        i = i + 1;
+    }
+
+    ret -1;
+}
+
 pub fun json_extract_string(data: []u8, key: []u8) []u8 {
-    val idx: i64 = find_subslice(data, key);
+    val idx: i64 = json_find_key(data, key);
     if (idx < 0) {
         ret []u8{ nil, 0 };
     }
@@ -127,7 +186,7 @@ pub fun json_extract_string(data: []u8, key: []u8) []u8 {
 }
 
 pub fun json_extract_number(data: []u8, key: []u8) []u8 {
-    val idx: i64 = find_subslice(data, key);
+    val idx: i64 = json_find_key(data, key);
     if (idx < 0) {
         ret []u8{ nil, 0 };
     }
@@ -189,7 +248,7 @@ pub fun json_extract_number(data: []u8, key: []u8) []u8 {
 }
 
 pub fun json_extract_after(data: []u8, anchor: []u8, key: []u8) []u8 {
-    val idx: i64 = find_subslice(data, anchor);
+    val idx: i64 = json_find_key(data, anchor);
     if (idx < 0) {
         ret []u8{ nil, 0 };
     }

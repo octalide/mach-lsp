@@ -1,15 +1,20 @@
+use std.io.console;
+use std.types.bool;
+
 use handlers;
 use state;
 use transport;
 use util;
-use std.types.bool;
 
 fun main() i32 {
+    write(STDERR, "info: mach lsp starting\n");
     var state_storage: ServerState;
     val server_state: *ServerState = ?state_storage;
+
     state_init(server_state);
 
     for (server_state->running) {
+        write(STDERR, "info: waiting for message\n");
         val body: []u8 = read_message();
         if (body.data == nil && body.length == 0) {
             if (server_state->running == false) {
@@ -19,11 +24,13 @@ fun main() i32 {
             if (server_state->shutdown_requested == false) {
                 server_state->running = false;
                 server_state->exit_status = 1;
+                write(STDERR, "error: input stream closed unexpectedly\n");
             }
 
             brk;
         }
 
+        write(STDERR, "info: handling message\n");
         handle_message(server_state, body);
         slice_free(body);
 
@@ -34,5 +41,6 @@ fun main() i32 {
 
     state_dnit(server_state);
 
+    write(STDERR, "info: mach lsp exiting\n");
     ret server_state->exit_status;
 }

@@ -1,3 +1,4 @@
+use std.io.console;
 use std.text.parse;
 use std.types.bool;
 
@@ -108,6 +109,9 @@ fun handle_initialize(state_ptr: *ServerState, body: []u8) {
 
     if (id.data != nil || id.length > 0) {
         send_initialize_response(id, id_is_string);
+    }
+    or {
+        write(STDERR, "mach-lsp error: initialize missing id\n");
     }
 
     state_clear_uri(state_ptr);
@@ -402,12 +406,14 @@ fun handle_unknown(state_ptr: *ServerState, body: []u8) {
     slice_free(id);
 }
 
-pub fun handle_message(state_ptr: *ServerState, body: []u8) {
+pub fun handle_message(state_ptr: *ServerState, body: []u8) bool {
     val method: []u8 = json_extract_string(body, "\"method\"");
     if (method.data == nil && method.length == 0) {
         slice_free(method);
-        ret;
+        ret true;
     }
+
+    var keep_running: bool = true;
 
     if (slice_equals(method, "initialize")) {
         handle_initialize(state_ptr, body);
@@ -417,6 +423,7 @@ pub fun handle_message(state_ptr: *ServerState, body: []u8) {
     }
     or (slice_equals(method, "exit")) {
         handle_exit(state_ptr);
+        keep_running = false;
     }
     or (slice_equals(method, "textDocument/didOpen")) {
         handle_did_open(state_ptr, body);
@@ -437,4 +444,5 @@ pub fun handle_message(state_ptr: *ServerState, body: []u8) {
     }
 
     slice_free(method);
+    ret keep_running;
 }

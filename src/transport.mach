@@ -6,63 +6,106 @@ use std.types.string;
 
 use util;
 
+# scan the header block to locate a content-length value
 fun parse_content_length(header: []u8) i64 {
-    val key: []u8 = "Content-Length";
-    val idx: i64 = find_subslice(header, key);
-    if (idx < 0) {
-        ret -1;
-    }
+    var line_start: u64 = 0;
+    var i: u64 = 0;
 
-    var pos: u64 = (idx::u64) + key.length;
-    var colon_found: bool = false;
-    for (pos < header.length) {
-        val ch: u8 = header[pos];
-        if (ch == ':') {
-            colon_found = true;
-            pos = pos + 1;
-            brk;
+    for (i <= header.length) {
+        if (i == header.length || header[i] == '\n') {
+            var line_len: u64 = 0;
+            if (i > line_start) {
+                line_len = i - line_start;
+                if (line_len > 0 && header[line_start + line_len - 1] == '\r') {
+                    line_len = line_len - 1;
+                }
+            }
+
+            if (line_len > 0) {
+                val line: []u8 = []u8{ header.data + line_start, line_len };
+
+                var colon_pos: i64 = -1;
+                var j: u64 = 0;
+                for (j < line.length) {
+                    if (line[j] == ':') {
+                        colon_pos = j::i64;
+                        brk;
+                    }
+
+                    j = j + 1;
+                }
+
+                if (colon_pos >= 0) {
+                    val key_slice: []u8 = []u8{ line.data, colon_pos::u64 };
+                    var k: u64 = 0;
+                    var is_content_length: bool = true;
+                    val expected: []u8 = "content-length";
+
+                    if (key_slice.length != expected.length) {
+                        is_content_length = false;
+                    }
+                    or {
+                        for (k < expected.length) {
+                            var ch: u8 = key_slice[k];
+                            if (ch >= 'A' && ch <= 'Z') {
+                                ch = ch + 32;
+                            }
+
+                            if (ch != expected[k]) {
+                                is_content_length = false;
+                                brk;
+                            }
+
+                            k = k + 1;
+                        }
+                    }
+
+                    if (is_content_length) {
+                        var value_start: u64 = (colon_pos::u64) + 1;
+
+                        for (value_start < line.length) {
+                            val ch: u8 = line[value_start];
+                            if (ch == ' ' || ch == '\t') {
+                                value_start = value_start + 1;
+                            }
+                            or {
+                                brk;
+                            }
+                        }
+
+                        if (value_start >= line.length) {
+                            ret -1;
+                        }
+
+                        var value_end: u64 = value_start;
+                        for (value_end < line.length) {
+                            val ch: u8 = line[value_end];
+                            if (ch >= '0' && ch <= '9') {
+                                value_end = value_end + 1;
+                            }
+                            or {
+                                brk;
+                            }
+                        }
+
+                        if (value_end == value_start) {
+                            ret -1;
+                        }
+
+                        val digits: []u8 = []u8{ line.data + value_start, value_end - value_start };
+                        val result: u64 = parse_u64_dec(digits);
+                        ret result::i64;
+                    }
+                }
+            }
+
+            line_start = i + 1;
         }
 
-        pos = pos + 1;
+        i = i + 1;
     }
 
-    if (colon_found == false) {
-        ret -1;
-    }
-
-    for (pos < header.length) {
-        val ch: u8 = header[pos];
-        if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') {
-            pos = pos + 1;
-        }
-        or {
-            brk;
-        }
-    }
-
-    if (pos >= header.length) {
-        ret -1;
-    }
-
-    val start: u64 = pos;
-    for (pos < header.length) {
-        val ch: u8 = header[pos];
-        if (ch >= '0' && ch <= '9') {
-            pos = pos + 1;
-        }
-        or {
-            brk;
-        }
-    }
-
-    val digits_len: u64 = pos - start;
-    if (digits_len == 0) {
-        ret -1;
-    }
-
-    val digits: []u8 = []u8{ header.data + start, digits_len };
-    val result: u64 = parse_u64_dec(digits);
-    ret result::i64;
+    ret -1;
 }
 
 pub fun read_message() []u8 {
@@ -73,16 +116,22 @@ pub fun read_message() []u8 {
     }
 
     var header_len: u64 = 0;
+    # read one byte at a time until header terminator is seen
     for {
         val got: i64 = read(STDIN, header_buf + header_len, 1);
         if (got <= 0) {
             deallocate(header_buf, header_cap);
+            if (header_len == 0) {
+                ret []u8{ nil, 0 };
+            }
+
+            write(STDERR, "error: failed to read header\n");
             ret []u8{ nil, 0 };
         }
 
         header_len = header_len + 1;
 
-        if (header_len == header_cap) {
+        if (header_len >= header_cap) {
             val new_cap: u64 = header_cap + 256;
             val new_buf: *u8 = reallocate(header_buf, header_cap, new_cap);
             if (new_buf == nil) {
@@ -94,12 +143,31 @@ pub fun read_message() []u8 {
             header_cap = new_cap;
         }
 
+        # detect standard crlf-crlf terminator
         if (header_len >= 4) {
             val a: u8 = @(header_buf + header_len - 4);
             val b: u8 = @(header_buf + header_len - 3);
             val c: u8 = @(header_buf + header_len - 2);
             val d: u8 = @(header_buf + header_len - 1);
             if (a == '\r' && b == '\n' && c == '\r' && d == '\n') {
+                brk;
+            }
+        }
+
+        # tolerate bare lf separators
+        if (header_len >= 2) {
+            val x: u8 = @(header_buf + header_len - 2);
+            val y: u8 = @(header_buf + header_len - 1);
+            if (x == '\n' && y == '\n') {
+                brk;
+            }
+        }
+
+        # also handle bare cr separators used by some clients
+        if (header_len >= 2) {
+            val m: u8 = @(header_buf + header_len - 2);
+            val n: u8 = @(header_buf + header_len - 1);
+            if (m == '\r' && n == '\r') {
                 brk;
             }
         }
@@ -110,16 +178,20 @@ pub fun read_message() []u8 {
     deallocate(header_buf, header_cap);
 
     if (body_len_i64 <= 0) {
-        ret read_message();
+        write(STDERR, "error: invalid content length\n");
+        ret []u8{ nil, 0 };
     }
 
     val body_len: u64 = body_len_i64::u64;
     if (body_len == 0) {
-        ret read_message();
+        write(STDERR, "error: zero content length\n");
+        ret []u8{ nil, 0 };
     }
 
+    # grab an exact buffer for the incoming body
     val body_buf: *u8 = allocate(body_len);
     if (body_buf == nil) {
+        write(STDERR, "error: failed to allocate body\n");
         ret []u8{ nil, 0 };
     }
 
@@ -128,13 +200,15 @@ pub fun read_message() []u8 {
         val chunk: i64 = read(STDIN, body_buf + received, (body_len - received));
         if (chunk <= 0) {
             deallocate(body_buf, body_len);
+            write(STDERR, "error: failed to read body\n");
             ret []u8{ nil, 0 };
         }
 
         received = received + (chunk::u64);
     }
 
-    ret []u8{ body_buf, body_len };
+    val body_slice: []u8 = []u8{ body_buf, body_len };
+    ret body_slice;
 }
 
 pub fun send_message(body: []u8) {

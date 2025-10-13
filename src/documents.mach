@@ -1,5 +1,6 @@
 use std.system.memory;
 use std.types.bool;
+use std.types.string;
 
 use util;
 
@@ -245,7 +246,6 @@ fun document_store_reserve(store: *DocumentStore, needed: u64) bool {
         val bytes_old: u64 = store->capacity * DOCUMENT_SLOT_BYTES;
         new_buf = reallocate((store->items) :: *u8, bytes_old, bytes_new);
     }
-
     if (new_buf == nil) {
         ret false;
     }

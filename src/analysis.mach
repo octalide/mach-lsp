@@ -162,7 +162,24 @@ fun token_matches(token: []u8, text: []u8) bool {
 }
 
 fun make_slice(source: *Document, start: u64, end: u64) []u8 {
-    if (source->text.data == nil || end <= start) {
+    if (source->text.data == nil) {
+        ret []u8{ nil, 0 };
+    }
+
+    val text_len: u64 = source->text.length;
+    if (text_len == 0) {
+        ret []u8{ nil, 0 };
+    }
+
+    if (start >= end) {
+        ret []u8{ nil, 0 };
+    }
+
+    if (start >= text_len) {
+        ret []u8{ nil, 0 };
+    }
+
+    if (end > text_len) {
         ret []u8{ nil, 0 };
     }
 

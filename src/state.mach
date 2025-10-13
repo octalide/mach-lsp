@@ -23,6 +23,7 @@ pub fun state_init(state: *ServerState) {
 pub fun state_dnit(state: *ServerState) {
     val store_ptr: *DocumentStore = (?state->documents) :: *DocumentStore;
     document_store_dnit(store_ptr);
+
     slice_free(state->current_uri);
     state->current_uri = []u8{ nil, 0 };
     state->shutdown_requested = false;
