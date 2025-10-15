@@ -11,8 +11,8 @@ fun parse_content_length(header: []u8) i64 {
     var line_start: u64 = 0;
     var i: u64 = 0;
 
-    for (i <= header.length) {
-        if (i == header.length || header[i] == '\n') {
+    for (i <= header.capacity) {
+        if (i == header.capacity || header[i] == '\n') {
             var line_len: u64 = 0;
             if (i > line_start) {
                 line_len = i - line_start;
@@ -26,7 +26,7 @@ fun parse_content_length(header: []u8) i64 {
 
                 var colon_pos: i64 = -1;
                 var j: u64 = 0;
-                for (j < line.length) {
+                for (j < line.capacity) {
                     if (line[j] == ':') {
                         colon_pos = j::i64;
                         brk;
@@ -41,11 +41,11 @@ fun parse_content_length(header: []u8) i64 {
                     var is_content_length: bool = true;
                     val expected: []u8 = "content-length";
 
-                    if (key_slice.length != expected.length) {
+                    if (key_slice.capacity != expected.capacity) {
                         is_content_length = false;
                     }
                     or {
-                        for (k < expected.length) {
+                        for (k < expected.capacity) {
                             var ch: u8 = key_slice[k];
                             if (ch >= 'A' && ch <= 'Z') {
                                 ch = ch + 32;
@@ -63,7 +63,7 @@ fun parse_content_length(header: []u8) i64 {
                     if (is_content_length) {
                         var value_start: u64 = (colon_pos::u64) + 1;
 
-                        for (value_start < line.length) {
+                        for (value_start < line.capacity) {
                             val ch: u8 = line[value_start];
                             if (ch == ' ' || ch == '\t') {
                                 value_start = value_start + 1;
@@ -73,12 +73,12 @@ fun parse_content_length(header: []u8) i64 {
                             }
                         }
 
-                        if (value_start >= line.length) {
+                        if (value_start >= line.capacity) {
                             ret -1;
                         }
 
                         var value_end: u64 = value_start;
-                        for (value_end < line.length) {
+                        for (value_end < line.capacity) {
                             val ch: u8 = line[value_end];
                             if (ch >= '0' && ch <= '9') {
                                 value_end = value_end + 1;
@@ -215,13 +215,13 @@ pub fun send_message(body: []u8) {
     val prefix: []u8 = "Content-Length: ";
     val suffix: []u8 = "\r\n\r\n";
 
-    val len_str: []u8 = u64_to_string(body.length);
+    val len_str: []u8 = u64_to_string(body.capacity);
     var length_digits: []u8 = "0";
-    if (len_str.data != nil && len_str.length > 0) {
+    if (len_str.data != nil && len_str.capacity > 0) {
         length_digits = len_str;
     }
 
-    val header_len: u64 = prefix.length + length_digits.length + suffix.length;
+    val header_len: u64 = prefix.capacity + length_digits.capacity + suffix.capacity;
     val header_buf: *u8 = allocate(header_len);
     if (header_buf == nil) {
         slice_free(len_str);
@@ -229,18 +229,18 @@ pub fun send_message(body: []u8) {
     }
 
     var offset: u64 = 0;
-    memory_copy(header_buf + offset, prefix.data, prefix.length);
-    offset = offset + prefix.length;
-    memory_copy(header_buf + offset, length_digits.data, length_digits.length);
-    offset = offset + length_digits.length;
-    memory_copy(header_buf + offset, suffix.data, suffix.length);
+    memory_copy(header_buf + offset, prefix.data, prefix.capacity);
+    offset = offset + prefix.capacity;
+    memory_copy(header_buf + offset, length_digits.data, length_digits.capacity);
+    offset = offset + length_digits.capacity;
+    memory_copy(header_buf + offset, suffix.data, suffix.capacity);
 
     val header_view: string = string{ header_buf, header_len };
     write(STDOUT, header_view);
     deallocate(header_buf, header_len);
 
-    if (body.data != nil && body.length > 0) {
-        val body_view: string = string{ body.data, body.length };
+    if (body.data != nil && body.capacity > 0) {
+        val body_view: string = string{ body.data, body.capacity };
         write(STDOUT, body_view);
     }
 

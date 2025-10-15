@@ -12,60 +12,60 @@ pub str ServerState {
 }
 
 pub fun state_init(state: *ServerState) {
-    val store_ptr: *DocumentStore = (?state->documents) :: *DocumentStore;
+    val store_ptr: *DocumentStore = (?state.documents) :: *DocumentStore;
     document_store_init(store_ptr);
-    state->current_uri = []u8{ nil, 0 };
-    state->shutdown_requested = false;
-    state->running = true;
-    state->exit_status = 0;
+    state.current_uri = []u8{ nil, 0 };
+    state.shutdown_requested = false;
+    state.running = true;
+    state.exit_status = 0;
 }
 
 pub fun state_dnit(state: *ServerState) {
-    val store_ptr: *DocumentStore = (?state->documents) :: *DocumentStore;
+    val store_ptr: *DocumentStore = (?state.documents) :: *DocumentStore;
     document_store_dnit(store_ptr);
 
-    slice_free(state->current_uri);
-    state->current_uri = []u8{ nil, 0 };
-    state->shutdown_requested = false;
-    state->running = false;
-    state->exit_status = 0;
+    slice_free(state.current_uri);
+    state.current_uri = []u8{ nil, 0 };
+    state.shutdown_requested = false;
+    state.running = false;
+    state.exit_status = 0;
 }
 
 pub fun state_clear_uri(state: *ServerState) {
-    if (state->current_uri.data != nil || state->current_uri.length > 0) {
-        val store_ptr: *DocumentStore = (?state->documents) :: *DocumentStore;
-        document_store_remove(store_ptr, state->current_uri);
-        slice_free(state->current_uri);
+    if (state.current_uri.data != nil || state.current_uri.capacity > 0) {
+        val store_ptr: *DocumentStore = (?state.documents) :: *DocumentStore;
+        document_store_remove(store_ptr, state.current_uri);
+        slice_free(state.current_uri);
     }
 
-    state->current_uri = []u8{ nil, 0 };
+    state.current_uri = []u8{ nil, 0 };
 }
 
 pub fun state_replace_uri(state: *ServerState, uri: []u8) {
-    val store_ptr: *DocumentStore = (?state->documents) :: *DocumentStore;
+    val store_ptr: *DocumentStore = (?state.documents) :: *DocumentStore;
 
-    if (state->current_uri.data != nil || state->current_uri.length > 0) {
-        document_store_remove(store_ptr, state->current_uri);
-        slice_free(state->current_uri);
+    if (state.current_uri.data != nil || state.current_uri.capacity > 0) {
+        document_store_remove(store_ptr, state.current_uri);
+        slice_free(state.current_uri);
     }
 
-    state->current_uri = uri;
+    state.current_uri = uri;
 
     val empty_text: []u8 = []u8{ nil, 0 };
-    val doc: *Document = document_store_upsert(store_ptr, state->current_uri, empty_text);
+    val doc: *Document = document_store_upsert(store_ptr, state.current_uri, empty_text);
     if (doc == nil) {
-        slice_free(state->current_uri);
-        state->current_uri = []u8{ nil, 0 };
+        slice_free(state.current_uri);
+        state.current_uri = []u8{ nil, 0 };
     }
 }
 
 pub fun state_clear_text(state: *ServerState) {
-    if (state->current_uri.data == nil && state->current_uri.length == 0) {
+    if (state.current_uri.data == nil && state.current_uri.capacity == 0) {
         ret;
     }
 
-    val store_ptr: *DocumentStore = (?state->documents) :: *DocumentStore;
-    val doc: *Document = document_store_get(store_ptr, state->current_uri);
+    val store_ptr: *DocumentStore = (?state.documents) :: *DocumentStore;
+    val doc: *Document = document_store_get(store_ptr, state.current_uri);
     if (doc == nil) {
         ret;
     }
@@ -75,13 +75,13 @@ pub fun state_clear_text(state: *ServerState) {
 }
 
 pub fun state_replace_text(state: *ServerState, text: []u8) {
-    if (state->current_uri.data == nil && state->current_uri.length == 0) {
+    if (state.current_uri.data == nil && state.current_uri.capacity == 0) {
         slice_free(text);
         ret;
     }
 
-    val store_ptr: *DocumentStore = (?state->documents) :: *DocumentStore;
-    val doc: *Document = document_store_upsert(store_ptr, state->current_uri, text);
+    val store_ptr: *DocumentStore = (?state.documents) :: *DocumentStore;
+    val doc: *Document = document_store_upsert(store_ptr, state.current_uri, text);
     slice_free(text);
 
     if (doc == nil) {
@@ -90,30 +90,30 @@ pub fun state_replace_text(state: *ServerState, text: []u8) {
 }
 
 pub fun state_get_text(state: *ServerState) []u8 {
-    if (state->current_uri.data == nil && state->current_uri.length == 0) {
+    if (state.current_uri.data == nil && state.current_uri.capacity == 0) {
         ret []u8{ nil, 0 };
     }
 
-    val store_ptr: *DocumentStore = (?state->documents) :: *DocumentStore;
-    val doc: *Document = document_store_get(store_ptr, state->current_uri);
+    val store_ptr: *DocumentStore = (?state.documents) :: *DocumentStore;
+    val doc: *Document = document_store_get(store_ptr, state.current_uri);
     if (doc == nil) {
         ret []u8{ nil, 0 };
     }
 
-    ret doc->text;
+    ret doc.text;
 }
 
 pub fun state_document_upsert(state: *ServerState, uri: []u8, text: []u8) *Document {
-    val store_ptr: *DocumentStore = (?state->documents) :: *DocumentStore;
+    val store_ptr: *DocumentStore = (?state.documents) :: *DocumentStore;
     ret document_store_upsert(store_ptr, uri, text);
 }
 
 pub fun state_document_get(state: *ServerState, uri: []u8) *Document {
-    val store_ptr: *DocumentStore = (?state->documents) :: *DocumentStore;
+    val store_ptr: *DocumentStore = (?state.documents) :: *DocumentStore;
     ret document_store_get(store_ptr, uri);
 }
 
 pub fun state_document_remove(state: *ServerState, uri: []u8) bool {
-    val store_ptr: *DocumentStore = (?state->documents) :: *DocumentStore;
+    val store_ptr: *DocumentStore = (?state.documents) :: *DocumentStore;
     ret document_store_remove(store_ptr, uri);
 }

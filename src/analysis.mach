@@ -26,28 +26,28 @@ pub str SymbolList {
 }
 
 pub fun symbol_list_init(list: *SymbolList) {
-    list->items = nil;
-    list->count = 0;
-    list->capacity = 0;
+    list.items = nil;
+    list.count = 0;
+    list.capacity = 0;
 }
 
 pub fun symbol_list_dnit(list: *SymbolList) {
-    if (list->items != nil && list->capacity > 0) {
-        val bytes: u64 = list->capacity * SYMBOL_ENTRY_BYTES;
-        deallocate((list->items) :: *u8, bytes);
+    if (list.items != nil && list.capacity > 0) {
+        val bytes: u64 = list.capacity * SYMBOL_ENTRY_BYTES;
+        deallocate((list.items) :: *u8, bytes);
     }
 
-    list->items = nil;
-    list->count = 0;
-    list->capacity = 0;
+    list.items = nil;
+    list.count = 0;
+    list.capacity = 0;
 }
 
 fun symbol_list_reserve(list: *SymbolList, needed: u64) bool {
-    if (needed <= list->capacity) {
+    if (needed <= list.capacity) {
         ret true;
     }
 
-    var new_cap: u64 = list->capacity;
+    var new_cap: u64 = list.capacity;
     if (new_cap == 0) {
         new_cap = 8;
     }
@@ -59,34 +59,34 @@ fun symbol_list_reserve(list: *SymbolList, needed: u64) bool {
     val bytes_new: u64 = new_cap * SYMBOL_ENTRY_BYTES;
 
     var new_buf: *u8 = nil;
-    if (list->items == nil) {
+    if (list.items == nil) {
         new_buf = allocate(bytes_new);
     }
     or {
-        val bytes_old: u64 = list->capacity * SYMBOL_ENTRY_BYTES;
-        new_buf = reallocate((list->items) :: *u8, bytes_old, bytes_new);
+        val bytes_old: u64 = list.capacity * SYMBOL_ENTRY_BYTES;
+        new_buf = reallocate((list.items) :: *u8, bytes_old, bytes_new);
     }
 
     if (new_buf == nil) {
         ret false;
     }
 
-    list->items = new_buf :: *SymbolEntry;
-    list->capacity = new_cap;
+    list.items = new_buf :: *SymbolEntry;
+    list.capacity = new_cap;
     ret true;
 }
 
 fun symbol_list_push(list: *SymbolList, start: u64, end: u64, kind: u8) bool {
-    if (symbol_list_reserve(list, list->count + 1) == false) {
+    if (symbol_list_reserve(list, list.count + 1) == false) {
         ret false;
     }
 
-    val entry: *SymbolEntry = list->items + list->count;
-    entry->name_start = start;
-    entry->name_end = end;
-    entry->kind = kind;
+    val entry: *SymbolEntry = list.items + list.count;
+    entry.name_start = start;
+    entry.name_end = end;
+    entry.kind = kind;
 
-    list->count = list->count + 1;
+    list.count = list.count + 1;
     ret true;
 }
 
@@ -162,11 +162,11 @@ fun token_matches(token: []u8, text: []u8) bool {
 }
 
 fun make_slice(source: *Document, start: u64, end: u64) []u8 {
-    if (source->text.data == nil) {
+    if (source.text.data == nil) {
         ret []u8{ nil, 0 };
     }
 
-    val text_len: u64 = source->text.length;
+    val text_len: u64 = source.text.capacity;
     if (text_len == 0) {
         ret []u8{ nil, 0 };
     }
@@ -183,12 +183,12 @@ fun make_slice(source: *Document, start: u64, end: u64) []u8 {
         ret []u8{ nil, 0 };
     }
 
-    ret []u8{ source->text.data + start, end - start };
+    ret []u8{ source.text.data + start, end - start };
 }
 
 pub fun analyze_collect_symbols(doc: *Document, list: *SymbolList, include_values: bool) bool {
-    val data: *u8 = doc->text.data;
-    val length: u64 = doc->text.length;
+    val data: *u8 = doc.text.data;
+    val length: u64 = doc.text.capacity;
 
     if (data == nil || length == 0) {
         ret true;
@@ -320,7 +320,7 @@ pub fun analyze_find_symbol(doc: *Document, name: []u8, info_out: *SymbolEntry, 
     var i: u64 = 0;
     for (i < list.count) {
         val entry: *SymbolEntry = list.items + i;
-        val symbol_name: []u8 = make_slice(doc, entry->name_start, entry->name_end);
+        val symbol_name: []u8 = make_slice(doc, entry.name_start, entry.name_end);
         if (slice_equals(symbol_name, name)) {
             memory_copy((info_out) :: *u8, (entry) :: *u8, SYMBOL_ENTRY_BYTES);
             found = true;
@@ -334,7 +334,7 @@ pub fun analyze_find_symbol(doc: *Document, name: []u8, info_out: *SymbolEntry, 
 }
 
 pub fun symbol_entry_name(doc: *Document, entry: *SymbolEntry) []u8 {
-    ret make_slice(doc, entry->name_start, entry->name_end);
+    ret make_slice(doc, entry.name_start, entry.name_end);
 }
 
 pub fun symbol_kind_description(kind: u8) []u8 {
@@ -347,15 +347,15 @@ pub fun symbol_kind_description(kind: u8) []u8 {
 }
 
 pub fun document_identifier_at(doc: *Document, line: u64, character: u64, start_out: *u64, end_out: *u64) []u8 {
-    if (doc->text.data == nil || doc->text.length == 0) {
+    if (doc.text.data == nil || doc.text.capacity == 0) {
         @start_out = 0;
         @end_out = 0;
         ret []u8{ nil, 0 };
     }
 
     var offset: u64 = document_position_to_offset(doc, line, character);
-    if (offset >= doc->text.length && doc->text.length > 0) {
-        offset = doc->text.length - 1;
+    if (offset >= doc.text.capacity && doc.text.capacity > 0) {
+        offset = doc.text.capacity - 1;
     }
 
     var index: i64 = offset::i64;
@@ -363,31 +363,31 @@ pub fun document_identifier_at(doc: *Document, line: u64, character: u64, start_
         index = 0;
     }
 
-    if (index >= doc->text.length::i64) {
-        index = (doc->text.length::i64) - 1;
+    if (index >= doc.text.capacity::i64) {
+        index = (doc.text.capacity::i64) - 1;
     }
 
     var idx: u64 = index::u64;
-    for (idx > 0 && is_ident_char(doc->text[idx]) == false) {
+    for (idx > 0 && is_ident_char(doc.text[idx]) == false) {
         idx = idx - 1;
-        if (is_ident_char(doc->text[idx])) {
+        if (is_ident_char(doc.text[idx])) {
             brk;
         }
     }
 
-    if (is_ident_char(doc->text[idx]) == false) {
+    if (is_ident_char(doc.text[idx]) == false) {
         @start_out = idx;
         @end_out = idx;
         ret []u8{ nil, 0 };
     }
 
     var start: u64 = idx;
-    for (start > 0 && is_ident_char(doc->text[start - 1])) {
+    for (start > 0 && is_ident_char(doc.text[start - 1])) {
         start = start - 1;
     }
 
     var end: u64 = idx + 1;
-    for (end < doc->text.length && is_ident_char(doc->text[end])) {
+    for (end < doc.text.capacity && is_ident_char(doc.text[end])) {
         end = end + 1;
     }
 

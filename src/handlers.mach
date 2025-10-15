@@ -13,12 +13,12 @@ fun parse_position(body: []u8, line_out: *u64, character_out: *u64) bool {
     val position_anchor: []u8 = "\"position\"";
 
     val line_raw: []u8 = json_extract_after(body, position_anchor, "\"line\"");
-    if (line_raw.data == nil && line_raw.length == 0) {
+    if (line_raw.data == nil && line_raw.capacity == 0) {
         ret false;
     }
 
     val character_raw: []u8 = json_extract_after(body, position_anchor, "\"character\"");
-    if (character_raw.data == nil && character_raw.length == 0) {
+    if (character_raw.data == nil && character_raw.capacity == 0) {
         slice_free(line_raw);
         ret false;
     }
@@ -33,25 +33,25 @@ fun parse_position(body: []u8, line_out: *u64, character_out: *u64) bool {
 
 fun append_location(builder: *SliceBuilder, uri: []u8, start_line: u64, start_char: u64, end_line: u64, end_char: u64) bool {
     val quoted_uri: []u8 = json_quote(uri);
-    if (quoted_uri.data == nil && quoted_uri.length == 0) {
+    if (quoted_uri.data == nil && quoted_uri.capacity == 0) {
         ret false;
     }
 
     val start_line_str: []u8 = u64_to_string(start_line);
-    if (start_line_str.data == nil && start_line_str.length == 0 && start_line != 0) {
+    if (start_line_str.data == nil && start_line_str.capacity == 0 && start_line != 0) {
         slice_free(quoted_uri);
         ret false;
     }
 
     val start_char_str: []u8 = u64_to_string(start_char);
-    if (start_char_str.data == nil && start_char_str.length == 0 && start_char != 0) {
+    if (start_char_str.data == nil && start_char_str.capacity == 0 && start_char != 0) {
         slice_free(quoted_uri);
         slice_free(start_line_str);
         ret false;
     }
 
     val end_line_str: []u8 = u64_to_string(end_line);
-    if (end_line_str.data == nil && end_line_str.length == 0 && end_line != 0) {
+    if (end_line_str.data == nil && end_line_str.capacity == 0 && end_line != 0) {
         slice_free(quoted_uri);
         slice_free(start_line_str);
         slice_free(start_char_str);
@@ -59,7 +59,7 @@ fun append_location(builder: *SliceBuilder, uri: []u8, start_line: u64, start_ch
     }
 
     val end_char_str: []u8 = u64_to_string(end_char);
-    if (end_char_str.data == nil && end_char_str.length == 0 && end_char != 0) {
+    if (end_char_str.data == nil && end_char_str.capacity == 0 && end_char != 0) {
         slice_free(quoted_uri);
         slice_free(start_line_str);
         slice_free(start_char_str);
@@ -100,14 +100,14 @@ fun completion_kind_from_symbol(symbol_kind: u8) u64 {
 fun handle_initialize(state_ptr: *ServerState, body: []u8) {
     var id_is_string: bool = false;
     var id: []u8 = json_extract_number(body, "\"id\"");
-    if (id.data == nil && id.length == 0) {
+    if (id.data == nil && id.capacity == 0) {
         id = json_extract_string(body, "\"id\"");
-        if (id.data != nil || id.length > 0) {
+        if (id.data != nil || id.capacity > 0) {
             id_is_string = true;
         }
     }
 
-    if (id.data != nil || id.length > 0) {
+    if (id.data != nil || id.capacity > 0) {
         send_initialize_response(id, id_is_string);
     }
     or {
@@ -116,8 +116,8 @@ fun handle_initialize(state_ptr: *ServerState, body: []u8) {
 
     state_clear_uri(state_ptr);
     state_clear_text(state_ptr);
-    state_ptr->shutdown_requested = false;
-    state_ptr->exit_status = 0;
+    state_ptr.shutdown_requested = false;
+    state_ptr.exit_status = 0;
 
     slice_free(id);
 }
@@ -125,25 +125,25 @@ fun handle_initialize(state_ptr: *ServerState, body: []u8) {
 fun handle_shutdown(state_ptr: *ServerState, body: []u8) {
     var id_is_string: bool = false;
     var id: []u8 = json_extract_number(body, "\"id\"");
-    if (id.data == nil && id.length == 0) {
+    if (id.data == nil && id.capacity == 0) {
         id = json_extract_string(body, "\"id\"");
-        if (id.data != nil || id.length > 0) {
+        if (id.data != nil || id.capacity > 0) {
             id_is_string = true;
         }
     }
 
-    if (id.data != nil || id.length > 0) {
+    if (id.data != nil || id.capacity > 0) {
         send_shutdown_response(id, id_is_string);
     }
 
     slice_free(id);
-    state_ptr->shutdown_requested = true;
+    state_ptr.shutdown_requested = true;
 }
 
 fun handle_did_open(state_ptr: *ServerState, body: []u8) {
     val anchor: []u8 = "\"textDocument\"";
     val uri: []u8 = json_extract_after(body, anchor, "\"uri\"");
-    if (uri.data != nil || uri.length > 0) {
+    if (uri.data != nil || uri.capacity > 0) {
         state_replace_uri(state_ptr, uri);
     }
     or {
@@ -151,7 +151,7 @@ fun handle_did_open(state_ptr: *ServerState, body: []u8) {
     }
 
     val text: []u8 = json_extract_after(body, anchor, "\"text\"");
-    if (text.data != nil || text.length > 0) {
+    if (text.data != nil || text.capacity > 0) {
         state_replace_text(state_ptr, text);
     }
     or {
@@ -162,14 +162,14 @@ fun handle_did_open(state_ptr: *ServerState, body: []u8) {
 fun handle_hover(state_ptr: *ServerState, body: []u8) {
     var id_is_string: bool = false;
     var id: []u8 = json_extract_number(body, "\"id\"");
-    if (id.data == nil && id.length == 0) {
+    if (id.data == nil && id.capacity == 0) {
         id = json_extract_string(body, "\"id\"");
-        if (id.data != nil || id.length > 0) {
+        if (id.data != nil || id.capacity > 0) {
             id_is_string = true;
         }
     }
 
-    if (id.data != nil || id.length > 0) {
+    if (id.data != nil || id.capacity > 0) {
         send_hover_response(state_ptr, id, id_is_string);
     }
 
@@ -179,20 +179,20 @@ fun handle_hover(state_ptr: *ServerState, body: []u8) {
 fun handle_definition(state_ptr: *ServerState, body: []u8) {
     var id_is_string: bool = false;
     var id: []u8 = json_extract_number(body, "\"id\"");
-    if (id.data == nil && id.length == 0) {
+    if (id.data == nil && id.capacity == 0) {
         id = json_extract_string(body, "\"id\"");
-        if (id.data != nil || id.length > 0) {
+        if (id.data != nil || id.capacity > 0) {
             id_is_string = true;
         }
     }
 
-    if (id.data == nil && id.length == 0) {
+    if (id.data == nil && id.capacity == 0) {
         ret;
     }
 
     val anchor: []u8 = "\"textDocument\"";
     val uri: []u8 = json_extract_after(body, anchor, "\"uri\"");
-    if (uri.data == nil && uri.length == 0) {
+    if (uri.data == nil && uri.capacity == 0) {
         send_null_response(id, id_is_string);
         slice_free(id);
         ret;
@@ -225,7 +225,7 @@ fun handle_definition(state_ptr: *ServerState, body: []u8) {
         (?token_end) :: *u64
     );
 
-    if (identifier.data == nil || identifier.length == 0) {
+    if (identifier.data == nil || identifier.capacity == 0) {
         send_null_response(id, id_is_string);
         slice_free(id);
         slice_free(uri);
@@ -253,7 +253,7 @@ fun handle_definition(state_ptr: *ServerState, body: []u8) {
     val builder_ptr: *SliceBuilder = (?builder) :: *SliceBuilder;
     slice_builder_init(builder_ptr);
 
-    if (append_location(builder_ptr, doc->uri, start_line, start_character, end_line, end_character) == false) {
+    if (append_location(builder_ptr, doc.uri, start_line, start_character, end_line, end_character) == false) {
         slice_builder_dnit(builder_ptr);
         send_null_response(id, id_is_string);
         slice_free(id);
@@ -271,20 +271,20 @@ fun handle_definition(state_ptr: *ServerState, body: []u8) {
 fun handle_completion(state_ptr: *ServerState, body: []u8) {
     var id_is_string: bool = false;
     var id: []u8 = json_extract_number(body, "\"id\"");
-    if (id.data == nil && id.length == 0) {
+    if (id.data == nil && id.capacity == 0) {
         id = json_extract_string(body, "\"id\"");
-        if (id.data != nil || id.length > 0) {
+        if (id.data != nil || id.capacity > 0) {
             id_is_string = true;
         }
     }
 
-    if (id.data == nil && id.length == 0) {
+    if (id.data == nil && id.capacity == 0) {
         ret;
     }
 
     val anchor: []u8 = "\"textDocument\"";
     val uri: []u8 = json_extract_after(body, anchor, "\"uri\"");
-    if (uri.data == nil && uri.length == 0) {
+    if (uri.data == nil && uri.capacity == 0) {
         send_success_response(id, id_is_string, "[]");
         slice_free(id);
         ret;
@@ -321,20 +321,20 @@ fun handle_completion(state_ptr: *ServerState, body: []u8) {
     for (i < list.count && ok) {
         val entry: *SymbolEntry = list.items + i;
         val name_slice: []u8 = symbol_entry_name(doc, entry);
-        if (name_slice.data == nil || name_slice.length == 0) {
+        if (name_slice.data == nil || name_slice.capacity == 0) {
             i = i + 1;
             cnt;
         }
 
         val label: []u8 = json_quote(name_slice);
-        if (label.data == nil && label.length == 0) {
+        if (label.data == nil && label.capacity == 0) {
             ok = false;
             brk;
         }
 
-        val kind_value: u64 = completion_kind_from_symbol(entry->kind);
+        val kind_value: u64 = completion_kind_from_symbol(entry.kind);
         val kind_text: []u8 = u64_to_string(kind_value);
-        if (kind_text.data == nil && kind_text.length == 0 && kind_value != 0) {
+        if (kind_text.data == nil && kind_text.capacity == 0 && kind_value != 0) {
             slice_free(label);
             ok = false;
             brk;
@@ -381,24 +381,24 @@ fun handle_completion(state_ptr: *ServerState, body: []u8) {
 }
 
 fun handle_exit(state_ptr: *ServerState) {
-    if (state_ptr->shutdown_requested == false) {
-        state_ptr->exit_status = 1;
+    if (state_ptr.shutdown_requested == false) {
+        state_ptr.exit_status = 1;
     }
 
-    state_ptr->running = false;
+    state_ptr.running = false;
 }
 
 fun handle_unknown(state_ptr: *ServerState, body: []u8) {
     var id_is_string: bool = false;
     var id: []u8 = json_extract_number(body, "\"id\"");
-    if (id.data == nil && id.length == 0) {
+    if (id.data == nil && id.capacity == 0) {
         id = json_extract_string(body, "\"id\"");
-        if (id.data != nil || id.length > 0) {
+        if (id.data != nil || id.capacity > 0) {
             id_is_string = true;
         }
     }
 
-    if (id.data == nil && id.length == 0) {
+    if (id.data == nil && id.capacity == 0) {
         ret;
     }
 
@@ -408,7 +408,7 @@ fun handle_unknown(state_ptr: *ServerState, body: []u8) {
 
 pub fun handle_message(state_ptr: *ServerState, body: []u8) bool {
     val method: []u8 = json_extract_string(body, "\"method\"");
-    if (method.data == nil && method.length == 0) {
+    if (method.data == nil && method.capacity == 0) {
         slice_free(method);
         ret true;
     }

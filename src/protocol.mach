@@ -19,7 +19,7 @@ pub fun send_initialize_response(id: []u8, id_is_string: bool) {
         id_data = quoted_id;
     }
 
-    val total: u64 = prefix.length + id_data.length + suffix.length;
+    val total: u64 = prefix.capacity + id_data.capacity + suffix.capacity;
     val buf: *u8 = allocate(total);
     if (buf == nil) {
         slice_free(quoted_id);
@@ -27,11 +27,11 @@ pub fun send_initialize_response(id: []u8, id_is_string: bool) {
     }
 
     var offset: u64 = 0;
-    memory_copy(buf + offset, prefix.data, prefix.length);
-    offset = offset + prefix.length;
-    memory_copy(buf + offset, id_data.data, id_data.length);
-    offset = offset + id_data.length;
-    memory_copy(buf + offset, suffix.data, suffix.length);
+    memory_copy(buf + offset, prefix.data, prefix.capacity);
+    offset = offset + prefix.capacity;
+    memory_copy(buf + offset, id_data.data, id_data.capacity);
+    offset = offset + id_data.capacity;
+    memory_copy(buf + offset, suffix.data, suffix.capacity);
 
     val body: []u8 = []u8{ buf, total };
     send_message(body);
@@ -52,7 +52,7 @@ pub fun send_success_response(id: []u8, id_is_string: bool, result: []u8) {
         id_data = quoted_id;
     }
 
-    val total: u64 = prefix.length + id_data.length + middle.length + result.length + suffix.length;
+    val total: u64 = prefix.capacity + id_data.capacity + middle.capacity + result.capacity + suffix.capacity;
     val buf: *u8 = allocate(total);
     if (buf == nil) {
         slice_free(quoted_id);
@@ -60,15 +60,15 @@ pub fun send_success_response(id: []u8, id_is_string: bool, result: []u8) {
     }
 
     var offset: u64 = 0;
-    memory_copy(buf + offset, prefix.data, prefix.length);
-    offset = offset + prefix.length;
-    memory_copy(buf + offset, id_data.data, id_data.length);
-    offset = offset + id_data.length;
-    memory_copy(buf + offset, middle.data, middle.length);
-    offset = offset + middle.length;
-    memory_copy(buf + offset, result.data, result.length);
-    offset = offset + result.length;
-    memory_copy(buf + offset, suffix.data, suffix.length);
+    memory_copy(buf + offset, prefix.data, prefix.capacity);
+    offset = offset + prefix.capacity;
+    memory_copy(buf + offset, id_data.data, id_data.capacity);
+    offset = offset + id_data.capacity;
+    memory_copy(buf + offset, middle.data, middle.capacity);
+    offset = offset + middle.capacity;
+    memory_copy(buf + offset, result.data, result.capacity);
+    offset = offset + result.capacity;
+    memory_copy(buf + offset, suffix.data, suffix.capacity);
 
     val body: []u8 = []u8{ buf, total };
     send_message(body);
@@ -92,7 +92,7 @@ pub fun send_shutdown_response(id: []u8, id_is_string: bool) {
         id_data = quoted;
     }
 
-    val total: u64 = prefix.length + id_data.length + suffix.length;
+    val total: u64 = prefix.capacity + id_data.capacity + suffix.capacity;
     val buf: *u8 = allocate(total);
     if (buf == nil) {
         slice_free(quoted);
@@ -100,11 +100,11 @@ pub fun send_shutdown_response(id: []u8, id_is_string: bool) {
     }
 
     var offset: u64 = 0;
-    memory_copy(buf + offset, prefix.data, prefix.length);
-    offset = offset + prefix.length;
-    memory_copy(buf + offset, id_data.data, id_data.length);
-    offset = offset + id_data.length;
-    memory_copy(buf + offset, suffix.data, suffix.length);
+    memory_copy(buf + offset, prefix.data, prefix.capacity);
+    offset = offset + prefix.capacity;
+    memory_copy(buf + offset, id_data.data, id_data.capacity);
+    offset = offset + id_data.capacity;
+    memory_copy(buf + offset, suffix.data, suffix.capacity);
 
     val body: []u8 = []u8{ buf, total };
     send_message(body);
@@ -116,24 +116,24 @@ pub fun send_hover_response(state_ptr: *ServerState, id: []u8, id_is_string: boo
     var message: []u8 = []u8{ nil, 0 };
     val stored_text: []u8 = state_get_text(state_ptr);
 
-    if (stored_text.data == nil || stored_text.length == 0) {
+    if (stored_text.data == nil || stored_text.capacity == 0) {
         message = clone_slice("mach lsp: no document loaded");
     }
     or {
         val prefix: string = "mach lsp: document bytes = ";
-        val len_str: []u8 = u64_to_string(stored_text.length);
-        if (len_str.data == nil && len_str.length == 0) {
+        val len_str: []u8 = u64_to_string(stored_text.capacity);
+        if (len_str.data == nil && len_str.capacity == 0) {
             message = clone_slice("mach lsp: document bytes = ?");
         }
         or {
-            val total: u64 = prefix.length + len_str.length;
+            val total: u64 = prefix.capacity + len_str.capacity;
             val buf: *u8 = allocate(total);
             if (buf == nil) {
                 message = clone_slice("mach lsp: document bytes = ?");
             }
             or {
-                memory_copy(buf, prefix.data, prefix.length);
-                memory_copy(buf + prefix.length, len_str.data, len_str.length);
+                memory_copy(buf, prefix.data, prefix.capacity);
+                memory_copy(buf + prefix.capacity, len_str.data, len_str.capacity);
                 message = []u8{ buf, total };
             }
 
@@ -155,7 +155,7 @@ pub fun send_hover_response(state_ptr: *ServerState, id: []u8, id_is_string: boo
     val middle: string = ",\"result\":{\"contents\":{\"kind\":\"markdown\",\"value\":";
     val suffix: string = "}}}";
 
-    val total: u64 = prefix.length + id_data.length + middle.length + quoted_message.length + suffix.length;
+    val total: u64 = prefix.capacity + id_data.capacity + middle.capacity + quoted_message.capacity + suffix.capacity;
     val buf: *u8 = allocate(total);
     if (buf == nil) {
         slice_free(quoted_id);
@@ -164,15 +164,15 @@ pub fun send_hover_response(state_ptr: *ServerState, id: []u8, id_is_string: boo
     }
 
     var offset: u64 = 0;
-    memory_copy(buf + offset, prefix.data, prefix.length);
-    offset = offset + prefix.length;
-    memory_copy(buf + offset, id_data.data, id_data.length);
-    offset = offset + id_data.length;
-    memory_copy(buf + offset, middle.data, middle.length);
-    offset = offset + middle.length;
-    memory_copy(buf + offset, quoted_message.data, quoted_message.length);
-    offset = offset + quoted_message.length;
-    memory_copy(buf + offset, suffix.data, suffix.length);
+    memory_copy(buf + offset, prefix.data, prefix.capacity);
+    offset = offset + prefix.capacity;
+    memory_copy(buf + offset, id_data.data, id_data.capacity);
+    offset = offset + id_data.capacity;
+    memory_copy(buf + offset, middle.data, middle.capacity);
+    offset = offset + middle.capacity;
+    memory_copy(buf + offset, quoted_message.data, quoted_message.capacity);
+    offset = offset + quoted_message.capacity;
+    memory_copy(buf + offset, suffix.data, suffix.capacity);
 
     val body: []u8 = []u8{ buf, total };
     send_message(body);
@@ -196,7 +196,7 @@ pub fun send_error_response(id: []u8, id_is_string: bool) {
     val middle: string = ",\"error\":{\"code\":-32601,\"message\":";
     val suffix: string = "}}";
 
-    val total: u64 = prefix.length + id_data.length + middle.length + quoted_message.length + suffix.length;
+    val total: u64 = prefix.capacity + id_data.capacity + middle.capacity + quoted_message.capacity + suffix.capacity;
     val buf: *u8 = allocate(total);
     if (buf == nil) {
         slice_free(quoted_id);
@@ -205,15 +205,15 @@ pub fun send_error_response(id: []u8, id_is_string: bool) {
     }
 
     var offset: u64 = 0;
-    memory_copy(buf + offset, prefix.data, prefix.length);
-    offset = offset + prefix.length;
-    memory_copy(buf + offset, id_data.data, id_data.length);
-    offset = offset + id_data.length;
-    memory_copy(buf + offset, middle.data, middle.length);
-    offset = offset + middle.length;
-    memory_copy(buf + offset, quoted_message.data, quoted_message.length);
-    offset = offset + quoted_message.length;
-    memory_copy(buf + offset, suffix.data, suffix.length);
+    memory_copy(buf + offset, prefix.data, prefix.capacity);
+    offset = offset + prefix.capacity;
+    memory_copy(buf + offset, id_data.data, id_data.capacity);
+    offset = offset + id_data.capacity;
+    memory_copy(buf + offset, middle.data, middle.capacity);
+    offset = offset + middle.capacity;
+    memory_copy(buf + offset, quoted_message.data, quoted_message.capacity);
+    offset = offset + quoted_message.capacity;
+    memory_copy(buf + offset, suffix.data, suffix.capacity);
 
     val body: []u8 = []u8{ buf, total };
     send_message(body);

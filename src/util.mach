@@ -2,34 +2,34 @@ use std.system.memory;
 use std.types.bool;
 
 pub fun slice_free(s: []u8) {
-    if (s.data == nil || s.length == 0) {
+    if (s.data == nil || s.capacity == 0) {
         ret;
     }
 
-    deallocate(s.data, s.length);
+    deallocate(s.data, s.capacity);
 }
 
 pub fun clone_slice(src: []u8) []u8 {
-    if (src.length == 0) {
+    if (src.capacity == 0) {
         ret []u8{ nil, 0 };
     }
 
-    val buf: *u8 = allocate(src.length);
+    val buf: *u8 = allocate(src.capacity);
     if (buf == nil) {
         ret []u8{ nil, 0 };
     }
 
-    memory_copy(buf, src.data, src.length);
-    ret []u8{ buf, src.length };
+    memory_copy(buf, src.data, src.capacity);
+    ret []u8{ buf, src.capacity };
 }
 
 pub fun slice_equals(a: []u8, b: []u8) bool {
-    if (a.length != b.length) {
+    if (a.capacity != b.capacity) {
         ret false;
     }
 
     var i: u64 = 0;
-    for (i < a.length) {
+    for (i < a.capacity) {
         if (a[i] != b[i]) {
             ret false;
         }
@@ -41,20 +41,20 @@ pub fun slice_equals(a: []u8, b: []u8) bool {
 }
 
 pub fun find_subslice(data: []u8, pattern: []u8) i64 {
-    if (pattern.length == 0) {
+    if (pattern.capacity == 0) {
         ret 0;
     }
 
-    if (pattern.length > data.length) {
+    if (pattern.capacity > data.capacity) {
         ret -1;
     }
 
     var i: u64 = 0;
-    val limit: u64 = data.length - pattern.length;
+    val limit: u64 = data.capacity - pattern.capacity;
     for (i <= limit) {
         var j: u64 = 0;
         var match: bool = true;
-        for (j < pattern.length) {
+        for (j < pattern.capacity) {
             if (data[i + j] != pattern[j]) {
                 match = false;
                 brk;
@@ -119,17 +119,17 @@ pub str SliceBuilder {
 }
 
 pub fun slice_builder_init(builder: *SliceBuilder) {
-    builder->data = nil;
-    builder->length = 0;
-    builder->capacity = 0;
+    builder.data = nil;
+    builder.capacity = 0;
+    builder.capacity = 0;
 }
 
 fun slice_builder_reserve(builder: *SliceBuilder, needed: u64) bool {
-    if (needed <= builder->capacity) {
+    if (needed <= builder.capacity) {
         ret true;
     }
 
-    var new_cap: u64 = builder->capacity;
+    var new_cap: u64 = builder.capacity;
     if (new_cap == 0) {
         new_cap = 128;
     }
@@ -139,80 +139,80 @@ fun slice_builder_reserve(builder: *SliceBuilder, needed: u64) bool {
     }
 
     var new_data: *u8 = nil;
-    if (builder->data == nil) {
+    if (builder.data == nil) {
         new_data = allocate(new_cap);
     }
     or {
-        new_data = reallocate(builder->data, builder->capacity, new_cap);
+        new_data = reallocate(builder.data, builder.capacity, new_cap);
     }
 
     if (new_data == nil) {
         ret false;
     }
 
-    builder->data = new_data;
-    builder->capacity = new_cap;
+    builder.data = new_data;
+    builder.capacity = new_cap;
     ret true;
 }
 
 pub fun slice_builder_append(builder: *SliceBuilder, value: []u8) bool {
-    if (value.data == nil || value.length == 0) {
+    if (value.data == nil || value.capacity == 0) {
         ret true;
     }
 
-    val required: u64 = builder->length + value.length;
+    val required: u64 = builder.capacity + value.capacity;
     if (slice_builder_reserve(builder, required) == false) {
         ret false;
     }
 
-    memory_copy(builder->data + builder->length, value.data, value.length);
-    builder->length = required;
+    memory_copy(builder.data + builder.capacity, value.data, value.capacity);
+    builder.capacity = required;
     ret true;
 }
 
 pub fun slice_builder_append_byte(builder: *SliceBuilder, value: u8) bool {
-    val required: u64 = builder->length + 1;
+    val required: u64 = builder.capacity + 1;
     if (slice_builder_reserve(builder, required) == false) {
         ret false;
     }
 
-    @(builder->data + builder->length) = value;
-    builder->length = required;
+    @(builder.data + builder.capacity) = value;
+    builder.capacity = required;
     ret true;
 }
 
 pub fun slice_builder_finish(builder: *SliceBuilder) []u8 {
-    if (builder->length == 0) {
-        if (builder->data != nil && builder->capacity != 0) {
-            deallocate(builder->data, builder->capacity);
+    if (builder.capacity == 0) {
+        if (builder.data != nil && builder.capacity != 0) {
+            deallocate(builder.data, builder.capacity);
         }
 
-        builder->data = nil;
-        builder->capacity = 0;
+        builder.data = nil;
+        builder.capacity = 0;
         ret []u8{ nil, 0 };
     }
 
-    if (builder->capacity > builder->length) {
-        val shrunk: *u8 = reallocate(builder->data, builder->capacity, builder->length);
+    if (builder.capacity > builder.capacity) {
+        val shrunk: *u8 = reallocate(builder.data, builder.capacity, builder.capacity);
         if (shrunk != nil) {
-            builder->data = shrunk;
-            builder->capacity = builder->length;
+            builder.data = shrunk;
+            builder.capacity = builder.capacity;
         }
     }
 
-    val out: []u8 = []u8{ builder->data, builder->length };
-    builder->data = nil;
-    builder->length = 0;
-    builder->capacity = 0;
+    val out: []u8 = []u8{ builder.data, builder.capacity };
+    builder.data = nil;
+    builder.capacity = 0;
+    builder.capacity = 0;
     ret out;
 }
 
 pub fun slice_builder_dnit(builder: *SliceBuilder) {
-    if (builder->data != nil && builder->capacity != 0) {
-        deallocate(builder->data, builder->capacity);
+    if (builder.data != nil && builder.capacity != 0) {
+        deallocate(builder.data, builder.capacity);
     }
 
-    builder->data = nil;
-    builder->length = 0;
-    builder->capacity = 0;
+    builder.data = nil;
+    builder.capacity = 0;
+    builder.capacity = 0;
 }

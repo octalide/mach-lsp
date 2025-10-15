@@ -13,17 +13,17 @@ fun main() i32 {
 
     state_init(server_state);
 
-    for (server_state->running) {
+    for (server_state.running) {
         write(STDERR, "info: waiting for message\n");
         val body: []u8 = read_message();
-        if (body.data == nil && body.length == 0) {
-            if (server_state->running == false) {
+        if (body.data == nil && body.capacity == 0) {
+            if (server_state.running == false) {
                 brk;
             }
 
-            if (server_state->shutdown_requested == false) {
-                server_state->running = false;
-                server_state->exit_status = 1;
+            if (server_state.shutdown_requested == false) {
+                server_state.running = false;
+                server_state.exit_status = 1;
                 write(STDERR, "error: input stream closed unexpectedly\n");
             }
 
@@ -34,7 +34,7 @@ fun main() i32 {
         handle_message(server_state, body);
         slice_free(body);
 
-        if (server_state->running == false) {
+        if (server_state.running == false) {
             brk;
         }
     }
@@ -42,5 +42,5 @@ fun main() i32 {
     state_dnit(server_state);
 
     write(STDERR, "info: mach lsp exiting\n");
-    ret server_state->exit_status;
+    ret server_state.exit_status;
 }
