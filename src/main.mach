@@ -1,46 +1,9 @@
-use std.io.console;
-use std.types.bool;
+use          std.runtime;
+use          std.types.string;
+use console: std.io.console;
 
-use handlers;
-use state;
-use transport;
-use util;
-
-fun main() i32 {
-    write(STDERR, "info: mach lsp starting\n");
-    var state_storage: ServerState;
-    val server_state: *ServerState = ?state_storage;
-
-    state_init(server_state);
-
-    for (server_state.running) {
-        write(STDERR, "info: waiting for message\n");
-        val body: []u8 = read_message();
-        if (body.data == nil && body.capacity == 0) {
-            if (server_state.running == false) {
-                brk;
-            }
-
-            if (server_state.shutdown_requested == false) {
-                server_state.running = false;
-                server_state.exit_status = 1;
-                write(STDERR, "error: input stream closed unexpectedly\n");
-            }
-
-            brk;
-        }
-
-        write(STDERR, "info: handling message\n");
-        handle_message(server_state, body);
-        slice_free(body);
-
-        if (server_state.running == false) {
-            brk;
-        }
-    }
-
-    state_dnit(server_state);
-
-    write(STDERR, "info: mach lsp exiting\n");
-    ret server_state.exit_status;
+$main.symbol = "main"
+fun main(args: []string) u64 {
+    console.print("MLS\n");
+    ret 0;
 }

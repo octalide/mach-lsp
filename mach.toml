@@ -1,15 +1,47 @@
 [project]
-name = "mach-lsp"
-version = "0.1.0"
+name = "mls"
+version = "0.3.2"
+src = "src"
+target = "all"
+
+[dependencies]
+std = "${MACH_HOME}/std"
+
+[targets.linux]
+triple = "x86_64-pc-linux-gnu"
 entrypoint = "main.mach"
+artifacts = "out/mls/linux"
+out = "out/bin/mls"
+opt-level = 2
+emit-ast = true
+emit-ir = true
+emit-asm = true
+emit-object = true
+build-library = false
+no-pie = false
 
-[directories]
-src-dir = "src"
-dep-dir = "dep"
-out-dir = "out"
+[targets.darwin]
+triple = "x86_64-apple-darwin"
+entrypoint = "main.mach"
+artifacts = "out/mls/darwin"
+out = "out/bin/mls"
+opt-level = 2
+emit-ast = true
+emit-ir = true
+emit-asm = true
+emit-object = true
+build-library = false
+no-pie = false
 
-[deps]
-std = { path = "../mach-std", src = "src" }
-
-[modules]
-std = "std"
+[targets.windows]
+triple = "x86_64-pc-windows-msvc"
+entrypoint = "main.mach"
+artifacts = "out/mls/windows"
+out = "bin/mls.exe"
+opt-level = 2
+emit-ast = true
+emit-ir = true
+emit-asm = true
+emit-object = true
+build-library = false
+no-pie = false
