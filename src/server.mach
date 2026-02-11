@@ -1,0 +1,200 @@
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use print:     std.print;
+
+use transport: mach_lsp.transport;
+use handler:   mach_lsp.handler;
+use workspace: mach_lsp.workspace;
+use json:      mach_lsp.json;
+
+# mach_lsp.server: top-level LSP server state and message loop.
+# ---
+# manages the server lifecycle (initialize -> running -> shutdown -> exit)
+# and dispatches incoming JSON-RPC messages to the appropriate handlers.
+
+# ServerStatus: tracks the current phase of the LSP lifecycle.
+pub val STATUS_UNINITIALIZED: u8 = 0;
+pub val STATUS_INITIALIZING:  u8 = 1;
+pub val STATUS_RUNNING:       u8 = 2;
+pub val STATUS_SHUTTING_DOWN: u8 = 3;
+pub val STATUS_EXITED:        u8 = 4;
+
+# Server: the top-level language server state.
+# ---
+# status:     current lifecycle phase
+# exit_code:  exit code to return from the process
+# alloc:      allocator used for all server-owned memory
+# ws:         workspace state (open documents, project info)
+pub rec Server {
+    status:    u8;
+    exit_code: i64;
+    alloc:     allocator.Allocator;
+    ws:        workspace.Workspace;
+}
+
+# init: initialize a server instance.
+# ---
+# sets the server to the uninitialized state and prepares the allocator
+# and workspace. the server is not yet ready to handle requests until
+# it receives an `initialize` message from the client.
+#
+# srv: pointer to the server to initialize
+pub fun init(srv: *Server) {
+    srv.status = STATUS_UNINITIALIZED;
+    srv.exit_code = 0;
+    srv.alloc = allocator.heap_allocator();
+    workspace.init(?srv.ws, srv.alloc);
+}
+
+# deinit: release all resources held by the server.
+# ---
+# tears down the workspace and marks the server as exited.
+# the heap allocator itself does not require explicit teardown;
+# all brk-backed memory is reclaimed on process exit.
+#
+# srv: pointer to the server to deinitialize
+pub fun deinit(srv: *Server) {
+    workspace.deinit(?srv.ws, srv.alloc);
+    srv.status = STATUS_EXITED;
+}
+
+# run: enter the main message loop.
+# ---
+# reads JSON-RPC messages from stdin, dispatches them, and writes
+# responses to stdout. blocks until the server exits (via the `exit`
+# notification or an I/O error).
+#
+# srv: pointer to the initialized server
+# ret: the exit code (0 = clean shutdown, 1 = error)
+pub fun run(srv: *Server) i64 {
+    for (srv.status != STATUS_EXITED) {
+        var msg: transport.Message;
+        val read_ok: bool = transport.read_message(?msg, srv.alloc);
+
+        if (!read_ok) {
+            # stdin closed or read failed
+            if (srv.status == STATUS_SHUTTING_DOWN) {
+                # expected: client closed connection after shutdown
+                srv.status = STATUS_EXITED;
+                brk;
+            }
+
+            print.eprintln("mach-lsp: error: failed to read message");
+            srv.exit_code = 1;
+            srv.status = STATUS_EXITED;
+            brk;
+        }
+
+        dispatch(srv, ?msg);
+        transport.message_free(?msg);
+    }
+
+    ret srv.exit_code;
+}
+
+# dispatch: route an incoming message to the correct handler.
+# ---
+# extracts the JSON-RPC `method` field and calls the matching handler.
+# if the message has an `id` field it is a request; otherwise it is a
+# notification. unknown requests receive an error response.
+#
+# srv: pointer to the server
+# msg: pointer to the received message
+fun dispatch(srv: *Server, msg: *transport.Message) {
+    val body_str: str = str{ data: msg.body, len: msg.body_len };
+    val method: str = json.extract_string(body_str, "\"method\"", srv.alloc);
+
+    if (method.len == 0) {
+        # no method field — likely a response or malformed message; ignore
+        ret;
+    }
+
+    # --- lifecycle ---
+
+    if (method.equals("initialize")) {
+        handler.handle_initialize(srv, body_str);
+        ret;
+    }
+
+    if (method.equals("initialized")) {
+        # notification: client acknowledges init; nothing to do
+        ret;
+    }
+
+    if (method.equals("shutdown")) {
+        handler.handle_shutdown(srv, body_str);
+        ret;
+    }
+
+    if (method.equals("exit")) {
+        handler.handle_exit(srv);
+        ret;
+    }
+
+    # --- reject everything before initialize completes ---
+
+    if (srv.status != STATUS_RUNNING) {
+        val id: str = json.extract_raw(body_str, "\"id\"", srv.alloc);
+        if (id.len > 0) {
+            handler.send_error(srv, id, -32002, "server not initialized");
+        }
+        ret;
+    }
+
+    # --- document synchronization ---
+
+    if (method.equals("textDocument/didOpen")) {
+        handler.handle_did_open(srv, body_str);
+        ret;
+    }
+
+    if (method.equals("textDocument/didChange")) {
+        handler.handle_did_change(srv, body_str);
+        ret;
+    }
+
+    if (method.equals("textDocument/didClose")) {
+        handler.handle_did_close(srv, body_str);
+        ret;
+    }
+
+    if (method.equals("textDocument/didSave")) {
+        # notification: saved; no action needed for now
+        ret;
+    }
+
+    # --- language features ---
+
+    if (method.equals("textDocument/hover")) {
+        handler.handle_hover(srv, body_str);
+        ret;
+    }
+
+    if (method.equals("textDocument/definition")) {
+        handler.handle_definition(srv, body_str);
+        ret;
+    }
+
+    if (method.equals("textDocument/completion")) {
+        handler.handle_completion(srv, body_str);
+        ret;
+    }
+
+    if (method.equals("textDocument/documentSymbol")) {
+        handler.handle_document_symbol(srv, body_str);
+        ret;
+    }
+
+    # --- fallback ---
+
+    val id: str = json.extract_raw(body_str, "\"id\"", srv.alloc);
+    if (id.len > 0) {
+        handler.send_error(srv, id, -32601, "method not found");
+    }
+
+    # notifications with unknown methods are silently ignored per spec
+}

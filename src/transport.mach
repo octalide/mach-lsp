@@ -1,100 +1,323 @@
-use std.io.console;
-use std.system.memory;
-use std.text.parse;
 use std.types.bool;
+use std.types.size;
 use std.types.string;
+use std.types.result;
 
-use util;
+use allocator: std.allocator;
+use mem:       std.memory;
+use stream:    std.stream;
+use stdio:     std.system.stdio;
+use print:     std.print;
 
-# scan the header block to locate a content-length value
-fun parse_content_length(header: []u8) i64 {
-    var line_start: u64 = 0;
-    var i: u64 = 0;
+# mach_lsp.transport: JSON-RPC transport over stdin/stdout.
+# ---
+# implements the LSP base protocol: reads and writes messages framed with
+# Content-Length headers over standard I/O. all messages are UTF-8 encoded
+# JSON payloads preceded by HTTP-style headers terminated by \r\n\r\n.
+#
+# wire format (per LSP spec):
+#   Content-Length: <byte-count>\r\n
+#   \r\n
+#   <JSON payload of exactly byte-count bytes>
 
-    for (i <= header.capacity) {
-        if (i == header.capacity || header[i] == '\n') {
-            var line_len: u64 = 0;
-            if (i > line_start) {
-                line_len = i - line_start;
-                if (line_len > 0 && header[line_start + line_len - 1] == '\r') {
-                    line_len = line_len - 1;
-                }
+# Message: a single JSON-RPC message read from the transport.
+# ---
+# body:     heap-allocated raw JSON payload bytes
+# body_len: length of body in bytes
+# alloc:    the allocator that owns body (needed for cleanup)
+pub rec Message {
+    body:     *u8;
+    body_len: usize;
+    alloc:    allocator.Allocator;
+}
+
+# message_free: release memory held by a message.
+# ---
+# msg: pointer to the message whose body should be freed
+pub fun message_free(msg: *Message) {
+    if (msg.body != nil && msg.body_len > 0) {
+        msg.alloc.free[u8](msg.body, msg.body_len);
+    }
+    msg.body = nil;
+    msg.body_len = 0;
+}
+
+# --- internal constants ---
+
+val HEADER_BUF_INITIAL: usize = 512;
+val HEADER_BUF_GROW:    usize = 256;
+val CL_KEY:             str   = "content-length";
+val CL_KEY_LEN:         usize = 14;
+val HEADER_PREFIX:      str   = "Content-Length: ";
+val CRLF_CRLF:          str   = "\r\n\r\n";
+
+# read_message: block until a complete LSP message arrives on stdin.
+# ---
+# reads the header block one byte at a time until the \r\n\r\n terminator
+# is found, extracts the Content-Length value, then reads exactly that many
+# bytes of body payload.
+#
+# msg:   pointer to a Message that will be filled in on success
+# alloc: allocator to use for all internal buffers and the resulting body
+# ret:   true if a message was successfully read, false on EOF or error
+pub fun read_message(msg: *Message, alloc: allocator.Allocator) bool {
+    msg.body = nil;
+    msg.body_len = 0;
+    msg.alloc = alloc;
+
+    var a: allocator.Allocator = alloc;
+    var reader: stream.Reader = stdio.stdin();
+
+    # --- read header block ---
+
+    var hdr_cap: usize = HEADER_BUF_INITIAL;
+    val hdr_res: Result[*u8, allocator.AllocError] = a.alloc[u8](hdr_cap);
+    if (hdr_res.is_err()) {
+        print.eprintln("mach-lsp: transport: failed to allocate header buffer");
+        ret false;
+    }
+    var hdr_buf: *u8 = hdr_res.unwrap_ok();
+
+    var hdr_len: usize = 0;
+    var found_terminator: bool = false;
+
+    for (!found_terminator) {
+        val got: Result[usize, str] = reader.read(hdr_buf + hdr_len, 1);
+        if (got.is_err()) {
+            a.free[u8](hdr_buf, hdr_cap);
+            ret false;
+        }
+
+        val n: usize = got.unwrap_ok();
+        if (n == 0) {
+            # EOF
+            a.free[u8](hdr_buf, hdr_cap);
+            ret false;
+        }
+
+        hdr_len = hdr_len + 1;
+
+        # grow header buffer if needed
+        if (hdr_len >= hdr_cap) {
+            val new_cap: usize = hdr_cap + HEADER_BUF_GROW;
+            val grow_res: Result[*u8, allocator.AllocError] = a.resize[u8](hdr_buf, hdr_cap, new_cap);
+            if (grow_res.is_err()) {
+                a.free[u8](hdr_buf, hdr_cap);
+                print.eprintln("mach-lsp: transport: header buffer resize failed");
+                ret false;
+            }
+            hdr_buf = grow_res.unwrap_ok();
+            hdr_cap = new_cap;
+        }
+
+        # check for \r\n\r\n terminator (standard)
+        if (hdr_len >= 4) {
+            if (@(hdr_buf + hdr_len - 4) == '\r' &&
+                @(hdr_buf + hdr_len - 3) == '\n' &&
+                @(hdr_buf + hdr_len - 2) == '\r' &&
+                @(hdr_buf + hdr_len - 1) == '\n') {
+                found_terminator = true;
+            }
+        }
+
+        # also tolerate bare \n\n (some clients)
+        if (!found_terminator && hdr_len >= 2) {
+            if (@(hdr_buf + hdr_len - 2) == '\n' &&
+                @(hdr_buf + hdr_len - 1) == '\n') {
+                found_terminator = true;
+            }
+        }
+    }
+
+    # --- parse content-length from headers ---
+
+    val content_length: i64 = parse_content_length(hdr_buf, hdr_len);
+    a.free[u8](hdr_buf, hdr_cap);
+
+    if (content_length <= 0) {
+        print.eprintln("mach-lsp: transport: missing or invalid Content-Length");
+        ret false;
+    }
+
+    val body_len: usize = content_length::usize;
+
+    # --- read body ---
+
+    val body_res: Result[*u8, allocator.AllocError] = a.alloc[u8](body_len);
+    if (body_res.is_err()) {
+        print.eprintln("mach-lsp: transport: failed to allocate body buffer");
+        ret false;
+    }
+    val body_buf: *u8 = body_res.unwrap_ok();
+
+    val read_res: Result[usize, str] = stream.read_exact(?reader, body_buf, body_len);
+    if (read_res.is_err()) {
+        a.free[u8](body_buf, body_len);
+        print.eprintln("mach-lsp: transport: failed to read body");
+        ret false;
+    }
+
+    msg.body = body_buf;
+    msg.body_len = body_len;
+    ret true;
+}
+
+# send_message: write a complete LSP message to stdout.
+# ---
+# frames the given JSON body with a Content-Length header and writes
+# everything to stdout in a single logical operation.
+#
+# body:     pointer to the JSON payload bytes
+# body_len: length of the payload in bytes
+# alloc:    allocator for temporary formatting buffers
+pub fun send_message(body: &u8, body_len: usize, alloc: allocator.Allocator) {
+    if (body == nil || body_len == 0) {
+        ret;
+    }
+
+    var a: allocator.Allocator = alloc;
+    var writer: stream.Writer = stdio.stdout();
+
+    # format the Content-Length digit string
+    var digit_buf: [20]u8;
+    val digit_len: usize = u64_to_buf(?digit_buf, 20, body_len);
+    val digit_start: usize = 20 - digit_len;
+
+    # total frame: "Content-Length: " + digits + "\r\n\r\n" + body
+    val prefix_len: usize = HEADER_PREFIX.len;
+    val sep_len: usize    = CRLF_CRLF.len;
+    val total: usize      = prefix_len + digit_len + sep_len + body_len;
+
+    val buf_res: Result[*u8, allocator.AllocError] = a.alloc[u8](total);
+    if (buf_res.is_err()) {
+        print.eprintln("mach-lsp: transport: failed to allocate send buffer");
+        ret;
+    }
+    val buf: *u8 = buf_res.unwrap_ok();
+
+    var offset: usize = 0;
+
+    # "Content-Length: "
+    mem.raw_copy((buf + offset)::ptr, HEADER_PREFIX.data::ptr, prefix_len);
+    offset = offset + prefix_len;
+
+    # digits
+    mem.raw_copy((buf + offset)::ptr, (?digit_buf + digit_start)::ptr, digit_len);
+    offset = offset + digit_len;
+
+    # "\r\n\r\n"
+    mem.raw_copy((buf + offset)::ptr, CRLF_CRLF.data::ptr, sep_len);
+    offset = offset + sep_len;
+
+    # JSON body
+    mem.raw_copy((buf + offset)::ptr, body::ptr, body_len);
+
+    stream.write_all(?writer, buf, total);
+
+    a.free[u8](buf, total);
+}
+
+# send_str: convenience wrapper that sends a str as a complete LSP message.
+# ---
+# s:     the JSON-RPC response body
+# alloc: allocator for temporary buffers
+pub fun send_str(s: str, alloc: allocator.Allocator) {
+    if (s.data == nil || s.len == 0) {
+        ret;
+    }
+    send_message(s.data, s.len, alloc);
+}
+
+# --- internal helpers ---
+
+# parse_content_length: scan header bytes for the Content-Length value.
+# ---
+# walks the header line by line, looking for a case-insensitive match on
+# "content-length". returns the parsed integer value, or -1 on failure.
+#
+# hdr:     pointer to the raw header bytes
+# hdr_len: number of header bytes
+# ret:     the content length, or -1 if not found / invalid
+fun parse_content_length(hdr: &u8, hdr_len: usize) i64 {
+    var line_start: usize = 0;
+    var i: usize = 0;
+
+    for (i <= hdr_len) {
+        val at_end: bool = (i == hdr_len);
+        val is_newline: bool = (!at_end && hdr[i] == '\n');
+
+        if (at_end || is_newline) {
+            var line_end: usize = i;
+
+            # strip trailing \r
+            if (line_end > line_start && hdr[line_end - 1] == '\r') {
+                line_end = line_end - 1;
             }
 
-            if (line_len > 0) {
-                val line: []u8 = []u8{ header.data + line_start, line_len };
+            val line_len: usize = line_end - line_start;
 
-                var colon_pos: i64 = -1;
-                var j: u64 = 0;
-                for (j < line.capacity) {
-                    if (line[j] == ':') {
-                        colon_pos = j::i64;
+            if (line_len > 0) {
+                # find colon position
+                var colon: i64 = -1;
+                var j: usize = line_start;
+                for (j < line_end) {
+                    if (hdr[j] == ':') {
+                        colon = j::i64;
                         brk;
                     }
-
                     j = j + 1;
                 }
 
-                if (colon_pos >= 0) {
-                    val key_slice: []u8 = []u8{ line.data, colon_pos::u64 };
-                    var k: u64 = 0;
-                    var is_content_length: bool = true;
-                    val expected: []u8 = "content-length";
+                if (colon >= 0) {
+                    val key_len: usize = (colon::usize) - line_start;
 
-                    if (key_slice.capacity != expected.capacity) {
-                        is_content_length = false;
-                    }
-                    or {
-                        for (k < expected.capacity) {
-                            var ch: u8 = key_slice[k];
+                    if (key_len == CL_KEY_LEN) {
+                        var match: bool = true;
+                        var k: usize = 0;
+                        for (k < key_len) {
+                            var ch: u8 = hdr[line_start + k];
+                            # lowercase for case-insensitive comparison
                             if (ch >= 'A' && ch <= 'Z') {
                                 ch = ch + 32;
                             }
-
-                            if (ch != expected[k]) {
-                                is_content_length = false;
+                            if (ch != CL_KEY.data[k]) {
+                                match = false;
                                 brk;
                             }
-
                             k = k + 1;
                         }
-                    }
 
-                    if (is_content_length) {
-                        var value_start: u64 = (colon_pos::u64) + 1;
-
-                        for (value_start < line.capacity) {
-                            val ch: u8 = line[value_start];
-                            if (ch == ' ' || ch == '\t') {
-                                value_start = value_start + 1;
+                        if (match) {
+                            # skip colon and whitespace
+                            var val_start: usize = (colon::usize) + 1;
+                            for (val_start < line_end) {
+                                val c: u8 = hdr[val_start];
+                                if (c != ' ' && c != '\t') {
+                                    brk;
+                                }
+                                val_start = val_start + 1;
                             }
-                            or {
-                                brk;
+
+                            # parse decimal digits
+                            var result: i64 = 0;
+                            var valid: bool = false;
+                            var d: usize = val_start;
+                            for (d < line_end) {
+                                val digit: u8 = hdr[d];
+                                if (digit >= '0' && digit <= '9') {
+                                    result = result * 10 + ((digit - '0')::i64);
+                                    valid = true;
+                                }
+                                or {
+                                    brk;
+                                }
+                                d = d + 1;
+                            }
+
+                            if (valid) {
+                                ret result;
                             }
                         }
-
-                        if (value_start >= line.capacity) {
-                            ret -1;
-                        }
-
-                        var value_end: u64 = value_start;
-                        for (value_end < line.capacity) {
-                            val ch: u8 = line[value_end];
-                            if (ch >= '0' && ch <= '9') {
-                                value_end = value_end + 1;
-                            }
-                            or {
-                                brk;
-                            }
-                        }
-
-                        if (value_end == value_start) {
-                            ret -1;
-                        }
-
-                        val digits: []u8 = []u8{ line.data + value_start, value_end - value_start };
-                        val result: u64 = parse_u64_dec(digits);
-                        ret result::i64;
                     }
                 }
             }
@@ -108,141 +331,188 @@ fun parse_content_length(header: []u8) i64 {
     ret -1;
 }
 
-pub fun read_message() []u8 {
-    var header_cap: u64 = 256;
-    var header_buf: *u8 = allocate(header_cap);
-    if (header_buf == nil) {
-        ret []u8{ nil, 0 };
+# u64_to_buf: render an unsigned integer into a byte buffer (right-aligned).
+# ---
+# writes decimal digits into the end of the provided buffer. returns the
+# number of digits written. the caller should read from offset (buf_cap - result).
+#
+# buf:     pointer to the output buffer
+# buf_cap: capacity of the buffer in bytes
+# value:   the value to render
+# ret:     number of digit bytes written
+fun u64_to_buf(buf: *u8, buf_cap: usize, value: usize) usize {
+    if (value == 0) {
+        @(buf + buf_cap - 1) = '0';
+        ret 1;
     }
 
-    var header_len: u64 = 0;
-    # read one byte at a time until header terminator is seen
-    for {
-        val got: i64 = read(STDIN, header_buf + header_len, 1);
-        if (got <= 0) {
-            deallocate(header_buf, header_cap);
-            if (header_len == 0) {
-                ret []u8{ nil, 0 };
-            }
+    var v: usize = value;
+    var pos: usize = buf_cap;
 
-            write(STDERR, "error: failed to read header\n");
-            ret []u8{ nil, 0 };
-        }
-
-        header_len = header_len + 1;
-
-        if (header_len >= header_cap) {
-            val new_cap: u64 = header_cap + 256;
-            val new_buf: *u8 = reallocate(header_buf, header_cap, new_cap);
-            if (new_buf == nil) {
-                deallocate(header_buf, header_cap);
-                ret []u8{ nil, 0 };
-            }
-
-            header_buf = new_buf;
-            header_cap = new_cap;
-        }
-
-        # detect standard crlf-crlf terminator
-        if (header_len >= 4) {
-            val a: u8 = @(header_buf + header_len - 4);
-            val b: u8 = @(header_buf + header_len - 3);
-            val c: u8 = @(header_buf + header_len - 2);
-            val d: u8 = @(header_buf + header_len - 1);
-            if (a == '\r' && b == '\n' && c == '\r' && d == '\n') {
-                brk;
-            }
-        }
-
-        # tolerate bare lf separators
-        if (header_len >= 2) {
-            val x: u8 = @(header_buf + header_len - 2);
-            val y: u8 = @(header_buf + header_len - 1);
-            if (x == '\n' && y == '\n') {
-                brk;
-            }
-        }
-
-        # also handle bare cr separators used by some clients
-        if (header_len >= 2) {
-            val m: u8 = @(header_buf + header_len - 2);
-            val n: u8 = @(header_buf + header_len - 1);
-            if (m == '\r' && n == '\r') {
-                brk;
-            }
-        }
+    for (v > 0 && pos > 0) {
+        pos = pos - 1;
+        val rem: usize = v % 10;
+        @(buf + pos) = ('0' + rem)::u8;
+        v = v / 10;
     }
 
-    val header_slice: []u8 = []u8{ header_buf, header_len };
-    val body_len_i64: i64 = parse_content_length(header_slice);
-    deallocate(header_buf, header_cap);
-
-    if (body_len_i64 <= 0) {
-        write(STDERR, "error: invalid content length\n");
-        ret []u8{ nil, 0 };
-    }
-
-    val body_len: u64 = body_len_i64::u64;
-    if (body_len == 0) {
-        write(STDERR, "error: zero content length\n");
-        ret []u8{ nil, 0 };
-    }
-
-    # grab an exact buffer for the incoming body
-    val body_buf: *u8 = allocate(body_len);
-    if (body_buf == nil) {
-        write(STDERR, "error: failed to allocate body\n");
-        ret []u8{ nil, 0 };
-    }
-
-    var received: u64 = 0;
-    for (received < body_len) {
-        val chunk: i64 = read(STDIN, body_buf + received, (body_len - received));
-        if (chunk <= 0) {
-            deallocate(body_buf, body_len);
-            write(STDERR, "error: failed to read body\n");
-            ret []u8{ nil, 0 };
-        }
-
-        received = received + (chunk::u64);
-    }
-
-    val body_slice: []u8 = []u8{ body_buf, body_len };
-    ret body_slice;
+    ret buf_cap - pos;
 }
 
-pub fun send_message(body: []u8) {
-    val prefix: []u8 = "Content-Length: ";
-    val suffix: []u8 = "\r\n\r\n";
+# --- tests ---
 
-    val len_str: []u8 = u64_to_string(body.capacity);
-    var length_digits: []u8 = "0";
-    if (len_str.data != nil && len_str.capacity > 0) {
-        length_digits = len_str;
-    }
+test "transport: parse_content_length extracts value from standard header" {
+    val hdr: str = "Content-Length: 42\r\n\r\n";
+    val result: i64 = parse_content_length(hdr.data, hdr.len);
+    if (result != 42) { ret 0; }
+    ret 1;
+}
 
-    val header_len: u64 = prefix.capacity + length_digits.capacity + suffix.capacity;
-    val header_buf: *u8 = allocate(header_len);
-    if (header_buf == nil) {
-        slice_free(len_str);
-        ret;
-    }
+test "transport: parse_content_length is case-insensitive" {
+    val hdr: str = "content-length: 100\r\n\r\n";
+    val result: i64 = parse_content_length(hdr.data, hdr.len);
+    if (result != 100) { ret 0; }
+    ret 1;
+}
 
-    var offset: u64 = 0;
-    memory_copy(header_buf + offset, prefix.data, prefix.capacity);
-    offset = offset + prefix.capacity;
-    memory_copy(header_buf + offset, length_digits.data, length_digits.capacity);
-    offset = offset + length_digits.capacity;
-    memory_copy(header_buf + offset, suffix.data, suffix.capacity);
+test "transport: parse_content_length handles mixed case" {
+    val hdr: str = "Content-LENGTH: 7\r\n\r\n";
+    val result: i64 = parse_content_length(hdr.data, hdr.len);
+    if (result != 7) { ret 0; }
+    ret 1;
+}
 
-    val header_view: string = string{ header_buf, header_len };
-    write(STDOUT, header_view);
-    deallocate(header_buf, header_len);
+test "transport: parse_content_length handles large value" {
+    val hdr: str = "Content-Length: 999999\r\n\r\n";
+    val result: i64 = parse_content_length(hdr.data, hdr.len);
+    if (result != 999999) { ret 0; }
+    ret 1;
+}
 
-    if (body.data != nil && body.capacity > 0) {
-        val body_view: string = string{ body.data, body.capacity };
-        write(STDOUT, body_view);
-    }
+test "transport: parse_content_length ignores other headers" {
+    val hdr: str = "Content-Type: application/json\r\nContent-Length: 55\r\n\r\n";
+    val result: i64 = parse_content_length(hdr.data, hdr.len);
+    if (result != 55) { ret 0; }
+    ret 1;
+}
 
-    slice_free(len_str);
+test "transport: parse_content_length returns -1 for missing header" {
+    val hdr: str = "Content-Type: application/json\r\n\r\n";
+    val result: i64 = parse_content_length(hdr.data, hdr.len);
+    if (result != -1) { ret 0; }
+    ret 1;
+}
+
+test "transport: parse_content_length returns -1 for empty header" {
+    val hdr: str = "\r\n\r\n";
+    val result: i64 = parse_content_length(hdr.data, hdr.len);
+    if (result != -1) { ret 0; }
+    ret 1;
+}
+
+test "transport: parse_content_length handles bare LF line endings" {
+    val hdr: str = "Content-Length: 10\n\n";
+    val result: i64 = parse_content_length(hdr.data, hdr.len);
+    if (result != 10) { ret 0; }
+    ret 1;
+}
+
+test "transport: parse_content_length skips whitespace after colon" {
+    val hdr: str = "Content-Length:   \t  77\r\n\r\n";
+    val result: i64 = parse_content_length(hdr.data, hdr.len);
+    if (result != 77) { ret 0; }
+    ret 1;
+}
+
+test "transport: parse_content_length returns -1 for non-numeric value" {
+    val hdr: str = "Content-Length: abc\r\n\r\n";
+    val result: i64 = parse_content_length(hdr.data, hdr.len);
+    if (result != -1) { ret 0; }
+    ret 1;
+}
+
+test "transport: parse_content_length stops parsing at non-digit" {
+    val hdr: str = "Content-Length: 123xyz\r\n\r\n";
+    val result: i64 = parse_content_length(hdr.data, hdr.len);
+    if (result != 123) { ret 0; }
+    ret 1;
+}
+
+test "transport: u64_to_buf renders zero" {
+    var buf: [20]u8;
+    val len: usize = u64_to_buf(?buf, 20, 0);
+    if (len != 1) { ret 0; }
+    if (buf[19] != '0') { ret 0; }
+    ret 1;
+}
+
+test "transport: u64_to_buf renders single digit" {
+    var buf: [20]u8;
+    val len: usize = u64_to_buf(?buf, 20, 7);
+    if (len != 1) { ret 0; }
+    if (buf[19] != '7') { ret 0; }
+    ret 1;
+}
+
+test "transport: u64_to_buf renders multi-digit number" {
+    var buf: [20]u8;
+    val len: usize = u64_to_buf(?buf, 20, 42);
+    if (len != 2) { ret 0; }
+    if (buf[18] != '4') { ret 0; }
+    if (buf[19] != '2') { ret 0; }
+    ret 1;
+}
+
+test "transport: u64_to_buf renders large number" {
+    var buf: [20]u8;
+    val len: usize = u64_to_buf(?buf, 20, 1000000);
+    if (len != 7) { ret 0; }
+    if (buf[13] != '1') { ret 0; }
+    if (buf[14] != '0') { ret 0; }
+    if (buf[19] != '0') { ret 0; }
+    ret 1;
+}
+
+test "transport: u64_to_buf renders 10 correctly" {
+    var buf: [20]u8;
+    val len: usize = u64_to_buf(?buf, 20, 10);
+    if (len != 2) { ret 0; }
+    if (buf[18] != '1') { ret 0; }
+    if (buf[19] != '0') { ret 0; }
+    ret 1;
+}
+
+test "transport: u64_to_buf renders powers of ten" {
+    var buf: [20]u8;
+
+    val len1: usize = u64_to_buf(?buf, 20, 1);
+    if (len1 != 1) { ret 0; }
+    if (buf[19] != '1') { ret 0; }
+
+    val len2: usize = u64_to_buf(?buf, 20, 100);
+    if (len2 != 3) { ret 0; }
+    if (buf[17] != '1') { ret 0; }
+    if (buf[18] != '0') { ret 0; }
+    if (buf[19] != '0') { ret 0; }
+
+    val len3: usize = u64_to_buf(?buf, 20, 10000);
+    if (len3 != 5) { ret 0; }
+    if (buf[15] != '1') { ret 0; }
+    if (buf[19] != '0') { ret 0; }
+
+    ret 1;
+}
+
+test "transport: u64_to_buf digit string matches expected" {
+    # verify that 12345 renders as "12345"
+    var buf: [20]u8;
+    val len: usize = u64_to_buf(?buf, 20, 12345);
+    if (len != 5) { ret 0; }
+    val start: usize = 20 - len;
+    if (buf[start]     != '1') { ret 0; }
+    if (buf[start + 1] != '2') { ret 0; }
+    if (buf[start + 2] != '3') { ret 0; }
+    if (buf[start + 3] != '4') { ret 0; }
+    if (buf[start + 4] != '5') { ret 0; }
+    ret 1;
 }

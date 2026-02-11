@@ -1,46 +1,26 @@
-use std.io.console;
+use std.runtime;
 use std.types.bool;
 
-use handlers;
-use state;
-use transport;
-use util;
+use print: std.print;
 
-fun main() i32 {
-    write(STDERR, "info: mach lsp starting\n");
-    var state_storage: ServerState;
-    val server_state: *ServerState = ?state_storage;
+use server: mach_lsp.server;
 
-    state_init(server_state);
+# mach-lsp: language server entry point.
+# ---
+# initializes the server state and enters the main message loop.
+# communicates via JSON-RPC over stdin/stdout per the LSP specification.
 
-    for (server_state.running) {
-        write(STDERR, "info: waiting for message\n");
-        val body: []u8 = read_message();
-        if (body.data == nil && body.capacity == 0) {
-            if (server_state.running == false) {
-                brk;
-            }
+$main.symbol = "main";
+fun main(argc: i64, argv: &&u8) i64 {
+    print.eprintln("mach-lsp: starting");
 
-            if (server_state.shutdown_requested == false) {
-                server_state.running = false;
-                server_state.exit_status = 1;
-                write(STDERR, "error: input stream closed unexpectedly\n");
-            }
+    var srv: server.Server;
+    server.init(?srv);
 
-            brk;
-        }
+    val exit_code: i64 = server.run(?srv);
 
-        write(STDERR, "info: handling message\n");
-        handle_message(server_state, body);
-        slice_free(body);
+    server.deinit(?srv);
 
-        if (server_state.running == false) {
-            brk;
-        }
-    }
-
-    state_dnit(server_state);
-
-    write(STDERR, "info: mach lsp exiting\n");
-    ret server_state.exit_status;
+    print.eprintln("mach-lsp: exiting");
+    ret exit_code;
 }

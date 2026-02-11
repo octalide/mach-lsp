@@ -1,5 +1,20 @@
-.cache
-.vscode
-out
-cmach
-tmp
+# Build output
+out/
+
+# Dependencies (vendored via mach dep)
+dep/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+.cache/

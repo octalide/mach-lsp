@@ -1,15 +1,28 @@
 [project]
-name = "mach-lsp"
+id = "mach_lsp"
+name = "Mach Language Server"
 version = "0.1.0"
+dir_src = "src"
+dir_dep = "dep"
+dir_out = "out"
+
+target = "native"
+
+[targets.linux]
+os = "linux"
+isa = "x86_64"
+abi = "sysv64"
+mode = "executable"
 entrypoint = "main.mach"
+artifacts = "linux"
+binary = "linux/bin/mach-lsp"
 
-[directories]
-src-dir = "src"
-dep-dir = "dep"
-out-dir = "out"
+[deps.mach-std]
+type = "remote"
+path = "https://github.com/octalide/mach-std"
+version = "branch/dev"
 
-[deps]
-std = { path = "../mach-std", src = "src" }
-
-[modules]
-std = "std"
+[deps.mach]
+type = "remote"
+path = "https://github.com/octalide/mach"
+version = "branch/dev"
