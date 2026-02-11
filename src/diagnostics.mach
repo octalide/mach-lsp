@@ -42,14 +42,14 @@ val MAX_DIAGNOSTICS: i32 = 50;
 # doc:   pointer to the document to diagnose
 # alloc: allocator for temporary buffers
 pub fun publish_diagnostics(doc: *workspace.Document, alloc: allocator.Allocator) {
-    if (doc == nil || doc.uri == nil || doc.uri_len == 0) {
+    if (doc == nil || doc.uri == nil) {
         ret;
     }
 
     var a: allocator.Allocator = alloc;
 
-    # build the source str from the document text
-    val source: str = str{ data: doc.text, len: doc.text_len };
+    # doc.text is already a valid null-terminated str
+    val source: str = doc.text;
 
     # initialize parser
     var alloc_copy: allocator.Allocator = alloc;
@@ -74,15 +74,13 @@ pub fun publish_diagnostics(doc: *workspace.Document, alloc: allocator.Allocator
     #   {"jsonrpc":"2.0","method":"textDocument/publishDiagnostics",
     #    "params":{"uri":"...","diagnostics":[...]}}
 
-    # pre-calculate total buffer size
     # header parts
     val hdr_prefix: str = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":";
     val hdr_mid:    str = ",\"diagnostics\":[";
     val hdr_suffix: str = "]}}";
 
     # quote the URI
-    val uri_str: str = str{ data: doc.uri, len: doc.uri_len };
-    val quoted_uri: str = json.quote(uri_str, a);
+    val quoted_uri: str = json.quote(doc.uri, a);
 
     # build each diagnostic JSON fragment first, store in a temp array
     var diag_strs: *str = nil;
@@ -126,20 +124,27 @@ pub fun publish_diagnostics(doc: *workspace.Document, alloc: allocator.Allocator
     }
 
     # calculate total message size
-    var total: usize = hdr_prefix.len + quoted_uri.len + hdr_mid.len + hdr_suffix.len;
+    val hdr_prefix_len: usize = hdr_prefix.len();
+    val hdr_mid_len: usize = hdr_mid.len();
+    val hdr_suffix_len: usize = hdr_suffix.len();
+    val quoted_uri_len: usize = quoted_uri.len();
+
+    var total: usize = hdr_prefix_len + quoted_uri_len + hdr_mid_len + hdr_suffix_len;
 
     # add diagnostic fragments + commas between them
     var d: i32 = 0;
     for (d < diag_str_count) {
-        total = total + diag_strs[d].len;
+        if (diag_strs[d] != nil) {
+            total = total + diag_strs[d].len();
+        }
         if (d > 0) {
             total = total + 1; # comma
         }
         d = d + 1;
     }
 
-    # allocate and assemble the message
-    val buf_res: Result[*u8, allocator.AllocError] = a.alloc[u8](total);
+    # allocate and assemble the message (+1 for null terminator)
+    val buf_res: Result[*u8, allocator.AllocError] = a.alloc[u8](total + 1);
     if (buf_res.is_err()) {
         # clean up and bail
         cleanup_diag_strs(diag_strs, diag_str_count, a);
@@ -165,12 +170,13 @@ pub fun publish_diagnostics(doc: *workspace.Document, alloc: allocator.Allocator
     }
 
     off = append(buf, off, hdr_suffix);
+    buf[off] = 0;
 
     # send via transport
-    transport.send_message(buf, total, a);
+    transport.send_message(buf::str, a);
 
     # clean up
-    a.free[u8](buf, total);
+    a.free[u8](buf, total + 1);
     cleanup_diag_strs(diag_strs, diag_str_count, a);
     free_str(quoted_uri, a);
     p.deinit();
@@ -181,21 +187,23 @@ pub fun publish_diagnostics(doc: *workspace.Document, alloc: allocator.Allocator
 # doc:   pointer to the document to clear diagnostics for
 # alloc: allocator for temporary buffers
 pub fun clear_diagnostics(doc: *workspace.Document, alloc: allocator.Allocator) {
-    if (doc == nil || doc.uri == nil || doc.uri_len == 0) {
+    if (doc == nil || doc.uri == nil) {
         ret;
     }
 
     var a: allocator.Allocator = alloc;
 
-    val uri_str: str = str{ data: doc.uri, len: doc.uri_len };
-    val quoted_uri: str = json.quote(uri_str, a);
+    val quoted_uri: str = json.quote(doc.uri, a);
 
     val prefix: str = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":";
     val suffix: str = ",\"diagnostics\":[]}}";
 
-    val total: usize = prefix.len + quoted_uri.len + suffix.len;
+    val prefix_len: usize = prefix.len();
+    val suffix_len: usize = suffix.len();
+    val quoted_uri_len: usize = quoted_uri.len();
+    val total: usize = prefix_len + quoted_uri_len + suffix_len;
 
-    val buf_res: Result[*u8, allocator.AllocError] = a.alloc[u8](total);
+    val buf_res: Result[*u8, allocator.AllocError] = a.alloc[u8](total + 1);
     if (buf_res.is_err()) {
         free_str(quoted_uri, a);
         ret;
@@ -206,10 +214,11 @@ pub fun clear_diagnostics(doc: *workspace.Document, alloc: allocator.Allocator) 
     off = append(buf, off, prefix);
     off = append(buf, off, quoted_uri);
     off = append(buf, off, suffix);
+    buf[off] = 0;
 
-    transport.send_message(buf, total, a);
+    transport.send_message(buf::str, a);
 
-    a.free[u8](buf, total);
+    a.free[u8](buf, total + 1);
     free_str(quoted_uri, a);
 }
 
@@ -226,7 +235,7 @@ pub fun clear_diagnostics(doc: *workspace.Document, alloc: allocator.Allocator) 
 # severity:   LSP DiagnosticSeverity value
 # message:    error message
 # alloc:      allocator for the result string
-# ret:        heap-allocated JSON string for this diagnostic
+# ret:        heap-allocated null-terminated JSON string for this diagnostic
 fun build_diagnostic_json(
     start_line: usize, start_char: usize,
     end_line: usize, end_char: usize,
@@ -254,10 +263,23 @@ fun build_diagnostic_json(
     val p6: str = ",\"source\":\"mach\",\"message\":";
     val p7: str = "}";
 
-    val total: usize = p1.len + sl.len + p2.len + sc.len + p3.len + el.len +
-                       p4.len + ec.len + p5.len + sev.len + p6.len + quoted_msg.len + p7.len;
+    var sl_len: usize = 0;
+    if (sl != nil) { sl_len = sl.len(); }
+    var sc_len: usize = 0;
+    if (sc != nil) { sc_len = sc.len(); }
+    var el_len: usize = 0;
+    if (el != nil) { el_len = el.len(); }
+    var ec_len: usize = 0;
+    if (ec != nil) { ec_len = ec.len(); }
+    var sev_len: usize = 0;
+    if (sev != nil) { sev_len = sev.len(); }
+    var quoted_msg_len: usize = 0;
+    if (quoted_msg != nil) { quoted_msg_len = quoted_msg.len(); }
 
-    val buf_res: Result[*u8, allocator.AllocError] = a.alloc[u8](total);
+    val total: usize = p1.len() + sl_len + p2.len() + sc_len + p3.len() + el_len +
+                       p4.len() + ec_len + p5.len() + sev_len + p6.len() + quoted_msg_len + p7.len();
+
+    val buf_res: Result[*u8, allocator.AllocError] = a.alloc[u8](total + 1);
     if (buf_res.is_err()) {
         free_str(sl, a);
         free_str(sc, a);
@@ -265,7 +287,7 @@ fun build_diagnostic_json(
         free_str(ec, a);
         free_str(sev, a);
         free_str(quoted_msg, a);
-        ret str{ data: nil, len: 0 };
+        ret nil;
     }
     val buf: *u8 = buf_res.unwrap_ok();
 
@@ -283,6 +305,7 @@ fun build_diagnostic_json(
     off = append(buf, off, p6);
     off = append(buf, off, quoted_msg);
     off = append(buf, off, p7);
+    buf[off] = 0;
 
     free_str(sl, a);
     free_str(sc, a);
@@ -291,7 +314,7 @@ fun build_diagnostic_json(
     free_str(sev, a);
     free_str(quoted_msg, a);
 
-    ret str{ data: buf, len: total };
+    ret buf::str;
 }
 
 # cleanup_diag_strs: free an array of diagnostic JSON strings.
@@ -314,23 +337,31 @@ fun cleanup_diag_strs(strs: *str, count: i32, alloc: allocator.Allocator) {
 
 # append: copy a str into buf at the given offset and return the new offset.
 fun append(buf: *u8, offset: usize, s: str) usize {
-    if (s.data != nil && s.len > 0) {
-        mem.raw_copy((buf + offset)::ptr, s.data::ptr, s.len);
+    if (s != nil) {
+        val slen: usize = s.len();
+        if (slen > 0) {
+            mem.raw_copy((buf + offset)::ptr, s::ptr, slen);
+        }
+        ret offset + slen;
     }
-    ret offset + s.len;
+    ret offset;
 }
 
 # free_str: free a heap-allocated str.
+# ---
+# the str must have been allocated with +1 for the null terminator.
+# never call on string literals or nil.
 fun free_str(s: str, alloc: allocator.Allocator) {
-    if (s.data != nil && s.len > 0) {
+    if (s != nil) {
+        val len: usize = s.len();
         var a: allocator.Allocator = alloc;
-        a.free[u8](s.data, s.len);
+        a.free_bytes(s::ptr, len + 1, 1);
     }
 }
 
 # format_usize: render an unsigned integer as a decimal digit string.
 # ---
-# the returned str is heap-allocated via alloc.
+# the returned str is heap-allocated (null-terminated) via alloc.
 fun format_usize(value: usize, alloc: allocator.Allocator) str {
     var tmp: [21]u8;
     var pos: usize = 21;
@@ -351,19 +382,20 @@ fun format_usize(value: usize, alloc: allocator.Allocator) str {
 
     val len: usize = 21 - pos;
     var a: allocator.Allocator = alloc;
-    val res: Result[*u8, allocator.AllocError] = a.alloc[u8](len);
+    val res: Result[*u8, allocator.AllocError] = a.alloc[u8](len + 1);
     if (res.is_err()) {
-        ret str{ data: nil, len: 0 };
+        ret nil;
     }
     val buf: *u8 = res.unwrap_ok();
     mem.raw_copy(buf::ptr, (?tmp[pos])::ptr, len);
+    buf[len] = 0;
 
-    ret str{ data: buf, len: len };
+    ret buf::str;
 }
 
 # format_i64: render a signed 64-bit integer as a decimal digit string.
 # ---
-# the returned str is heap-allocated via alloc.
+# the returned str is heap-allocated (null-terminated) via alloc.
 fun format_i64(value: i64, alloc: allocator.Allocator) str {
     var tmp: [21]u8;
     var pos: usize = 21;
@@ -395,12 +427,13 @@ fun format_i64(value: i64, alloc: allocator.Allocator) str {
 
     val len: usize = 21 - pos;
     var a: allocator.Allocator = alloc;
-    val res: Result[*u8, allocator.AllocError] = a.alloc[u8](len);
+    val res: Result[*u8, allocator.AllocError] = a.alloc[u8](len + 1);
     if (res.is_err()) {
-        ret str{ data: nil, len: 0 };
+        ret nil;
     }
     val buf: *u8 = res.unwrap_ok();
     mem.raw_copy(buf::ptr, (?tmp[pos])::ptr, len);
+    buf[len] = 0;
 
-    ret str{ data: buf, len: len };
+    ret buf::str;
 }

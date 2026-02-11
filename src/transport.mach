@@ -22,11 +22,11 @@ use print:     std.print;
 
 # Message: a single JSON-RPC message read from the transport.
 # ---
-# body:     heap-allocated raw JSON payload bytes
-# body_len: length of body in bytes
+# body:     heap-allocated null-terminated JSON payload (str = &char)
+# body_len: cached length of body in bytes (not including null terminator)
 # alloc:    the allocator that owns body (needed for cleanup)
 pub rec Message {
-    body:     *u8;
+    body:     str;
     body_len: usize;
     alloc:    allocator.Allocator;
 }
@@ -36,7 +36,7 @@ pub rec Message {
 # msg: pointer to the message whose body should be freed
 pub fun message_free(msg: *Message) {
     if (msg.body != nil && msg.body_len > 0) {
-        msg.alloc.free[u8](msg.body, msg.body_len);
+        msg.alloc.free_bytes(msg.body::ptr, msg.body_len + 1, 1);
     }
     msg.body = nil;
     msg.body_len = 0;
@@ -55,7 +55,7 @@ val CRLF_CRLF:          str   = "\r\n\r\n";
 # ---
 # reads the header block one byte at a time until the \r\n\r\n terminator
 # is found, extracts the Content-Length value, then reads exactly that many
-# bytes of body payload.
+# bytes of body payload. the body is null-terminated so it can be used as str.
 #
 # msg:   pointer to a Message that will be filled in on success
 # alloc: allocator to use for all internal buffers and the resulting body
@@ -141,9 +141,9 @@ pub fun read_message(msg: *Message, alloc: allocator.Allocator) bool {
 
     val body_len: usize = content_length::usize;
 
-    # --- read body ---
+    # --- read body (allocate +1 for null terminator) ---
 
-    val body_res: Result[*u8, allocator.AllocError] = a.alloc[u8](body_len);
+    val body_res: Result[*u8, allocator.AllocError] = a.alloc[u8](body_len + 1);
     if (body_res.is_err()) {
         print.eprintln("mach-lsp: transport: failed to allocate body buffer");
         ret false;
@@ -152,12 +152,15 @@ pub fun read_message(msg: *Message, alloc: allocator.Allocator) bool {
 
     val read_res: Result[usize, str] = stream.read_exact(?reader, body_buf, body_len);
     if (read_res.is_err()) {
-        a.free[u8](body_buf, body_len);
+        a.free[u8](body_buf, body_len + 1);
         print.eprintln("mach-lsp: transport: failed to read body");
         ret false;
     }
 
-    msg.body = body_buf;
+    # null-terminate so body can be used as str
+    body_buf[body_len] = 0;
+
+    msg.body = body_buf::str;
     msg.body_len = body_len;
     ret true;
 }
@@ -167,11 +170,15 @@ pub fun read_message(msg: *Message, alloc: allocator.Allocator) bool {
 # frames the given JSON body with a Content-Length header and writes
 # everything to stdout in a single logical operation.
 #
-# body:     pointer to the JSON payload bytes
-# body_len: length of the payload in bytes
-# alloc:    allocator for temporary formatting buffers
-pub fun send_message(body: &u8, body_len: usize, alloc: allocator.Allocator) {
-    if (body == nil || body_len == 0) {
+# body:  null-terminated JSON payload string
+# alloc: allocator for temporary formatting buffers
+pub fun send_message(body: str, alloc: allocator.Allocator) {
+    if (body == nil) {
+        ret;
+    }
+
+    val body_len: usize = body.len();
+    if (body_len == 0) {
         ret;
     }
 
@@ -180,12 +187,12 @@ pub fun send_message(body: &u8, body_len: usize, alloc: allocator.Allocator) {
 
     # format the Content-Length digit string
     var digit_buf: [20]u8;
-    val digit_len: usize = u64_to_buf(?digit_buf, 20, body_len);
+    val digit_len: usize = u64_to_buf(?digit_buf[0], 20, body_len);
     val digit_start: usize = 20 - digit_len;
 
     # total frame: "Content-Length: " + digits + "\r\n\r\n" + body
-    val prefix_len: usize = HEADER_PREFIX.len;
-    val sep_len: usize    = CRLF_CRLF.len;
+    val prefix_len: usize = HEADER_PREFIX.len();
+    val sep_len: usize    = CRLF_CRLF.len();
     val total: usize      = prefix_len + digit_len + sep_len + body_len;
 
     val buf_res: Result[*u8, allocator.AllocError] = a.alloc[u8](total);
@@ -198,15 +205,15 @@ pub fun send_message(body: &u8, body_len: usize, alloc: allocator.Allocator) {
     var offset: usize = 0;
 
     # "Content-Length: "
-    mem.raw_copy((buf + offset)::ptr, HEADER_PREFIX.data::ptr, prefix_len);
+    mem.raw_copy((buf + offset)::ptr, HEADER_PREFIX::ptr, prefix_len);
     offset = offset + prefix_len;
 
     # digits
-    mem.raw_copy((buf + offset)::ptr, (?digit_buf + digit_start)::ptr, digit_len);
+    mem.raw_copy((buf + offset)::ptr, (?digit_buf[digit_start])::ptr, digit_len);
     offset = offset + digit_len;
 
     # "\r\n\r\n"
-    mem.raw_copy((buf + offset)::ptr, CRLF_CRLF.data::ptr, sep_len);
+    mem.raw_copy((buf + offset)::ptr, CRLF_CRLF::ptr, sep_len);
     offset = offset + sep_len;
 
     # JSON body
@@ -215,17 +222,6 @@ pub fun send_message(body: &u8, body_len: usize, alloc: allocator.Allocator) {
     stream.write_all(?writer, buf, total);
 
     a.free[u8](buf, total);
-}
-
-# send_str: convenience wrapper that sends a str as a complete LSP message.
-# ---
-# s:     the JSON-RPC response body
-# alloc: allocator for temporary buffers
-pub fun send_str(s: str, alloc: allocator.Allocator) {
-    if (s.data == nil || s.len == 0) {
-        ret;
-    }
-    send_message(s.data, s.len, alloc);
 }
 
 # --- internal helpers ---
@@ -280,7 +276,7 @@ fun parse_content_length(hdr: &u8, hdr_len: usize) i64 {
                             if (ch >= 'A' && ch <= 'Z') {
                                 ch = ch + 32;
                             }
-                            if (ch != CL_KEY.data[k]) {
+                            if (ch != CL_KEY[k]) {
                                 match = false;
                                 brk;
                             }
@@ -363,84 +359,84 @@ fun u64_to_buf(buf: *u8, buf_cap: usize, value: usize) usize {
 
 test "transport: parse_content_length extracts value from standard header" {
     val hdr: str = "Content-Length: 42\r\n\r\n";
-    val result: i64 = parse_content_length(hdr.data, hdr.len);
+    val result: i64 = parse_content_length(hdr::&u8, hdr.len());
     if (result != 42) { ret 0; }
     ret 1;
 }
 
 test "transport: parse_content_length is case-insensitive" {
     val hdr: str = "content-length: 100\r\n\r\n";
-    val result: i64 = parse_content_length(hdr.data, hdr.len);
+    val result: i64 = parse_content_length(hdr::&u8, hdr.len());
     if (result != 100) { ret 0; }
     ret 1;
 }
 
 test "transport: parse_content_length handles mixed case" {
     val hdr: str = "Content-LENGTH: 7\r\n\r\n";
-    val result: i64 = parse_content_length(hdr.data, hdr.len);
+    val result: i64 = parse_content_length(hdr::&u8, hdr.len());
     if (result != 7) { ret 0; }
     ret 1;
 }
 
 test "transport: parse_content_length handles large value" {
     val hdr: str = "Content-Length: 999999\r\n\r\n";
-    val result: i64 = parse_content_length(hdr.data, hdr.len);
+    val result: i64 = parse_content_length(hdr::&u8, hdr.len());
     if (result != 999999) { ret 0; }
     ret 1;
 }
 
 test "transport: parse_content_length ignores other headers" {
     val hdr: str = "Content-Type: application/json\r\nContent-Length: 55\r\n\r\n";
-    val result: i64 = parse_content_length(hdr.data, hdr.len);
+    val result: i64 = parse_content_length(hdr::&u8, hdr.len());
     if (result != 55) { ret 0; }
     ret 1;
 }
 
 test "transport: parse_content_length returns -1 for missing header" {
     val hdr: str = "Content-Type: application/json\r\n\r\n";
-    val result: i64 = parse_content_length(hdr.data, hdr.len);
+    val result: i64 = parse_content_length(hdr::&u8, hdr.len());
     if (result != -1) { ret 0; }
     ret 1;
 }
 
 test "transport: parse_content_length returns -1 for empty header" {
     val hdr: str = "\r\n\r\n";
-    val result: i64 = parse_content_length(hdr.data, hdr.len);
+    val result: i64 = parse_content_length(hdr::&u8, hdr.len());
     if (result != -1) { ret 0; }
     ret 1;
 }
 
 test "transport: parse_content_length handles bare LF line endings" {
     val hdr: str = "Content-Length: 10\n\n";
-    val result: i64 = parse_content_length(hdr.data, hdr.len);
+    val result: i64 = parse_content_length(hdr::&u8, hdr.len());
     if (result != 10) { ret 0; }
     ret 1;
 }
 
 test "transport: parse_content_length skips whitespace after colon" {
     val hdr: str = "Content-Length:   \t  77\r\n\r\n";
-    val result: i64 = parse_content_length(hdr.data, hdr.len);
+    val result: i64 = parse_content_length(hdr::&u8, hdr.len());
     if (result != 77) { ret 0; }
     ret 1;
 }
 
 test "transport: parse_content_length returns -1 for non-numeric value" {
     val hdr: str = "Content-Length: abc\r\n\r\n";
-    val result: i64 = parse_content_length(hdr.data, hdr.len);
+    val result: i64 = parse_content_length(hdr::&u8, hdr.len());
     if (result != -1) { ret 0; }
     ret 1;
 }
 
 test "transport: parse_content_length stops parsing at non-digit" {
     val hdr: str = "Content-Length: 123xyz\r\n\r\n";
-    val result: i64 = parse_content_length(hdr.data, hdr.len);
+    val result: i64 = parse_content_length(hdr::&u8, hdr.len());
     if (result != 123) { ret 0; }
     ret 1;
 }
 
 test "transport: u64_to_buf renders zero" {
     var buf: [20]u8;
-    val len: usize = u64_to_buf(?buf, 20, 0);
+    val len: usize = u64_to_buf(?buf[0], 20, 0);
     if (len != 1) { ret 0; }
     if (buf[19] != '0') { ret 0; }
     ret 1;
@@ -448,7 +444,7 @@ test "transport: u64_to_buf renders zero" {
 
 test "transport: u64_to_buf renders single digit" {
     var buf: [20]u8;
-    val len: usize = u64_to_buf(?buf, 20, 7);
+    val len: usize = u64_to_buf(?buf[0], 20, 7);
     if (len != 1) { ret 0; }
     if (buf[19] != '7') { ret 0; }
     ret 1;
@@ -456,7 +452,7 @@ test "transport: u64_to_buf renders single digit" {
 
 test "transport: u64_to_buf renders multi-digit number" {
     var buf: [20]u8;
-    val len: usize = u64_to_buf(?buf, 20, 42);
+    val len: usize = u64_to_buf(?buf[0], 20, 42);
     if (len != 2) { ret 0; }
     if (buf[18] != '4') { ret 0; }
     if (buf[19] != '2') { ret 0; }
@@ -465,7 +461,7 @@ test "transport: u64_to_buf renders multi-digit number" {
 
 test "transport: u64_to_buf renders large number" {
     var buf: [20]u8;
-    val len: usize = u64_to_buf(?buf, 20, 1000000);
+    val len: usize = u64_to_buf(?buf[0], 20, 1000000);
     if (len != 7) { ret 0; }
     if (buf[13] != '1') { ret 0; }
     if (buf[14] != '0') { ret 0; }
@@ -475,7 +471,7 @@ test "transport: u64_to_buf renders large number" {
 
 test "transport: u64_to_buf renders 10 correctly" {
     var buf: [20]u8;
-    val len: usize = u64_to_buf(?buf, 20, 10);
+    val len: usize = u64_to_buf(?buf[0], 20, 10);
     if (len != 2) { ret 0; }
     if (buf[18] != '1') { ret 0; }
     if (buf[19] != '0') { ret 0; }
@@ -485,17 +481,17 @@ test "transport: u64_to_buf renders 10 correctly" {
 test "transport: u64_to_buf renders powers of ten" {
     var buf: [20]u8;
 
-    val len1: usize = u64_to_buf(?buf, 20, 1);
+    val len1: usize = u64_to_buf(?buf[0], 20, 1);
     if (len1 != 1) { ret 0; }
     if (buf[19] != '1') { ret 0; }
 
-    val len2: usize = u64_to_buf(?buf, 20, 100);
+    val len2: usize = u64_to_buf(?buf[0], 20, 100);
     if (len2 != 3) { ret 0; }
     if (buf[17] != '1') { ret 0; }
     if (buf[18] != '0') { ret 0; }
     if (buf[19] != '0') { ret 0; }
 
-    val len3: usize = u64_to_buf(?buf, 20, 10000);
+    val len3: usize = u64_to_buf(?buf[0], 20, 10000);
     if (len3 != 5) { ret 0; }
     if (buf[15] != '1') { ret 0; }
     if (buf[19] != '0') { ret 0; }
@@ -506,7 +502,7 @@ test "transport: u64_to_buf renders powers of ten" {
 test "transport: u64_to_buf digit string matches expected" {
     # verify that 12345 renders as "12345"
     var buf: [20]u8;
-    val len: usize = u64_to_buf(?buf, 20, 12345);
+    val len: usize = u64_to_buf(?buf[0], 20, 12345);
     if (len != 5) { ret 0; }
     val start: usize = 20 - len;
     if (buf[start]     != '1') { ret 0; }

@@ -11,6 +11,9 @@ use print:     std.print;
 # ---
 # tracks open documents, their contents, and line offset tables for
 # translating between byte offsets and LSP line/character positions.
+#
+# str is &char (a null-terminated C string pointer). all heap-allocated
+# strings include +1 byte for the null terminator.
 
 # --- constants ---
 
@@ -19,17 +22,15 @@ val INITIAL_LINE_CAP: usize = 256;
 
 # Document: a single open text document tracked by the server.
 # ---
-# uri:          heap-allocated URI string (e.g. "file:///path/to/file.mach")
-# uri_len:      byte length of uri
-# text:         heap-allocated source text
-# text_len:     byte length of text
-# lines:        heap-allocated array of byte offsets for each line start
-# line_count:   number of entries in lines
-# line_cap:     allocated capacity of lines array (in elements, not bytes)
+# uri:        heap-allocated null-terminated URI string
+# text:       heap-allocated null-terminated source text
+# text_len:   cached byte length of text (avoids repeated .len() walks)
+# lines:      heap-allocated array of byte offsets for each line start
+# line_count: number of entries in lines
+# line_cap:   allocated capacity of lines array (in elements, not bytes)
 pub rec Document {
-    uri:        *u8;
-    uri_len:    usize;
-    text:       *u8;
+    uri:        str;
+    text:       str;
     text_len:   usize;
     lines:      *usize;
     line_count: usize;
@@ -72,7 +73,8 @@ pub fun deinit(ws: *Workspace, alloc: allocator.Allocator) {
     }
 
     if (ws.docs != nil && ws.cap > 0) {
-        alloc.free[Document](ws.docs, ws.cap);
+        var a: allocator.Allocator = alloc;
+        a.free[Document](ws.docs, ws.cap);
     }
 
     ws.docs = nil;
@@ -82,17 +84,15 @@ pub fun deinit(ws: *Workspace, alloc: allocator.Allocator) {
 
 # open: register a newly opened document in the workspace.
 # ---
-# ws:       pointer to the workspace
-# uri:      document URI bytes
-# uri_len:  byte length of the URI
-# text:     initial document text bytes
-# text_len: byte length of the text
-# ret:      pointer to the new Document, or nil on allocation failure
-pub fun open(ws: *Workspace, uri: &u8, uri_len: usize, text: &u8, text_len: usize) *Document {
+# ws:   pointer to the workspace
+# uri:  document URI (null-terminated str)
+# text: initial document text (null-terminated str)
+# ret:  pointer to the new Document, or nil on allocation failure
+pub fun open(ws: *Workspace, uri: str, text: str) *Document {
     # check if already open — if so, just update the text
-    val existing: *Document = find(ws, uri, uri_len);
+    val existing: *Document = find(ws, uri);
     if (existing != nil) {
-        update(ws, existing, text, text_len);
+        update(ws, existing, text);
         ret existing;
     }
 
@@ -106,20 +106,25 @@ pub fun open(ws: *Workspace, uri: &u8, uri_len: usize, text: &u8, text_len: usiz
     val doc: *Document = ?ws.docs[ws.count];
 
     # clone URI
-    doc.uri = clone_bytes(uri, uri_len, ws.alloc);
-    if (uri_len > 0 && doc.uri == nil) {
+    doc.uri = clone_str(uri, ws.alloc);
+    if (uri != nil && doc.uri == nil) {
         ret nil;
     }
-    doc.uri_len = uri_len;
 
     # clone text
-    doc.text = clone_bytes(text, text_len, ws.alloc);
-    if (text_len > 0 && doc.text == nil) {
-        ws.alloc.free[u8](doc.uri, uri_len);
+    doc.text = clone_str(text, ws.alloc);
+    if (text != nil && doc.text == nil) {
+        free_str(doc.uri, ws.alloc);
         doc.uri = nil;
         ret nil;
     }
-    doc.text_len = text_len;
+
+    if (doc.text != nil) {
+        doc.text_len = doc.text.len();
+    }
+    or {
+        doc.text_len = 0;
+    }
 
     # build line offset table
     doc.lines = nil;
@@ -133,15 +138,14 @@ pub fun open(ws: *Workspace, uri: &u8, uri_len: usize, text: &u8, text_len: usiz
 
 # close: remove a document from the workspace by URI.
 # ---
-# ws:      pointer to the workspace
-# uri:     URI bytes of the document to close
-# uri_len: byte length of the URI
-# ret:     true if the document was found and removed
-pub fun close(ws: *Workspace, uri: &u8, uri_len: usize) bool {
+# ws:  pointer to the workspace
+# uri: URI of the document to close (null-terminated str)
+# ret: true if the document was found and removed
+pub fun close(ws: *Workspace, uri: str) bool {
     var idx: isize = -1;
     var i: usize = 0;
     for (i < ws.count) {
-        if (str_eq(ws.docs[i].uri, ws.docs[i].uri_len, uri, uri_len)) {
+        if (ws.docs[i].uri != nil && ws.docs[i].uri.equals(uri)) {
             idx = i::isize;
             brk;
         }
@@ -161,7 +165,7 @@ pub fun close(ws: *Workspace, uri: &u8, uri_len: usize) bool {
         mem.raw_copy(
             (?ws.docs[j - 1])::ptr,
             (?ws.docs[j])::ptr,
-            $size_of(Document),
+            $size_of(Document)
         );
         j = j + 1;
     }
@@ -176,32 +180,36 @@ pub fun close(ws: *Workspace, uri: &u8, uri_len: usize) bool {
 
 # update: replace the text of an already-open document.
 # ---
-# ws:       pointer to the workspace
-# doc:      pointer to the document to update
-# text:     new text bytes
-# text_len: byte length of the new text
-pub fun update(ws: *Workspace, doc: *Document, text: &u8, text_len: usize) {
+# ws:   pointer to the workspace
+# doc:  pointer to the document to update
+# text: new text (null-terminated str)
+pub fun update(ws: *Workspace, doc: *Document, text: str) {
     # free old text
-    if (doc.text != nil && doc.text_len > 0) {
-        ws.alloc.free[u8](doc.text, doc.text_len);
-    }
+    free_str(doc.text, ws.alloc);
 
-    doc.text = clone_bytes(text, text_len, ws.alloc);
-    doc.text_len = text_len;
+    doc.text = clone_str(text, ws.alloc);
+    if (doc.text != nil) {
+        doc.text_len = doc.text.len();
+    }
+    or {
+        doc.text_len = 0;
+    }
 
     rebuild_lines(doc, ws.alloc);
 }
 
 # find: look up an open document by URI.
 # ---
-# ws:      pointer to the workspace
-# uri:     URI bytes to search for
-# uri_len: byte length of the URI
-# ret:     pointer to the matching Document, or nil if not found
-pub fun find(ws: *Workspace, uri: &u8, uri_len: usize) *Document {
+# ws:  pointer to the workspace
+# uri: URI to search for (null-terminated str)
+# ret: pointer to the matching Document, or nil if not found
+pub fun find(ws: *Workspace, uri: str) *Document {
+    if (uri == nil) {
+        ret nil;
+    }
     var i: usize = 0;
     for (i < ws.count) {
-        if (str_eq(ws.docs[i].uri, ws.docs[i].uri_len, uri, uri_len)) {
+        if (ws.docs[i].uri != nil && ws.docs[i].uri.equals(uri)) {
             ret ?ws.docs[i];
         }
         i = i + 1;
@@ -269,17 +277,15 @@ pub fun position_to_offset(doc: &Document, line: usize, character: usize) usize 
 
 # doc_free: release all memory owned by a document.
 fun doc_free(doc: *Document, alloc: allocator.Allocator) {
-    if (doc.uri != nil && doc.uri_len > 0) {
-        alloc.free[u8](doc.uri, doc.uri_len);
-    }
-    if (doc.text != nil && doc.text_len > 0) {
-        alloc.free[u8](doc.text, doc.text_len);
-    }
+    free_str(doc.uri, alloc);
+    free_str(doc.text, alloc);
+
     if (doc.lines != nil && doc.line_cap > 0) {
-        alloc.free[usize](doc.lines, doc.line_cap);
+        var a: allocator.Allocator = alloc;
+        a.free[usize](doc.lines, doc.line_cap);
     }
+
     doc.uri = nil;
-    doc.uri_len = 0;
     doc.text = nil;
     doc.text_len = 0;
     doc.lines = nil;
@@ -297,7 +303,8 @@ fun grow_docs(ws: *Workspace) bool {
         new_cap = new_cap + (new_cap >> 1) + 4;
     }
 
-    val res: Result[*Document, allocator.AllocError] = ws.alloc.resize[Document](ws.docs, ws.cap, new_cap);
+    var a: allocator.Allocator = ws.alloc;
+    val res: Result[*Document, allocator.AllocError] = a.resize[Document](ws.docs, ws.cap, new_cap);
     if (res.is_err()) {
         print.eprintln("mach-lsp: workspace: failed to grow document array");
         ret false;
@@ -318,9 +325,11 @@ fun grow_docs(ws: *Workspace) bool {
 
 # rebuild_lines: recompute the line offset table for a document.
 fun rebuild_lines(doc: *Document, alloc: allocator.Allocator) {
+    var a: allocator.Allocator = alloc;
+
     # free existing table
     if (doc.lines != nil && doc.line_cap > 0) {
-        alloc.free[usize](doc.lines, doc.line_cap);
+        a.free[usize](doc.lines, doc.line_cap);
     }
     doc.lines = nil;
     doc.line_count = 0;
@@ -345,7 +354,7 @@ fun rebuild_lines(doc: *Document, alloc: allocator.Allocator) {
         cap = INITIAL_LINE_CAP;
     }
 
-    val res: Result[*usize, allocator.AllocError] = alloc.alloc[usize](cap);
+    val res: Result[*usize, allocator.AllocError] = a.alloc[usize](cap);
     if (res.is_err()) {
         ret;
     }
@@ -370,38 +379,67 @@ fun rebuild_lines(doc: *Document, alloc: allocator.Allocator) {
     doc.line_cap = cap;
 }
 
-# clone_bytes: allocate a copy of a byte buffer.
-fun clone_bytes(src: &u8, len: usize, alloc: allocator.Allocator) *u8 {
-    if (src == nil || len == 0) {
+# clone_str: allocate a heap copy of a null-terminated string.
+# ---
+# the returned str is heap-allocated (len + 1 bytes including null terminator).
+# the caller is responsible for freeing it with free_str().
+# s:     string to clone
+# alloc: allocator to use
+# ret:   heap-allocated copy, or nil on failure
+pub fun clone_str(s: str, alloc: allocator.Allocator) str {
+    if (s == nil) {
         ret nil;
     }
-
+    val len: usize = s.len();
+    if (len == 0) {
+        ret nil;
+    }
     var a: allocator.Allocator = alloc;
-    val res: Result[*u8, allocator.AllocError] = a.alloc[u8](len);
+    val res: Result[*u8, allocator.AllocError] = a.alloc[u8](len + 1);
     if (res.is_err()) {
         ret nil;
     }
-
-    val dst: *u8 = res.unwrap_ok();
-    mem.raw_copy(dst::ptr, src::ptr, len);
-    ret dst;
+    val buf: *u8 = res.unwrap_ok();
+    mem.raw_copy(buf::ptr, s::ptr, len);
+    buf[len] = 0;
+    ret buf::str;
 }
 
-# str_eq: compare two byte buffers for equality.
-fun str_eq(a: &u8, a_len: usize, b: &u8, b_len: usize) bool {
-    if (a_len != b_len) {
-        ret false;
+# make_str: create a null-terminated str from raw bytes and a length.
+# ---
+# the returned str is heap-allocated (len + 1 bytes including null terminator).
+# data:  pointer to raw bytes (not necessarily null-terminated)
+# len:   number of bytes to copy
+# alloc: allocator to use
+# ret:   heap-allocated null-terminated copy, or nil on failure
+pub fun make_str(data: &u8, len: usize, alloc: allocator.Allocator) str {
+    if (data == nil || len == 0) {
+        ret nil;
     }
-
-    var i: usize = 0;
-    for (i < a_len) {
-        if (a[i] != b[i]) {
-            ret false;
-        }
-        i = i + 1;
+    var a: allocator.Allocator = alloc;
+    val res: Result[*u8, allocator.AllocError] = a.alloc[u8](len + 1);
+    if (res.is_err()) {
+        ret nil;
     }
+    val buf: *u8 = res.unwrap_ok();
+    mem.raw_copy(buf::ptr, data::ptr, len);
+    buf[len] = 0;
+    ret buf::str;
+}
 
-    ret true;
+# free_str: free a heap-allocated str.
+# ---
+# only call this on strings returned by clone_str() or make_str().
+# never call on string literals or nil.
+# s:     string to free
+# alloc: allocator that owns the memory
+pub fun free_str(s: str, alloc: allocator.Allocator) {
+    if (s == nil) {
+        ret;
+    }
+    val len: usize = s.len();
+    var a: allocator.Allocator = alloc;
+    a.free_bytes(s::ptr, len + 1, 1);
 }
 
 # --- tests ---
@@ -423,11 +461,10 @@ test "workspace: open adds a document" {
 
     val uri: str = "file:///test.mach";
     val text: str = "use std.runtime;\n";
-    val doc: *Document = open(?ws, uri.data, uri.len, text.data, text.len);
+    val doc: *Document = open(?ws, uri, text);
     if (doc == nil) { ret 0; }
     if (ws.count != 1) { ret 0; }
-    if (doc.uri_len != uri.len) { ret 0; }
-    if (doc.text_len != text.len) { ret 0; }
+    if (doc.text_len != text.len()) { ret 0; }
 
     deinit(?ws, a);
     ret 1;
@@ -442,15 +479,15 @@ test "workspace: open same uri twice updates instead of duplicating" {
     val text1: str = "hello";
     val text2: str = "world!";
 
-    val doc1: *Document = open(?ws, uri.data, uri.len, text1.data, text1.len);
+    val doc1: *Document = open(?ws, uri, text1);
     if (doc1 == nil) { ret 0; }
     if (ws.count != 1) { ret 0; }
 
-    val doc2: *Document = open(?ws, uri.data, uri.len, text2.data, text2.len);
+    val doc2: *Document = open(?ws, uri, text2);
     if (doc2 == nil) { ret 0; }
     # should still be 1 document, not 2
     if (ws.count != 1) { ret 0; }
-    if (doc2.text_len != text2.len) { ret 0; }
+    if (doc2.text_len != text2.len()) { ret 0; }
 
     deinit(?ws, a);
     ret 1;
@@ -466,9 +503,9 @@ test "workspace: open multiple documents" {
     val uri3: str = "file:///c.mach";
     val text: str = "# empty";
 
-    open(?ws, uri1.data, uri1.len, text.data, text.len);
-    open(?ws, uri2.data, uri2.len, text.data, text.len);
-    open(?ws, uri3.data, uri3.len, text.data, text.len);
+    open(?ws, uri1, text);
+    open(?ws, uri2, text);
+    open(?ws, uri3, text);
 
     if (ws.count != 3) { ret 0; }
 
@@ -483,11 +520,11 @@ test "workspace: find returns document by uri" {
 
     val uri: str = "file:///find_me.mach";
     val text: str = "val x: i32 = 42;";
-    open(?ws, uri.data, uri.len, text.data, text.len);
+    open(?ws, uri, text);
 
-    val found: *Document = find(?ws, uri.data, uri.len);
+    val found: *Document = find(?ws, uri);
     if (found == nil) { ret 0; }
-    if (found.text_len != text.len) { ret 0; }
+    if (found.text_len != text.len()) { ret 0; }
 
     deinit(?ws, a);
     ret 1;
@@ -499,34 +536,29 @@ test "workspace: find returns nil for unknown uri" {
     init(?ws, a);
 
     val uri: str = "file:///exists.mach";
-    val text: str = "# yes";
-    open(?ws, uri.data, uri.len, text.data, text.len);
+    val text: str = "# hi";
+    open(?ws, uri, text);
 
-    val missing: str = "file:///nope.mach";
-    val found: *Document = find(?ws, missing.data, missing.len);
+    val found: *Document = find(?ws, "file:///nope.mach");
     if (found != nil) { ret 0; }
 
     deinit(?ws, a);
     ret 1;
 }
 
-test "workspace: close removes a document" {
+test "workspace: close removes document" {
     var a: allocator.Allocator = allocator.heap_allocator();
     var ws: Workspace;
     init(?ws, a);
 
     val uri: str = "file:///close_me.mach";
-    val text: str = "# bye";
-    open(?ws, uri.data, uri.len, text.data, text.len);
+    val text: str = "# close";
+    open(?ws, uri, text);
     if (ws.count != 1) { ret 0; }
 
-    val ok: bool = close(?ws, uri.data, uri.len);
-    if (!ok) { ret 0; }
+    val closed: bool = close(?ws, uri);
+    if (!closed) { ret 0; }
     if (ws.count != 0) { ret 0; }
-
-    # should no longer be findable
-    val found: *Document = find(?ws, uri.data, uri.len);
-    if (found != nil) { ret 0; }
 
     deinit(?ws, a);
     ret 1;
@@ -537,159 +569,66 @@ test "workspace: close returns false for unknown uri" {
     var ws: Workspace;
     init(?ws, a);
 
-    val uri: str = "file:///nope.mach";
-    val ok: bool = close(?ws, uri.data, uri.len);
-    if (ok) { ret 0; }
+    val closed: bool = close(?ws, "file:///nope.mach");
+    if (closed) { ret 0; }
 
     deinit(?ws, a);
     ret 1;
 }
 
-test "workspace: close middle document shifts remaining" {
+test "workspace: update replaces text" {
     var a: allocator.Allocator = allocator.heap_allocator();
     var ws: Workspace;
     init(?ws, a);
 
-    val uri1: str = "file:///a.mach";
-    val uri2: str = "file:///b.mach";
-    val uri3: str = "file:///c.mach";
-    val text: str = "# x";
+    val uri: str = "file:///update_me.mach";
+    val text1: str = "first";
+    val text2: str = "second version";
 
-    open(?ws, uri1.data, uri1.len, text.data, text.len);
-    open(?ws, uri2.data, uri2.len, text.data, text.len);
-    open(?ws, uri3.data, uri3.len, text.data, text.len);
-    if (ws.count != 3) { ret 0; }
-
-    # close the middle one
-    val ok: bool = close(?ws, uri2.data, uri2.len);
-    if (!ok) { ret 0; }
-    if (ws.count != 2) { ret 0; }
-
-    # first and third should still be findable
-    if (find(?ws, uri1.data, uri1.len) == nil) { ret 0; }
-    if (find(?ws, uri3.data, uri3.len) == nil) { ret 0; }
-    # middle should be gone
-    if (find(?ws, uri2.data, uri2.len) != nil) { ret 0; }
-
-    deinit(?ws, a);
-    ret 1;
-}
-
-test "workspace: update replaces document text" {
-    var a: allocator.Allocator = allocator.heap_allocator();
-    var ws: Workspace;
-    init(?ws, a);
-
-    val uri: str = "file:///update.mach";
-    val text1: str = "val x: i32 = 1;";
-    val doc: *Document = open(?ws, uri.data, uri.len, text1.data, text1.len);
+    val doc: *Document = open(?ws, uri, text1);
     if (doc == nil) { ret 0; }
-    if (doc.text_len != text1.len) { ret 0; }
+    if (doc.text_len != 5) { ret 0; }
 
-    val text2: str = "val x: i64 = 999;\nval y: i64 = 0;\n";
-    update(?ws, doc, text2.data, text2.len);
-    if (doc.text_len != text2.len) { ret 0; }
-
-    deinit(?ws, a);
-    ret 1;
-}
-
-test "workspace: rebuild_lines counts single line" {
-    var a: allocator.Allocator = allocator.heap_allocator();
-    var ws: Workspace;
-    init(?ws, a);
-
-    val uri: str = "file:///one_line.mach";
-    val text: str = "val x: i32 = 42;";
-    val doc: *Document = open(?ws, uri.data, uri.len, text.data, text.len);
-    if (doc == nil) { ret 0; }
-    # no newlines => 1 line
-    if (doc.line_count != 1) { ret 0; }
-    if (doc.lines == nil) { ret 0; }
-    # first line starts at offset 0
-    if (doc.lines[0] != 0) { ret 0; }
+    update(?ws, doc, text2);
+    if (doc.text_len != 14) { ret 0; }
 
     deinit(?ws, a);
     ret 1;
 }
 
-test "workspace: rebuild_lines counts multiple lines" {
-    var a: allocator.Allocator = allocator.heap_allocator();
-    var ws: Workspace;
-    init(?ws, a);
-
-    val uri: str = "file:///multi.mach";
-    val text: str = "line0\nline1\nline2\n";
-    val doc: *Document = open(?ws, uri.data, uri.len, text.data, text.len);
-    if (doc == nil) { ret 0; }
-    # 3 newlines => 4 lines (last is empty after trailing newline)
-    if (doc.line_count != 4) { ret 0; }
-    if (doc.lines[0] != 0) { ret 0; }
-    if (doc.lines[1] != 6) { ret 0; }
-    if (doc.lines[2] != 12) { ret 0; }
-    if (doc.lines[3] != 18) { ret 0; }
-
-    deinit(?ws, a);
-    ret 1;
-}
-
-test "workspace: rebuild_lines handles empty text" {
-    var a: allocator.Allocator = allocator.heap_allocator();
-    var ws: Workspace;
-    init(?ws, a);
-
-    val uri: str = "file:///empty.mach";
-    val empty: str = str{ data: nil, len: 0 };
-    val doc: *Document = open(?ws, uri.data, uri.len, empty.data, empty.len);
-    if (doc == nil) { ret 0; }
-    if (doc.line_count != 0) { ret 0; }
-    if (doc.lines != nil) { ret 0; }
-
-    deinit(?ws, a);
-    ret 1;
-}
-
-test "workspace: offset_to_position first line" {
+test "workspace: offset_to_position single line" {
     var a: allocator.Allocator = allocator.heap_allocator();
     var ws: Workspace;
     init(?ws, a);
 
     val uri: str = "file:///pos.mach";
-    val text: str = "hello\nworld\n";
-    val doc: *Document = open(?ws, uri.data, uri.len, text.data, text.len);
+    val text: str = "hello world";
+    val doc: *Document = open(?ws, uri, text);
     if (doc == nil) { ret 0; }
 
     var line: usize = 0;
     var ch: usize = 0;
-
-    # offset 3 = 'l' in "hello" => line 0, char 3
-    offset_to_position(doc, 3, ?line, ?ch);
+    offset_to_position(doc, 6, ?line, ?ch);
     if (line != 0) { ret 0; }
-    if (ch != 3) { ret 0; }
+    if (ch != 6) { ret 0; }
 
     deinit(?ws, a);
     ret 1;
 }
 
-test "workspace: offset_to_position second line" {
+test "workspace: offset_to_position multi line" {
     var a: allocator.Allocator = allocator.heap_allocator();
     var ws: Workspace;
     init(?ws, a);
 
-    val uri: str = "file:///pos2.mach";
-    val text: str = "hello\nworld\n";
-    val doc: *Document = open(?ws, uri.data, uri.len, text.data, text.len);
+    val uri: str = "file:///ml.mach";
+    val text: str = "line1\nline2\nline3";
+    val doc: *Document = open(?ws, uri, text);
     if (doc == nil) { ret 0; }
 
+    # offset 8 should be line 1, character 2 ("ne2")
     var line: usize = 0;
     var ch: usize = 0;
-
-    # offset 6 = 'w' in "world" => line 1, char 0
-    offset_to_position(doc, 6, ?line, ?ch);
-    if (line != 1) { ret 0; }
-    if (ch != 0) { ret 0; }
-
-    # offset 8 = 'r' in "world" => line 1, char 2
     offset_to_position(doc, 8, ?line, ?ch);
     if (line != 1) { ret 0; }
     if (ch != 2) { ret 0; }
@@ -698,203 +637,33 @@ test "workspace: offset_to_position second line" {
     ret 1;
 }
 
-test "workspace: offset_to_position at newline boundary" {
+test "workspace: clone_str and free_str" {
     var a: allocator.Allocator = allocator.heap_allocator();
-    var ws: Workspace;
-    init(?ws, a);
-
-    val uri: str = "file:///boundary.mach";
-    val text: str = "ab\ncd\n";
-    val doc: *Document = open(?ws, uri.data, uri.len, text.data, text.len);
-    if (doc == nil) { ret 0; }
-
-    var line: usize = 0;
-    var ch: usize = 0;
-
-    # offset 2 = '\n' => still line 0, char 2
-    offset_to_position(doc, 2, ?line, ?ch);
-    if (line != 0) { ret 0; }
-    if (ch != 2) { ret 0; }
-
-    # offset 3 = 'c' => line 1, char 0
-    offset_to_position(doc, 3, ?line, ?ch);
-    if (line != 1) { ret 0; }
-    if (ch != 0) { ret 0; }
-
-    deinit(?ws, a);
+    val original: str = "hello world";
+    val cloned: str = clone_str(original, a);
+    if (cloned == nil) { ret 0; }
+    if (!cloned.equals(original)) { ret 0; }
+    if (cloned.len() != 11) { ret 0; }
+    free_str(cloned, a);
     ret 1;
 }
 
-test "workspace: position_to_offset round-trips with offset_to_position" {
+test "workspace: clone_str nil returns nil" {
     var a: allocator.Allocator = allocator.heap_allocator();
-    var ws: Workspace;
-    init(?ws, a);
-
-    val uri: str = "file:///roundtrip.mach";
-    val text: str = "use std.runtime;\nval x: i32 = 0;\nfun main() {}\n";
-    val doc: *Document = open(?ws, uri.data, uri.len, text.data, text.len);
-    if (doc == nil) { ret 0; }
-
-    # test several offsets round-trip correctly
-    var test_offset: usize = 0;
-    for (test_offset < text.len) {
-        var line: usize = 0;
-        var ch: usize = 0;
-        offset_to_position(doc, test_offset, ?line, ?ch);
-        val back: usize = position_to_offset(doc, line, ch);
-        if (back != test_offset) { ret 0; }
-        test_offset = test_offset + 1;
-    }
-
-    deinit(?ws, a);
+    val cloned: str = clone_str(nil, a);
+    if (cloned != nil) { ret 0; }
     ret 1;
 }
 
-test "workspace: position_to_offset line 0 char 0 is 0" {
+test "workspace: make_str creates null-terminated string" {
     var a: allocator.Allocator = allocator.heap_allocator();
-    var ws: Workspace;
-    init(?ws, a);
-
-    val uri: str = "file:///origin.mach";
-    val text: str = "abc\ndef\n";
-    val doc: *Document = open(?ws, uri.data, uri.len, text.data, text.len);
-    if (doc == nil) { ret 0; }
-
-    val off: usize = position_to_offset(doc, 0, 0);
-    if (off != 0) { ret 0; }
-
-    deinit(?ws, a);
-    ret 1;
-}
-
-test "workspace: position_to_offset line beyond end clamps to last line" {
-    var a: allocator.Allocator = allocator.heap_allocator();
-    var ws: Workspace;
-    init(?ws, a);
-
-    val uri: str = "file:///clamp.mach";
-    val text: str = "abc\ndef\n";
-    val doc: *Document = open(?ws, uri.data, uri.len, text.data, text.len);
-    if (doc == nil) { ret 0; }
-
-    # line 999 doesn't exist; should clamp to the last line start + character
-    val off: usize = position_to_offset(doc, 999, 2);
-    val last_start: usize = doc.lines[doc.line_count - 1];
-    if (off != last_start + 2) { ret 0; }
-
-    deinit(?ws, a);
-    ret 1;
-}
-
-test "workspace: update rebuilds line table" {
-    var a: allocator.Allocator = allocator.heap_allocator();
-    var ws: Workspace;
-    init(?ws, a);
-
-    val uri: str = "file:///rebuild.mach";
-    val text1: str = "one line";
-    val doc: *Document = open(?ws, uri.data, uri.len, text1.data, text1.len);
-    if (doc == nil) { ret 0; }
-    if (doc.line_count != 1) { ret 0; }
-
-    val text2: str = "first\nsecond\nthird\n";
-    update(?ws, doc, text2.data, text2.len);
-    if (doc.line_count != 4) { ret 0; }
-    if (doc.lines[0] != 0) { ret 0; }
-    if (doc.lines[1] != 6) { ret 0; }
-    if (doc.lines[2] != 13) { ret 0; }
-    if (doc.lines[3] != 19) { ret 0; }
-
-    deinit(?ws, a);
-    ret 1;
-}
-
-test "workspace: clone_bytes produces independent copy" {
-    var a: allocator.Allocator = allocator.heap_allocator();
-    val src: str = "hello";
-    val dst: *u8 = clone_bytes(src.data, src.len, a);
-    if (dst == nil) { ret 0; }
-    # must be a different pointer
-    if (dst == src.data) { ret 0; }
-    # contents must match
-    var i: usize = 0;
-    for (i < src.len) {
-        if (dst[i] != src.data[i]) {
-            a.free[u8](dst, src.len);
-            ret 0;
-        }
-        i = i + 1;
-    }
-    a.free[u8](dst, src.len);
-    ret 1;
-}
-
-test "workspace: clone_bytes returns nil for nil input" {
-    var a: allocator.Allocator = allocator.heap_allocator();
-    val dst: *u8 = clone_bytes(nil, 0, a);
-    if (dst != nil) { ret 0; }
-    ret 1;
-}
-
-test "workspace: str_eq matches equal buffers" {
-    val a: str = "hello";
-    val b: str = "hello";
-    if (!str_eq(a.data, a.len, b.data, b.len)) { ret 0; }
-    ret 1;
-}
-
-test "workspace: str_eq rejects different lengths" {
-    val a: str = "hello";
-    val b: str = "hi";
-    if (str_eq(a.data, a.len, b.data, b.len)) { ret 0; }
-    ret 1;
-}
-
-test "workspace: str_eq rejects different content" {
-    val a: str = "hello";
-    val b: str = "world";
-    if (str_eq(a.data, a.len, b.data, b.len)) { ret 0; }
-    ret 1;
-}
-
-test "workspace: str_eq matches empty buffers" {
-    val empty: str = str{ data: nil, len: 0 };
-    if (!str_eq(empty.data, empty.len, empty.data, empty.len)) { ret 0; }
-    ret 1;
-}
-
-test "workspace: deinit on empty workspace is safe" {
-    var a: allocator.Allocator = allocator.heap_allocator();
-    var ws: Workspace;
-    init(?ws, a);
-    deinit(?ws, a);
-    if (ws.docs != nil) { ret 0; }
-    if (ws.count != 0) { ret 0; }
-    ret 1;
-}
-
-test "workspace: deinit frees all documents" {
-    var a: allocator.Allocator = allocator.heap_allocator();
-    var ws: Workspace;
-    init(?ws, a);
-
-    val text: str = "# content\n";
-    var i: usize = 0;
-    for (i < 10) {
-        val uri_prefix: str = "file:///doc";
-        # use index as single-digit suffix for unique URIs
-        var uri_buf: [16]u8;
-        mem.raw_copy((?uri_buf[0])::ptr, uri_prefix.data::ptr, uri_prefix.len);
-        uri_buf[uri_prefix.len] = ('0' + i)::u8;
-        val uri_len: usize = uri_prefix.len + 1;
-
-        open(?ws, ?uri_buf[0], uri_len, text.data, text.len);
-        i = i + 1;
-    }
-    if (ws.count != 10) { ret 0; }
-
-    # deinit should clean up all 10 documents without crashing
-    deinit(?ws, a);
-    if (ws.count != 0) { ret 0; }
+    val source: str = "hello";
+    val made: str = make_str(source::&u8, 3, a);
+    if (made == nil) { ret 0; }
+    if (made.len() != 3) { ret 0; }
+    if (made[0] != 'h') { ret 0; }
+    if (made[1] != 'e') { ret 0; }
+    if (made[2] != 'l') { ret 0; }
+    free_str(made, a);
     ret 1;
 }

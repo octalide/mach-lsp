@@ -11,7 +11,7 @@ use mem:       std.memory;
 # provides functions for pulling string and numeric values out of raw JSON
 # byte streams, as well as helpers for building JSON response fragments.
 # this is intentionally minimal — it does not implement a full JSON parser.
-# it operates directly on str (data + len) without null-termination assumptions.
+# it operates directly on str (&char, null-terminated pointer).
 
 # --- extraction ---
 
@@ -19,33 +19,36 @@ use mem:       std.memory;
 # ---
 # extracts the string value associated with a JSON key like `"method"`.
 # the key parameter must include the surrounding quotes (e.g. `"\"method\""`).
-# the returned str points to heap-allocated memory owned by the caller.
-# on failure or missing key, returns a str with data == nil and len == 0.
+# the returned str is heap-allocated (null-terminated) and owned by the caller.
+# on failure or missing key, returns nil.
 #
-# data:  raw JSON bytes
+# data:  raw JSON string (null-terminated)
 # key:   the quoted key to search for (e.g. "\"method\"")
 # alloc: allocator for the returned string
-# ret:   the extracted string value, or empty str on failure
+# ret:   the extracted string value, or nil on failure
 pub fun extract_string(data: str, key: str, alloc: allocator.Allocator) str {
     val idx: isize = find_key(data, key);
     if (idx < 0) {
-        ret str{ data: nil, len: 0 };
+        ret nil;
     }
 
+    val data_len: usize = data.len();
+    val key_len: usize = key.len();
+
     # advance past key
-    var pos: usize = (idx::usize) + key.len;
+    var pos: usize = (idx::usize) + key_len;
 
     # skip to colon
     pos = skip_whitespace(data, pos);
-    if (pos >= data.len || data.data[pos] != ':') {
-        ret str{ data: nil, len: 0 };
+    if (pos >= data_len || data[pos] != ':') {
+        ret nil;
     }
     pos = pos + 1;
 
     # skip whitespace after colon
     pos = skip_whitespace(data, pos);
-    if (pos >= data.len || data.data[pos] != '"') {
-        ret str{ data: nil, len: 0 };
+    if (pos >= data_len || data[pos] != '"') {
+        ret nil;
     }
 
     # opening quote
@@ -54,8 +57,8 @@ pub fun extract_string(data: str, key: str, alloc: allocator.Allocator) str {
     # first pass: compute unescaped length
     var scan: usize = pos;
     var out_len: usize = 0;
-    for (scan < data.len) {
-        val ch: u8 = data.data[scan];
+    for (scan < data_len) {
+        val ch: u8 = data[scan];
         if (ch == '\\') {
             scan = scan + 2;
             out_len = out_len + 1;
@@ -69,34 +72,34 @@ pub fun extract_string(data: str, key: str, alloc: allocator.Allocator) str {
         }
     }
 
-    if (scan >= data.len) {
+    if (scan >= data_len) {
         # unterminated string
-        ret str{ data: nil, len: 0 };
+        ret nil;
     }
 
     if (out_len == 0) {
-        ret str{ data: nil, len: 0 };
+        ret nil;
     }
 
-    # allocate output
+    # allocate output (+1 for null terminator)
     var a: allocator.Allocator = alloc;
-    val res: Result[*u8, allocator.AllocError] = a.alloc[u8](out_len);
+    val res: Result[*u8, allocator.AllocError] = a.alloc[u8](out_len + 1);
     if (res.is_err()) {
-        ret str{ data: nil, len: 0 };
+        ret nil;
     }
     val buf: *u8 = res.unwrap_ok();
 
     # second pass: decode escapes
     scan = pos;
     var w: usize = 0;
-    for (scan < data.len && w < out_len) {
-        val ch: u8 = data.data[scan];
+    for (scan < data_len && w < out_len) {
+        val ch: u8 = data[scan];
         if (ch == '\\') {
             scan = scan + 1;
-            if (scan >= data.len) {
+            if (scan >= data_len) {
                 brk;
             }
-            val esc: u8 = data.data[scan];
+            val esc: u8 = data[scan];
             if (esc == 'n')       { buf[w] = '\n'; }
             or (esc == 'r')       { buf[w] = '\r'; }
             or (esc == 't')       { buf[w] = '\t'; }
@@ -116,7 +119,8 @@ pub fun extract_string(data: str, key: str, alloc: allocator.Allocator) str {
         }
     }
 
-    ret str{ data: buf, len: w };
+    buf[w] = 0;
+    ret buf::str;
 }
 
 # extract_raw: find a JSON key and return the raw token value (unquoted).
@@ -124,38 +128,41 @@ pub fun extract_string(data: str, key: str, alloc: allocator.Allocator) str {
 # works for numeric ids and other non-string values. returns the raw bytes
 # between the colon and the next delimiter (comma, brace, bracket, or whitespace).
 # for string values the surrounding quotes are included.
-# the returned str points to the original data buffer (not heap-allocated).
+# the returned str is heap-allocated (null-terminated) and owned by the caller.
 #
-# data:  raw JSON bytes
+# data:  raw JSON string (null-terminated)
 # key:   the quoted key to search for
-# alloc: unused but kept for interface consistency
-# ret:   a str slice into data, or empty str on failure
+# alloc: allocator for the returned string
+# ret:   a heap-allocated str copy of the raw value, or nil on failure
 pub fun extract_raw(data: str, key: str, alloc: allocator.Allocator) str {
     val idx: isize = find_key(data, key);
     if (idx < 0) {
-        ret str{ data: nil, len: 0 };
+        ret nil;
     }
 
-    var pos: usize = (idx::usize) + key.len;
+    val data_len: usize = data.len();
+    val key_len: usize = key.len();
+
+    var pos: usize = (idx::usize) + key_len;
 
     pos = skip_whitespace(data, pos);
-    if (pos >= data.len || data.data[pos] != ':') {
-        ret str{ data: nil, len: 0 };
+    if (pos >= data_len || data[pos] != ':') {
+        ret nil;
     }
     pos = pos + 1;
 
     pos = skip_whitespace(data, pos);
-    if (pos >= data.len) {
-        ret str{ data: nil, len: 0 };
+    if (pos >= data_len) {
+        ret nil;
     }
 
     val start: usize = pos;
 
     # if it's a string, find the closing quote
-    if (data.data[pos] == '"') {
+    if (data[pos] == '"') {
         pos = pos + 1;
-        for (pos < data.len) {
-            val ch: u8 = data.data[pos];
+        for (pos < data_len) {
+            val ch: u8 = data[pos];
             if (ch == '\\') {
                 pos = pos + 2;
             }
@@ -167,12 +174,12 @@ pub fun extract_raw(data: str, key: str, alloc: allocator.Allocator) str {
                 pos = pos + 1;
             }
         }
-        ret str{ data: data.data + start, len: pos - start };
+        ret make_str_copy(data, start, pos, alloc);
     }
 
     # otherwise scan until delimiter
-    for (pos < data.len) {
-        val ch: u8 = data.data[pos];
+    for (pos < data_len) {
+        val ch: u8 = data[pos];
         if (ch == ',' || ch == '}' || ch == ']' ||
             ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') {
             brk;
@@ -181,24 +188,26 @@ pub fun extract_raw(data: str, key: str, alloc: allocator.Allocator) str {
     }
 
     if (pos == start) {
-        ret str{ data: nil, len: 0 };
+        ret nil;
     }
 
-    ret str{ data: data.data + start, len: pos - start };
+    ret make_str_copy(data, start, pos, alloc);
 }
 
 # extract_number_i64: extract a JSON number value as a signed 64-bit integer.
 # ---
-# data:  raw JSON bytes
+# data:  raw JSON string (null-terminated)
 # key:   the quoted key to search for
 # alloc: allocator (passed through to extract_raw)
 # ret:   the parsed integer, or 0 if not found or not a number
 pub fun extract_number_i64(data: str, key: str, alloc: allocator.Allocator) i64 {
     val raw: str = extract_raw(data, key, alloc);
-    if (raw.data == nil || raw.len == 0) {
+    if (raw == nil) {
         ret 0;
     }
-    ret parse_i64(raw);
+    val result: i64 = parse_i64(raw);
+    free_str(raw, alloc);
+    ret result;
 }
 
 # extract_after: search for an anchor key, then extract a string value by a
@@ -206,23 +215,26 @@ pub fun extract_number_i64(data: str, key: str, alloc: allocator.Allocator) i64 
 # ---
 # useful for nested lookups like extracting "uri" after finding "textDocument".
 #
-# data:   raw JSON bytes
+# data:   raw JSON string (null-terminated)
 # anchor: the quoted key to use as a starting point
 # key:    the quoted key to search for after the anchor
 # alloc:  allocator for the returned string
-# ret:    the extracted string value, or empty str on failure
+# ret:    the extracted string value, or nil on failure
 pub fun extract_after(data: str, anchor: str, key: str, alloc: allocator.Allocator) str {
     val idx: isize = find_key(data, anchor);
     if (idx < 0) {
-        ret str{ data: nil, len: 0 };
+        ret nil;
     }
 
-    val offset: usize = (idx::usize) + anchor.len;
-    if (offset >= data.len) {
-        ret str{ data: nil, len: 0 };
+    val data_len: usize = data.len();
+    val anchor_len: usize = anchor.len();
+    val offset: usize = (idx::usize) + anchor_len;
+    if (offset >= data_len) {
+        ret nil;
     }
 
-    val sub: str = str{ data: data.data + offset, len: data.len - offset };
+    # data + offset yields a valid null-terminated str sharing the same terminator
+    val sub: str = (data + offset)::str;
     ret extract_string(sub, key, alloc);
 }
 
@@ -231,21 +243,27 @@ pub fun extract_after(data: str, anchor: str, key: str, alloc: allocator.Allocat
 # quote: JSON-encode a string value with surrounding double quotes.
 # ---
 # escapes backslash, double quote, newline, carriage return, tab, and
-# control characters below 0x20. the returned str is heap-allocated.
+# control characters below 0x20. the returned str is heap-allocated
+# (null-terminated) and owned by the caller.
 #
 # s:     the raw string to encode
 # alloc: allocator for the result
-# ret:   the quoted JSON string, or empty str on allocation failure
+# ret:   the quoted JSON string, or nil on allocation failure
 pub fun quote(s: str, alloc: allocator.Allocator) str {
-    if (s.data == nil || s.len == 0) {
-        ret str{ data: nil, len: 0 };
+    if (s == nil) {
+        ret nil;
+    }
+
+    val s_len: usize = s.len();
+    if (s_len == 0) {
+        ret nil;
     }
 
     # first pass: compute encoded length (2 for surrounding quotes)
     var encoded_len: usize = 2;
     var i: usize = 0;
-    for (i < s.len) {
-        val ch: u8 = s.data[i];
+    for (i < s_len) {
+        val ch: u8 = s[i];
         if (ch == '"' || ch == '\\' || ch == '\n' || ch == '\r' || ch == '\t') {
             encoded_len = encoded_len + 2;
         }
@@ -259,10 +277,11 @@ pub fun quote(s: str, alloc: allocator.Allocator) str {
         i = i + 1;
     }
 
+    # allocate (+1 for null terminator)
     var a: allocator.Allocator = alloc;
-    val res: Result[*u8, allocator.AllocError] = a.alloc[u8](encoded_len);
+    val res: Result[*u8, allocator.AllocError] = a.alloc[u8](encoded_len + 1);
     if (res.is_err()) {
-        ret str{ data: nil, len: 0 };
+        ret nil;
     }
     val buf: *u8 = res.unwrap_ok();
 
@@ -271,8 +290,8 @@ pub fun quote(s: str, alloc: allocator.Allocator) str {
     pos = pos + 1;
 
     i = 0;
-    for (i < s.len) {
-        val ch: u8 = s.data[i];
+    for (i < s_len) {
+        val ch: u8 = s[i];
         if (ch == '"') {
             buf[pos] = '\\'; buf[pos + 1] = '"';
             pos = pos + 2;
@@ -307,16 +326,17 @@ pub fun quote(s: str, alloc: allocator.Allocator) str {
     buf[pos] = '"';
     pos = pos + 1;
 
-    ret str{ data: buf, len: pos };
+    buf[pos] = 0;
+    ret buf::str;
 }
 
 # format_usize: render a usize as a decimal digit string.
 # ---
-# the returned str is heap-allocated via alloc.
+# the returned str is heap-allocated (null-terminated) via alloc.
 #
 # value: the number to format
 # alloc: allocator for the result buffer
-# ret:   decimal digit string, or empty str on allocation failure
+# ret:   decimal digit string, or nil on allocation failure
 pub fun format_usize(value: usize, alloc: allocator.Allocator) str {
     # render right-aligned into a stack buffer, then clone
     var tmp: [20]u8;
@@ -338,15 +358,17 @@ pub fun format_usize(value: usize, alloc: allocator.Allocator) str {
 
     val len: usize = 20 - pos;
 
+    # allocate (+1 for null terminator)
     var a: allocator.Allocator = alloc;
-    val res: Result[*u8, allocator.AllocError] = a.alloc[u8](len);
+    val res: Result[*u8, allocator.AllocError] = a.alloc[u8](len + 1);
     if (res.is_err()) {
-        ret str{ data: nil, len: 0 };
+        ret nil;
     }
     val buf: *u8 = res.unwrap_ok();
     mem.raw_copy(buf::ptr, (?tmp[pos])::ptr, len);
+    buf[len] = 0;
 
-    ret str{ data: buf, len: len };
+    ret buf::str;
 }
 
 # --- internal helpers ---
@@ -357,16 +379,19 @@ pub fun format_usize(value: usize, alloc: allocator.Allocator) str {
 # (i.e. only matches keys that begin at a quote character outside of
 # an already-open string). returns -1 if not found.
 fun find_key(data: str, key: str) isize {
-    if (key.len == 0 || key.len > data.len) {
+    val key_len: usize = key.len();
+    val data_len: usize = data.len();
+
+    if (key_len == 0 || key_len > data_len) {
         ret -1;
     }
 
     var in_string: bool = false;
     var i: usize = 0;
-    val limit: usize = data.len - key.len;
+    val limit: usize = data_len - key_len;
 
     for (i <= limit) {
-        val ch: u8 = data.data[i];
+        val ch: u8 = data[i];
 
         if (ch == '"' && !is_escaped(data, i)) {
             if (!in_string) {
@@ -398,7 +423,7 @@ fun is_escaped(data: str, index: usize) bool {
     var count: usize = 0;
 
     for {
-        if (data.data[back] != '\\') {
+        if (data[back] != '\\') {
             brk;
         }
         count = count + 1;
@@ -413,13 +438,16 @@ fun is_escaped(data: str, index: usize) bool {
 
 # match_at: check whether data contains pattern starting at offset.
 fun match_at(data: str, offset: usize, pattern: str) bool {
-    if (offset + pattern.len > data.len) {
+    val pattern_len: usize = pattern.len();
+    val data_len: usize = data.len();
+
+    if (offset + pattern_len > data_len) {
         ret false;
     }
 
     var i: usize = 0;
-    for (i < pattern.len) {
-        if (data.data[offset + i] != pattern.data[i]) {
+    for (i < pattern_len) {
+        if (data[offset + i] != pattern[i]) {
             ret false;
         }
         i = i + 1;
@@ -430,9 +458,10 @@ fun match_at(data: str, offset: usize, pattern: str) bool {
 
 # skip_whitespace: advance pos past any whitespace characters.
 fun skip_whitespace(data: str, pos: usize) usize {
+    val data_len: usize = data.len();
     var p: usize = pos;
-    for (p < data.len) {
-        val ch: u8 = data.data[p];
+    for (p < data_len) {
+        val ch: u8 = data[p];
         if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n') {
             brk;
         }
@@ -443,21 +472,26 @@ fun skip_whitespace(data: str, pos: usize) usize {
 
 # parse_i64: parse a decimal integer (with optional leading minus) from a str.
 fun parse_i64(s: str) i64 {
-    if (s.data == nil || s.len == 0) {
+    if (s == nil) {
+        ret 0;
+    }
+
+    val s_len: usize = s.len();
+    if (s_len == 0) {
         ret 0;
     }
 
     var pos: usize = 0;
     var negative: bool = false;
 
-    if (s.data[pos] == '-') {
+    if (s[pos] == '-') {
         negative = true;
         pos = pos + 1;
     }
 
     var result: i64 = 0;
-    for (pos < s.len) {
-        val ch: u8 = s.data[pos];
+    for (pos < s_len) {
+        val ch: u8 = s[pos];
         if (ch >= '0' && ch <= '9') {
             result = result * 10 + ((ch - '0')::i64);
         }
@@ -473,16 +507,48 @@ fun parse_i64(s: str) i64 {
     ret result;
 }
 
+# make_str_copy: allocate a heap copy of a substring of data[start..end).
+# ---
+# the returned str is null-terminated and owned by the caller.
+fun make_str_copy(data: str, start: usize, end: usize, alloc: allocator.Allocator) str {
+    val len: usize = end - start;
+    if (len == 0) {
+        ret nil;
+    }
+
+    var a: allocator.Allocator = alloc;
+    val res: Result[*u8, allocator.AllocError] = a.alloc[u8](len + 1);
+    if (res.is_err()) {
+        ret nil;
+    }
+    val buf: *u8 = res.unwrap_ok();
+    mem.raw_copy(buf::ptr, (data + start)::ptr, len);
+    buf[len] = 0;
+    ret buf::str;
+}
+
+# free_str: free a heap-allocated str produced by json extraction/quoting.
+# ---
+# the str must have been allocated with +1 for the null terminator.
+# never call on string literals or nil.
+pub fun free_str(s: str, alloc: allocator.Allocator) {
+    if (s != nil) {
+        val len: usize = s.len();
+        var a: allocator.Allocator = alloc;
+        a.free_bytes(s::ptr, len + 1, 1);
+    }
+}
+
 # --- tests ---
 
 test "json: extract_string finds method field" {
     var a: allocator.Allocator = allocator.heap_allocator();
     val input: str = "{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"id\":1}";
     val result: str = extract_string(input, "\"method\"", a);
-    if (result.data == nil) { ret 0; }
-    if (result.len != 10) { ret 0; }
+    if (result == nil) { ret 0; }
+    if (result.len() != 10) { ret 0; }
     if (!result.equals("initialize")) { ret 0; }
-    a.free[u8](result.data, result.len);
+    free_str(result, a);
     ret 1;
 }
 
@@ -490,8 +556,7 @@ test "json: extract_string returns empty for missing key" {
     var a: allocator.Allocator = allocator.heap_allocator();
     val input: str = "{\"jsonrpc\":\"2.0\",\"id\":1}";
     val result: str = extract_string(input, "\"method\"", a);
-    if (result.data != nil) { ret 0; }
-    if (result.len != 0) { ret 0; }
+    if (result != nil) { ret 0; }
     ret 1;
 }
 
@@ -499,11 +564,11 @@ test "json: extract_string decodes escape sequences" {
     var a: allocator.Allocator = allocator.heap_allocator();
     val input: str = "{\"msg\":\"hello\\nworld\"}";
     val result: str = extract_string(input, "\"msg\"", a);
-    if (result.data == nil) { ret 0; }
-    if (result.len != 11) { ret 0; }
+    if (result == nil) { ret 0; }
+    if (result.len() != 11) { ret 0; }
     # 'hello' + newline + 'world' = 11 bytes
-    if (result.data[5] != '\n') { ret 0; }
-    a.free[u8](result.data, result.len);
+    if (result[5] != '\n') { ret 0; }
+    free_str(result, a);
     ret 1;
 }
 
@@ -511,11 +576,11 @@ test "json: extract_string handles escaped quotes" {
     var a: allocator.Allocator = allocator.heap_allocator();
     val input: str = "{\"key\":\"say \\\"hi\\\"\"}";
     val result: str = extract_string(input, "\"key\"", a);
-    if (result.data == nil) { ret 0; }
+    if (result == nil) { ret 0; }
     # say "hi" = 8 bytes
-    if (result.len != 8) { ret 0; }
-    if (result.data[4] != '"') { ret 0; }
-    a.free[u8](result.data, result.len);
+    if (result.len() != 8) { ret 0; }
+    if (result[4] != '"') { ret 0; }
+    free_str(result, a);
     ret 1;
 }
 
@@ -523,9 +588,8 @@ test "json: extract_string returns empty for empty value" {
     var a: allocator.Allocator = allocator.heap_allocator();
     val input: str = "{\"key\":\"\"}";
     val result: str = extract_string(input, "\"key\"", a);
-    # empty string value yields data == nil, len == 0
-    if (result.data != nil) { ret 0; }
-    if (result.len != 0) { ret 0; }
+    # empty string value yields nil
+    if (result != nil) { ret 0; }
     ret 1;
 }
 
@@ -533,10 +597,11 @@ test "json: extract_raw finds numeric id" {
     var a: allocator.Allocator = allocator.heap_allocator();
     val input: str = "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"shutdown\"}";
     val result: str = extract_raw(input, "\"id\"", a);
-    if (result.data == nil) { ret 0; }
-    if (result.len != 2) { ret 0; }
-    if (result.data[0] != '4') { ret 0; }
-    if (result.data[1] != '2') { ret 0; }
+    if (result == nil) { ret 0; }
+    if (result.len() != 2) { ret 0; }
+    if (result[0] != '4') { ret 0; }
+    if (result[1] != '2') { ret 0; }
+    free_str(result, a);
     ret 1;
 }
 
@@ -544,11 +609,12 @@ test "json: extract_raw finds string id with quotes" {
     var a: allocator.Allocator = allocator.heap_allocator();
     val input: str = "{\"id\":\"abc\",\"method\":\"test\"}";
     val result: str = extract_raw(input, "\"id\"", a);
-    if (result.data == nil) { ret 0; }
+    if (result == nil) { ret 0; }
     # result should include surrounding quotes: "abc" = 5 bytes
-    if (result.len != 5) { ret 0; }
-    if (result.data[0] != '"') { ret 0; }
-    if (result.data[4] != '"') { ret 0; }
+    if (result.len() != 5) { ret 0; }
+    if (result[0] != '"') { ret 0; }
+    if (result[4] != '"') { ret 0; }
+    free_str(result, a);
     ret 1;
 }
 
@@ -556,8 +622,7 @@ test "json: extract_raw returns empty for missing key" {
     var a: allocator.Allocator = allocator.heap_allocator();
     val input: str = "{\"id\":1}";
     val result: str = extract_raw(input, "\"missing\"", a);
-    if (result.data != nil) { ret 0; }
-    if (result.len != 0) { ret 0; }
+    if (result != nil) { ret 0; }
     ret 1;
 }
 
@@ -589,9 +654,9 @@ test "json: extract_after finds nested string" {
     var a: allocator.Allocator = allocator.heap_allocator();
     val input: str = "{\"textDocument\":{\"uri\":\"file:///test.mach\"},\"position\":{\"line\":0}}";
     val result: str = extract_after(input, "\"textDocument\"", "\"uri\"", a);
-    if (result.data == nil) { ret 0; }
+    if (result == nil) { ret 0; }
     if (!result.equals("file:///test.mach")) { ret 0; }
-    a.free[u8](result.data, result.len);
+    free_str(result, a);
     ret 1;
 }
 
@@ -599,8 +664,7 @@ test "json: extract_after returns empty when anchor missing" {
     var a: allocator.Allocator = allocator.heap_allocator();
     val input: str = "{\"id\":1}";
     val result: str = extract_after(input, "\"textDocument\"", "\"uri\"", a);
-    if (result.data != nil) { ret 0; }
-    if (result.len != 0) { ret 0; }
+    if (result != nil) { ret 0; }
     ret 1;
 }
 
@@ -608,13 +672,13 @@ test "json: quote produces valid JSON string" {
     var a: allocator.Allocator = allocator.heap_allocator();
     val input: str = "hello";
     val result: str = quote(input, a);
-    if (result.data == nil) { ret 0; }
+    if (result == nil) { ret 0; }
     # "hello" = 7 bytes (quotes + content)
-    if (result.len != 7) { ret 0; }
-    if (result.data[0] != '"') { ret 0; }
-    if (result.data[6] != '"') { ret 0; }
-    if (result.data[1] != 'h') { ret 0; }
-    a.free[u8](result.data, result.len);
+    if (result.len() != 7) { ret 0; }
+    if (result[0] != '"') { ret 0; }
+    if (result[6] != '"') { ret 0; }
+    if (result[1] != 'h') { ret 0; }
+    free_str(result, a);
     ret 1;
 }
 
@@ -622,14 +686,14 @@ test "json: quote escapes special characters" {
     var a: allocator.Allocator = allocator.heap_allocator();
     val input: str = "a\"b";
     val result: str = quote(input, a);
-    if (result.data == nil) { ret 0; }
+    if (result == nil) { ret 0; }
     # "a\"b" = 6 bytes: " a \ " b "
-    if (result.len != 6) { ret 0; }
-    if (result.data[0] != '"') { ret 0; }
-    if (result.data[2] != '\\') { ret 0; }
-    if (result.data[3] != '"') { ret 0; }
-    if (result.data[5] != '"') { ret 0; }
-    a.free[u8](result.data, result.len);
+    if (result.len() != 6) { ret 0; }
+    if (result[0] != '"') { ret 0; }
+    if (result[2] != '\\') { ret 0; }
+    if (result[3] != '"') { ret 0; }
+    if (result[5] != '"') { ret 0; }
+    free_str(result, a);
     ret 1;
 }
 
@@ -637,53 +701,51 @@ test "json: quote escapes newlines" {
     var a: allocator.Allocator = allocator.heap_allocator();
     val input: str = "a\nb";
     val result: str = quote(input, a);
-    if (result.data == nil) { ret 0; }
+    if (result == nil) { ret 0; }
     # "a\nb" = 6 bytes: " a \ n b "
-    if (result.len != 6) { ret 0; }
-    if (result.data[2] != '\\') { ret 0; }
-    if (result.data[3] != 'n') { ret 0; }
-    a.free[u8](result.data, result.len);
+    if (result.len() != 6) { ret 0; }
+    if (result[2] != '\\') { ret 0; }
+    if (result[3] != 'n') { ret 0; }
+    free_str(result, a);
     ret 1;
 }
 
-test "json: quote returns empty for nil input" {
+test "json: quote returns nil for nil input" {
     var a: allocator.Allocator = allocator.heap_allocator();
-    val input: str = str{ data: nil, len: 0 };
-    val result: str = quote(input, a);
-    if (result.data != nil) { ret 0; }
-    if (result.len != 0) { ret 0; }
+    val result: str = quote(nil, a);
+    if (result != nil) { ret 0; }
     ret 1;
 }
 
 test "json: format_usize renders zero" {
     var a: allocator.Allocator = allocator.heap_allocator();
     val result: str = format_usize(0, a);
-    if (result.data == nil) { ret 0; }
-    if (result.len != 1) { ret 0; }
-    if (result.data[0] != '0') { ret 0; }
-    a.free[u8](result.data, result.len);
+    if (result == nil) { ret 0; }
+    if (result.len() != 1) { ret 0; }
+    if (result[0] != '0') { ret 0; }
+    free_str(result, a);
     ret 1;
 }
 
 test "json: format_usize renders small number" {
     var a: allocator.Allocator = allocator.heap_allocator();
     val result: str = format_usize(42, a);
-    if (result.data == nil) { ret 0; }
-    if (result.len != 2) { ret 0; }
-    if (result.data[0] != '4') { ret 0; }
-    if (result.data[1] != '2') { ret 0; }
-    a.free[u8](result.data, result.len);
+    if (result == nil) { ret 0; }
+    if (result.len() != 2) { ret 0; }
+    if (result[0] != '4') { ret 0; }
+    if (result[1] != '2') { ret 0; }
+    free_str(result, a);
     ret 1;
 }
 
 test "json: format_usize renders large number" {
     var a: allocator.Allocator = allocator.heap_allocator();
     val result: str = format_usize(1000000, a);
-    if (result.data == nil) { ret 0; }
-    if (result.len != 7) { ret 0; }
-    if (result.data[0] != '1') { ret 0; }
-    if (result.data[6] != '0') { ret 0; }
-    a.free[u8](result.data, result.len);
+    if (result == nil) { ret 0; }
+    if (result.len() != 7) { ret 0; }
+    if (result[0] != '1') { ret 0; }
+    if (result[6] != '0') { ret 0; }
+    free_str(result, a);
     ret 1;
 }
 
@@ -716,8 +778,7 @@ test "json: parse_i64 stops at non-digit" {
 }
 
 test "json: parse_i64 returns zero for empty" {
-    val s: str = str{ data: nil, len: 0 };
-    val result: i64 = parse_i64(s);
+    val result: i64 = parse_i64(nil);
     if (result != 0) { ret 0; }
     ret 1;
 }

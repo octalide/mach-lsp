@@ -11,10 +11,7 @@ use transport: mach_lsp.transport;
 use workspace: mach_lsp.workspace;
 use json:      mach_lsp.json;
 
-# forward declaration — Server lives in mach_lsp.server but we receive *Server
-# from dispatch. to avoid a circular import we accept ptr and cast internally.
-# (the server module imports us; we must not import it back.)
-use server:      mach_lsp.server;
+use lsp_types:   mach_lsp.lsp_types;
 use diagnostics: mach_lsp.diagnostics;
 
 # mach_lsp.handler: LSP request/notification handler implementations.
@@ -32,7 +29,7 @@ use diagnostics: mach_lsp.diagnostics;
 # id:      raw JSON id value (numeric string or quoted string — already formatted)
 # code:    LSP/JSON-RPC error code
 # message: human-readable error message
-pub fun send_error(srv: *server.Server, id: str, code: i64, message: str) {
+pub fun send_error(srv: *lsp_types.Server, id: str, code: i64, message: str) {
     var a: allocator.Allocator = srv.alloc;
 
     val quoted_msg: str = json.quote(message, a);
@@ -45,11 +42,17 @@ pub fun send_error(srv: *server.Server, id: str, code: i64, message: str) {
     val mid2:    str = ",\"message\":";
     val suffix:  str = "}}";
 
-    val total: usize = prefix.len + id.len + mid1.len + code_str.len +
-                       mid2.len + quoted_msg.len + suffix.len;
+    val id_len: usize = id.len();
+    val quoted_msg_len: usize = quoted_msg.len();
+    val code_str_len: usize = code_str.len();
 
-    val buf_res: Result[*u8, allocator.AllocError] = a.alloc[u8](total);
+    val total: usize = prefix.len() + id_len + mid1.len() + code_str_len +
+                       mid2.len() + quoted_msg_len + suffix.len();
+
+    val buf_res: Result[*u8, allocator.AllocError] = a.alloc[u8](total + 1);
     if (buf_res.is_err()) {
+        free_str(quoted_msg, a);
+        free_str(code_str, a);
         ret;
     }
     val buf: *u8 = buf_res.unwrap_ok();
@@ -62,10 +65,11 @@ pub fun send_error(srv: *server.Server, id: str, code: i64, message: str) {
     off = append(buf, off, mid2);
     off = append(buf, off, quoted_msg);
     off = append(buf, off, suffix);
+    buf[off] = 0;
 
-    transport.send_message(buf, total, a);
+    transport.send_message(buf::str, a);
 
-    a.free[u8](buf, total);
+    a.free[u8](buf, total + 1);
     free_str(quoted_msg, a);
     free_str(code_str, a);
 }
@@ -75,16 +79,19 @@ pub fun send_error(srv: *server.Server, id: str, code: i64, message: str) {
 # srv:    pointer to the server
 # id:     raw JSON id token
 # result: pre-formatted JSON result value
-fun send_result(srv: *server.Server, id: str, result: str) {
+fun send_result(srv: *lsp_types.Server, id: str, result: str) {
     var a: allocator.Allocator = srv.alloc;
 
     val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
     val mid:    str = ",\"result\":";
     val suffix: str = "}";
 
-    val total: usize = prefix.len + id.len + mid.len + result.len + suffix.len;
+    val id_len: usize = id.len();
+    val result_len: usize = result.len();
 
-    val buf_res: Result[*u8, allocator.AllocError] = a.alloc[u8](total);
+    val total: usize = prefix.len() + id_len + mid.len() + result_len + suffix.len();
+
+    val buf_res: Result[*u8, allocator.AllocError] = a.alloc[u8](total + 1);
     if (buf_res.is_err()) {
         ret;
     }
@@ -96,13 +103,14 @@ fun send_result(srv: *server.Server, id: str, result: str) {
     off = append(buf, off, mid);
     off = append(buf, off, result);
     off = append(buf, off, suffix);
+    buf[off] = 0;
 
-    transport.send_message(buf, total, a);
-    a.free[u8](buf, total);
+    transport.send_message(buf::str, a);
+    a.free[u8](buf, total + 1);
 }
 
 # send_null_result: send a JSON-RPC response with result: null.
-fun send_null_result(srv: *server.Server, id: str) {
+fun send_null_result(srv: *lsp_types.Server, id: str) {
     send_result(srv, id, "null");
 }
 
@@ -113,16 +121,16 @@ fun send_null_result(srv: *server.Server, id: str) {
 # handle_initialize: respond to the `initialize` request.
 # ---
 # advertises server capabilities and transitions to the RUNNING state.
-pub fun handle_initialize(srv: *server.Server, body: str) {
+pub fun handle_initialize(srv: *lsp_types.Server, body: str) {
     var a: allocator.Allocator = srv.alloc;
     val id: str = json.extract_raw(body, "\"id\"", a);
 
-    if (id.len == 0) {
+    if (id == nil) {
         print.eprintln("mach-lsp: initialize: missing id");
         ret;
     }
 
-    srv.status = server.STATUS_RUNNING;
+    srv.status = lsp_types.STATUS_RUNNING;
 
     # capabilities we advertise:
     #   textDocumentSync: full (1) — client sends entire document on change
@@ -133,19 +141,21 @@ pub fun handle_initialize(srv: *server.Server, body: str) {
     val capabilities: str = "{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":{},\"documentSymbolProvider\":true},\"serverInfo\":{\"name\":\"mach-lsp\",\"version\":\"0.1.0\"}}";
 
     send_result(srv, id, capabilities);
+    free_str(id, a);
 }
 
 # handle_shutdown: respond to the `shutdown` request.
 # ---
 # returns null and marks the server as shutting down.
-pub fun handle_shutdown(srv: *server.Server, body: str) {
+pub fun handle_shutdown(srv: *lsp_types.Server, body: str) {
     var a: allocator.Allocator = srv.alloc;
     val id: str = json.extract_raw(body, "\"id\"", a);
 
-    srv.status = server.STATUS_SHUTTING_DOWN;
+    srv.status = lsp_types.STATUS_SHUTTING_DOWN;
 
-    if (id.len > 0) {
+    if (id != nil) {
         send_null_result(srv, id);
+        free_str(id, a);
     }
 }
 
@@ -153,11 +163,11 @@ pub fun handle_shutdown(srv: *server.Server, body: str) {
 # ---
 # terminates the message loop. exit code is 0 if shutdown was requested first,
 # 1 otherwise (per LSP spec).
-pub fun handle_exit(srv: *server.Server) {
-    if (srv.status != server.STATUS_SHUTTING_DOWN) {
+pub fun handle_exit(srv: *lsp_types.Server) {
+    if (srv.status != lsp_types.STATUS_SHUTTING_DOWN) {
         srv.exit_code = 1;
     }
-    srv.status = server.STATUS_EXITED;
+    srv.status = lsp_types.STATUS_EXITED;
 }
 
 # ============================================================================
@@ -167,15 +177,15 @@ pub fun handle_exit(srv: *server.Server) {
 # handle_did_open: process `textDocument/didOpen` notification.
 # ---
 # registers the document in the workspace with its initial text.
-pub fun handle_did_open(srv: *server.Server, body: str) {
+pub fun handle_did_open(srv: *lsp_types.Server, body: str) {
     var a: allocator.Allocator = srv.alloc;
     val anchor: str = "\"textDocument\"";
 
     val uri: str = json.extract_after(body, anchor, "\"uri\"", a);
     val text: str = json.extract_after(body, anchor, "\"text\"", a);
 
-    if (uri.len > 0) {
-        val doc: *workspace.Document = workspace.open(?srv.ws, uri.data, uri.len, text.data, text.len);
+    if (uri != nil) {
+        val doc: *workspace.Document = workspace.open(?srv.ws, uri, text);
         if (doc != nil) {
             diagnostics.publish_diagnostics(doc, a);
         }
@@ -189,7 +199,7 @@ pub fun handle_did_open(srv: *server.Server, body: str) {
 # ---
 # with textDocumentSync = 1 (full), the entire new text is in the first
 # content change entry. we extract it and update the workspace copy.
-pub fun handle_did_change(srv: *server.Server, body: str) {
+pub fun handle_did_change(srv: *lsp_types.Server, body: str) {
     var a: allocator.Allocator = srv.alloc;
     val anchor: str = "\"textDocument\"";
 
@@ -199,10 +209,10 @@ pub fun handle_did_change(srv: *server.Server, body: str) {
     val text_anchor: str = "\"contentChanges\"";
     val text: str = json.extract_after(body, text_anchor, "\"text\"", a);
 
-    if (uri.len > 0) {
-        val doc: *workspace.Document = workspace.find(?srv.ws, uri.data, uri.len);
+    if (uri != nil) {
+        val doc: *workspace.Document = workspace.find(?srv.ws, uri);
         if (doc != nil) {
-            workspace.update(?srv.ws, doc, text.data, text.len);
+            workspace.update(?srv.ws, doc, text);
             diagnostics.publish_diagnostics(doc, a);
         }
     }
@@ -214,18 +224,18 @@ pub fun handle_did_change(srv: *server.Server, body: str) {
 # handle_did_close: process `textDocument/didClose` notification.
 # ---
 # removes the document from the workspace.
-pub fun handle_did_close(srv: *server.Server, body: str) {
+pub fun handle_did_close(srv: *lsp_types.Server, body: str) {
     var a: allocator.Allocator = srv.alloc;
     val anchor: str = "\"textDocument\"";
 
     val uri: str = json.extract_after(body, anchor, "\"uri\"", a);
-    if (uri.len > 0) {
+    if (uri != nil) {
         # clear diagnostics before removing the document from the workspace
-        val doc: *workspace.Document = workspace.find(?srv.ws, uri.data, uri.len);
+        val doc: *workspace.Document = workspace.find(?srv.ws, uri);
         if (doc != nil) {
             diagnostics.clear_diagnostics(doc, a);
         }
-        workspace.close(?srv.ws, uri.data, uri.len);
+        workspace.close(?srv.ws, uri);
     }
 
     free_str(uri, a);
@@ -239,25 +249,26 @@ pub fun handle_did_close(srv: *server.Server, body: str) {
 # ---
 # TODO: hook into mach.compiler.sema for real type information.
 # currently returns a placeholder message with the document byte size.
-pub fun handle_hover(srv: *server.Server, body: str) {
+pub fun handle_hover(srv: *lsp_types.Server, body: str) {
     var a: allocator.Allocator = srv.alloc;
     val id: str = json.extract_raw(body, "\"id\"", a);
-    if (id.len == 0) {
+    if (id == nil) {
         ret;
     }
 
     val anchor: str = "\"textDocument\"";
     val uri: str = json.extract_after(body, anchor, "\"uri\"", a);
-    if (uri.len == 0) {
+    if (uri == nil) {
         send_null_result(srv, id);
-        free_str(uri, a);
+        free_str(id, a);
         ret;
     }
 
-    val doc: *workspace.Document = workspace.find(?srv.ws, uri.data, uri.len);
+    val doc: *workspace.Document = workspace.find(?srv.ws, uri);
     if (doc == nil) {
         send_null_result(srv, id);
         free_str(uri, a);
+        free_str(id, a);
         ret;
     }
 
@@ -265,18 +276,22 @@ pub fun handle_hover(srv: *server.Server, body: str) {
     val size_str: str = json.format_usize(doc.text_len, a);
     val hover_prefix: str = "mach-lsp: document bytes = ";
 
-    val msg_len: usize = hover_prefix.len + size_str.len;
-    val msg_res: Result[*u8, allocator.AllocError] = a.alloc[u8](msg_len);
+    val hover_prefix_len: usize = hover_prefix.len();
+    val size_str_len: usize = size_str.len();
+    val msg_len: usize = hover_prefix_len + size_str_len;
+    val msg_res: Result[*u8, allocator.AllocError] = a.alloc[u8](msg_len + 1);
     if (msg_res.is_err()) {
         send_null_result(srv, id);
         free_str(uri, a);
         free_str(size_str, a);
+        free_str(id, a);
         ret;
     }
     val msg_buf: *u8 = msg_res.unwrap_ok();
-    mem.raw_copy(msg_buf::ptr, hover_prefix.data::ptr, hover_prefix.len);
-    mem.raw_copy((msg_buf + hover_prefix.len)::ptr, size_str.data::ptr, size_str.len);
-    val msg: str = str{ data: msg_buf, len: msg_len };
+    mem.raw_copy(msg_buf::ptr, hover_prefix::ptr, hover_prefix_len);
+    mem.raw_copy((msg_buf + hover_prefix_len)::ptr, size_str::ptr, size_str_len);
+    msg_buf[msg_len] = 0;
+    val msg: str = msg_buf::str;
 
     val quoted_msg: str = json.quote(msg, a);
 
@@ -284,8 +299,11 @@ pub fun handle_hover(srv: *server.Server, body: str) {
     val r_prefix: str = "{\"contents\":{\"kind\":\"markdown\",\"value\":";
     val r_suffix: str = "}}";
 
-    val result_len: usize = r_prefix.len + quoted_msg.len + r_suffix.len;
-    val result_res: Result[*u8, allocator.AllocError] = a.alloc[u8](result_len);
+    val r_prefix_len: usize = r_prefix.len();
+    val r_suffix_len: usize = r_suffix.len();
+    val quoted_msg_len: usize = quoted_msg.len();
+    val result_len: usize = r_prefix_len + quoted_msg_len + r_suffix_len;
+    val result_res: Result[*u8, allocator.AllocError] = a.alloc[u8](result_len + 1);
     if (result_res.is_err()) {
         send_null_result(srv, id);
     }
@@ -295,27 +313,29 @@ pub fun handle_hover(srv: *server.Server, body: str) {
         off = append(result_buf, off, r_prefix);
         off = append(result_buf, off, quoted_msg);
         off = append(result_buf, off, r_suffix);
+        result_buf[off] = 0;
 
-        val result: str = str{ data: result_buf, len: result_len };
-        send_result(srv, id, result);
-        a.free[u8](result_buf, result_len);
+        send_result(srv, id, result_buf::str);
+        a.free[u8](result_buf, result_len + 1);
     }
 
-    a.free[u8](msg_buf, msg_len);
+    a.free[u8](msg_buf, msg_len + 1);
     free_str(quoted_msg, a);
     free_str(size_str, a);
     free_str(uri, a);
+    free_str(id, a);
 }
 
 # handle_definition: respond to `textDocument/definition`.
 # ---
 # TODO: hook into mach.compiler.sema symbol table for real go-to-definition.
 # currently returns null (no result).
-pub fun handle_definition(srv: *server.Server, body: str) {
+pub fun handle_definition(srv: *lsp_types.Server, body: str) {
     var a: allocator.Allocator = srv.alloc;
     val id: str = json.extract_raw(body, "\"id\"", a);
-    if (id.len > 0) {
+    if (id != nil) {
         send_null_result(srv, id);
+        free_str(id, a);
     }
 }
 
@@ -323,11 +343,12 @@ pub fun handle_definition(srv: *server.Server, body: str) {
 # ---
 # TODO: hook into mach.compiler.sema for real symbol completion.
 # currently returns an empty completion list.
-pub fun handle_completion(srv: *server.Server, body: str) {
+pub fun handle_completion(srv: *lsp_types.Server, body: str) {
     var a: allocator.Allocator = srv.alloc;
     val id: str = json.extract_raw(body, "\"id\"", a);
-    if (id.len > 0) {
+    if (id != nil) {
         send_result(srv, id, "[]");
+        free_str(id, a);
     }
 }
 
@@ -335,11 +356,12 @@ pub fun handle_completion(srv: *server.Server, body: str) {
 # ---
 # TODO: hook into mach.compiler.parser / ast for real symbol extraction.
 # currently returns an empty symbol list.
-pub fun handle_document_symbol(srv: *server.Server, body: str) {
+pub fun handle_document_symbol(srv: *lsp_types.Server, body: str) {
     var a: allocator.Allocator = srv.alloc;
     val id: str = json.extract_raw(body, "\"id\"", a);
-    if (id.len > 0) {
+    if (id != nil) {
         send_result(srv, id, "[]");
+        free_str(id, a);
     }
 }
 
@@ -349,23 +371,31 @@ pub fun handle_document_symbol(srv: *server.Server, body: str) {
 
 # append: copy a str into buf at the given offset and return the new offset.
 fun append(buf: *u8, offset: usize, s: str) usize {
-    if (s.data != nil && s.len > 0) {
-        mem.raw_copy((buf + offset)::ptr, s.data::ptr, s.len);
+    if (s != nil) {
+        val slen: usize = s.len();
+        if (slen > 0) {
+            mem.raw_copy((buf + offset)::ptr, s::ptr, slen);
+        }
+        ret offset + slen;
     }
-    ret offset + s.len;
+    ret offset;
 }
 
 # free_str: free a heap-allocated str produced by json extraction/quoting.
+# ---
+# the str must have been allocated with +1 for the null terminator.
+# never call on string literals or nil.
 fun free_str(s: str, alloc: allocator.Allocator) {
-    if (s.data != nil && s.len > 0) {
+    if (s != nil) {
+        val len: usize = s.len();
         var a: allocator.Allocator = alloc;
-        a.free[u8](s.data, s.len);
+        a.free_bytes(s::ptr, len + 1, 1);
     }
 }
 
 # format_i64: render a signed 64-bit integer as a decimal digit string.
 # ---
-# the returned str is heap-allocated via alloc.
+# the returned str is heap-allocated (null-terminated) via alloc.
 fun format_i64(value: i64, alloc: allocator.Allocator) str {
     var tmp: [21]u8;
     var pos: usize = 21;
@@ -397,12 +427,13 @@ fun format_i64(value: i64, alloc: allocator.Allocator) str {
 
     val len: usize = 21 - pos;
     var a: allocator.Allocator = alloc;
-    val res: Result[*u8, allocator.AllocError] = a.alloc[u8](len);
+    val res: Result[*u8, allocator.AllocError] = a.alloc[u8](len + 1);
     if (res.is_err()) {
-        ret str{ data: nil, len: 0 };
+        ret nil;
     }
     val buf: *u8 = res.unwrap_ok();
     mem.raw_copy(buf::ptr, (?tmp[pos])::ptr, len);
+    buf[len] = 0;
 
-    ret str{ data: buf, len: len };
+    ret buf::str;
 }
