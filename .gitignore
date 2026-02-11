@@ -2,7 +2,7 @@
 out/
 
 # Dependencies (vendored via mach dep)
-dep/
+# dep/ is managed by git submodules — do not ignore
 
 # Editor
 .vscode/
