@@ -11,6 +11,10 @@ use transport: mls.transport;
 use workspace: mls.workspace;
 use json:      mls.json;
 
+use ast:    mach.compiler.ast;
+use symbol: mach.compiler.symbol;
+use token:  mach.compiler.token;
+
 use lsp_types:   mls.lsp_types;
 use diagnostics: mls.diagnostics;
 use analysis:    mls.analysis;
@@ -218,11 +222,82 @@ pub fun handle_hover(srv: *lsp_types.Server, body: str) {
 pub fun handle_definition(srv: *lsp_types.Server, body: str) {
     var a: allocator.Allocator = srv.alloc;
     val id: str = json.extract_raw(body, "\"id\"", a);
-    if (id != nil) {
-        # TODO: #4 — resolve symbol at cursor, return definition Location
+    if (id == nil) { ret; }
+
+    val td_anchor: str = "\"textDocument\"";
+    val uri: str = json.extract_after(body, td_anchor, "\"uri\"", a);
+
+    val pos_anchor: str = "\"position\"";
+    val line: i64 = json.extract_number_after(body, pos_anchor, "\"line\"", a);
+    val character: i64 = json.extract_number_after(body, pos_anchor, "\"character\"", a);
+
+    if (uri == nil) {
         send_null_result(srv, id);
         free_str(id, a);
+        ret;
     }
+
+    val doc: *workspace.Document = workspace.find(?srv.ws, uri);
+    if (doc == nil) {
+        send_null_result(srv, id);
+        free_str(uri, a);
+        free_str(id, a);
+        ret;
+    }
+
+    val ar: *analysis.AnalysisResult = analysis.get_analysis(?srv.ac, doc);
+    if (ar == nil) {
+        send_null_result(srv, id);
+        free_str(uri, a);
+        free_str(id, a);
+        ret;
+    }
+
+    val offset: usize = workspace.position_to_offset(doc, line::usize, character::usize);
+    val node: *ast.Node = analysis.find_node_at_offset(ar.root, offset::i32);
+    if (node == nil) {
+        send_null_result(srv, id);
+        free_str(uri, a);
+        free_str(id, a);
+        ret;
+    }
+
+    val sym: *symbol.Symbol = analysis.get_node_symbol(node);
+    if (sym == nil || sym.decl_node == nil) {
+        send_null_result(srv, id);
+        free_str(uri, a);
+        free_str(id, a);
+        ret;
+    }
+
+    val decl_pos: i32 = sym.decl_node.tok.pos;
+    val decl_len: i32 = sym.decl_node.tok.len;
+
+    var def_line: usize = 0;
+    var def_char: usize = 0;
+    workspace.offset_to_position(doc, decl_pos::usize, ?def_line, ?def_char);
+
+    var end_line: usize = 0;
+    var end_char: usize = 0;
+    if (decl_len > 0) {
+        workspace.offset_to_position(doc, (decl_pos + decl_len)::usize, ?end_line, ?end_char);
+    }
+    or {
+        end_line = def_line;
+        end_char = def_char + 1;
+    }
+
+    val location: str = build_location_json(doc.uri, def_line, def_char, end_line, end_char, a);
+    if (location != nil) {
+        send_result(srv, id, location);
+        free_str(location, a);
+    }
+    or {
+        send_null_result(srv, id);
+    }
+
+    free_str(uri, a);
+    free_str(id, a);
 }
 
 pub fun handle_references(srv: *lsp_types.Server, body: str) {
@@ -288,6 +363,74 @@ fun append(buf: *u8, offset: usize, s: str) usize {
         ret offset + slen;
     }
     ret offset;
+}
+
+fun build_location_json(
+    uri: str, start_line: usize, start_char: usize,
+    end_line: usize, end_char: usize,
+    alloc: allocator.Allocator
+) str {
+    var a: allocator.Allocator = alloc;
+
+    val quoted_uri: str = json.quote(uri, a);
+    val sl: str = json.format_usize(start_line, a);
+    val sc: str = json.format_usize(start_char, a);
+    val el: str = json.format_usize(end_line, a);
+    val ec: str = json.format_usize(end_char, a);
+
+    val p1: str = "{\"uri\":";
+    val p2: str = ",\"range\":{\"start\":{\"line\":";
+    val p3: str = ",\"character\":";
+    val p4: str = "},\"end\":{\"line\":";
+    val p5: str = ",\"character\":";
+    val p6: str = "}}}";
+
+    var qu_len: usize = 0;
+    if (quoted_uri != nil) { qu_len = str_len(quoted_uri); }
+    var sl_len: usize = 0;
+    if (sl != nil) { sl_len = str_len(sl); }
+    var sc_len: usize = 0;
+    if (sc != nil) { sc_len = str_len(sc); }
+    var el_len: usize = 0;
+    if (el != nil) { el_len = str_len(el); }
+    var ec_len: usize = 0;
+    if (ec != nil) { ec_len = str_len(ec); }
+
+    val total: usize = str_len(p1) + qu_len + str_len(p2) + sl_len + str_len(p3) + sc_len +
+                       str_len(p4) + el_len + str_len(p5) + ec_len + str_len(p6);
+
+    val buf_res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, total + 1);
+    if (!buf_res.tag) {
+        free_str(quoted_uri, a);
+        free_str(sl, a);
+        free_str(sc, a);
+        free_str(el, a);
+        free_str(ec, a);
+        ret nil;
+    }
+    val buf: *u8 = buf_res.value.ok;
+
+    var off: usize = 0;
+    off = append(buf, off, p1);
+    off = append(buf, off, quoted_uri);
+    off = append(buf, off, p2);
+    off = append(buf, off, sl);
+    off = append(buf, off, p3);
+    off = append(buf, off, sc);
+    off = append(buf, off, p4);
+    off = append(buf, off, el);
+    off = append(buf, off, p5);
+    off = append(buf, off, ec);
+    off = append(buf, off, p6);
+    buf[off] = 0;
+
+    free_str(quoted_uri, a);
+    free_str(sl, a);
+    free_str(sc, a);
+    free_str(el, a);
+    free_str(ec, a);
+
+    ret buf::str;
 }
 
 fun free_str(s: str, alloc: allocator.Allocator) {
