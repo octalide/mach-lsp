@@ -137,11 +137,34 @@ pub fun get_analysis(cache: *AnalysisCache, doc: *workspace.Document, ws: *works
 # --- AST query functions ---
 
 # find_node_at_offset: find the most specific AST node at a byte offset.
-# returns the innermost identifier, field access, or type name node
-# whose token span contains the given offset.
-pub fun find_node_at_offset(root: *ast.Node, offset: i32) *ast.Node {
+# returns the innermost identifier, field access, type name, or declaration
+# name node whose token span contains the given offset.
+pub fun find_node_at_offset(root: *ast.Node, offset: i32, source: str) *ast.Node {
     if (root == nil || offset < 0) { ret nil; }
-    ret walk_node(root, offset);
+    ret walk_node(root, offset, source);
+}
+
+# is_decl_name_hit: check if offset falls within a declaration's name region.
+# scans forward from the keyword token through whitespace to find the name start.
+fun is_decl_name_hit(node: *ast.Node, name: str, offset: i32, source: str) bool {
+    if (name == nil || source == nil) { ret false; }
+    val name_len: i32 = str_len(name)::i32;
+    if (name_len == 0) { ret false; }
+
+    # scan forward from end of keyword token, skipping whitespace
+    var pos: i32 = node.tok.pos + node.tok.len;
+    for (pos < offset + name_len + 16) {
+        val ch: u8 = source[pos::usize];
+        if (ch != 32 && ch != 9 && ch != 10 && ch != 13) { # not space/tab/newline/cr
+            # found start of name — check if it matches and offset is within
+            if (offset >= pos && offset < pos + name_len) {
+                ret true;
+            }
+            ret false;
+        }
+        pos = pos + 1;
+    }
+    ret false;
 }
 
 # get_node_symbol: extract the resolved symbol from a node.
@@ -197,6 +220,51 @@ pub fun get_field_name(node: *ast.Node) str {
         ret node.info.field_expr.field;
     }
     ret nil;
+}
+
+# get_decl_name: extract the name string from a declaration node.
+# works for FUN, VAL, VAR, REC, UNI, DEF, PARAM, FIELD.
+pub fun get_decl_name(node: *ast.Node) str {
+    if (node == nil) { ret nil; }
+    val k: u8 = node.kind;
+    if (k == ast.NODE_DECL_FUN)  { ret node.info.fun_decl.name; }
+    if (k == ast.NODE_DECL_VAL || k == ast.NODE_DECL_VAR)  { ret node.info.var_decl.name; }
+    if (k == ast.NODE_DECL_REC || k == ast.NODE_DECL_UNI)  { ret node.info.type_decl.name; }
+    if (k == ast.NODE_DECL_DEF)  { ret node.info.def_decl.name; }
+    if (k == ast.NODE_PARAM || k == ast.NODE_FIELD) { ret node.info.field_decl.name; }
+    ret nil;
+}
+
+# is_decl_node: check if a node is a declaration (FUN/VAL/VAR/REC/UNI/DEF/PARAM/FIELD).
+pub fun is_decl_node(node: *ast.Node) bool {
+    if (node == nil) { ret false; }
+    val k: u8 = node.kind;
+    ret k == ast.NODE_DECL_FUN || k == ast.NODE_DECL_VAL || k == ast.NODE_DECL_VAR ||
+        k == ast.NODE_DECL_REC || k == ast.NODE_DECL_UNI || k == ast.NODE_DECL_DEF ||
+        k == ast.NODE_PARAM || k == ast.NODE_FIELD;
+}
+
+# get_decl_name_pos: compute the byte offset and length of a declaration's name in the source.
+# returns false if the name cannot be located.
+pub fun get_decl_name_pos(node: *ast.Node, source: str, out_pos: *i32, out_len: *i32) bool {
+    if (node == nil || source == nil || out_pos == nil || out_len == nil) { ret false; }
+    val name: str = get_decl_name(node);
+    if (name == nil) { ret false; }
+    val name_len: i32 = str_len(name)::i32;
+    if (name_len == 0) { ret false; }
+
+    # scan forward from end of keyword token, skipping whitespace
+    var pos: i32 = node.tok.pos + node.tok.len;
+    for (pos < node.tok.pos + node.tok.len + 16) {
+        val ch: u8 = source[pos::usize];
+        if (ch != 32 && ch != 9 && ch != 10 && ch != 13) {
+            @out_pos = pos;
+            @out_len = name_len;
+            ret true;
+        }
+        pos = pos + 1;
+    }
+    ret false;
 }
 
 # find_use_at_offset: find a use declaration that contains the given offset.
@@ -475,6 +543,11 @@ fun run_analysis(cache: *AnalysisCache, entry: *CacheEntry, doc: *workspace.Docu
     sem.error_count = 0;
     sem.had_error = false;
 
+    # derive module path from file path relative to src root
+    # e.g. "mach.compiler.target" for src/compiler/target.mach
+    if (sem.module_path == nil && sem.src_root != nil && sem.project_id != nil && fp != nil) {
+        sem.module_path = workspace.derive_module_path(fp, sem.src_root, sem.project_id, cache.alloc);
+    }
     if (sem.module_path == nil) {
         if (sem.project_id != nil) {
             sem.module_path = sem.project_id;
@@ -514,14 +587,25 @@ fun run_analysis(cache: *AnalysisCache, entry: *CacheEntry, doc: *workspace.Docu
     collect.collect_declarations(?sem, pr.root);
 
     # reset error count so resolve passes run even when dep modules had errors.
+    # the standard analyze() skips resolve if collect had ANY errors, which
+    # prevents local symbol resolution when dep modules have errors.
     sem.error_count = 0;
     sem.had_error = false;
 
-    # pass 2: resolve types and identifiers
+    # pass 2: resolve types
     resolve.resolve_types(?sem, pr.root);
+
+    # reset again so resolve_functions runs
+    sem.error_count = 0;
+    sem.had_error = false;
 
     # pass 2b: resolve function bodies — sets node.symbol on identifier nodes
     resolve.resolve_functions(?sem, pr.root);
+
+    # post-processing: patch node.symbol on declaration nodes.
+    # sema only sets node.symbol on expression idents, not on declaration nodes.
+    # walk expression idents and copy their symbol pointer to the declaration node.
+    patch_decl_symbols(pr.root);
 
     # clean up scopes
     for (sem.current_scope != nil) {
@@ -581,9 +665,191 @@ fun grow_cache(cache: *AnalysisCache) bool {
     ret true;
 }
 
+# --- declaration symbol patching ---
+#
+# sema only sets node.symbol on expression ident nodes, not on declaration
+# nodes (val/var/fun/rec/uni/def/param/field). for LSP features like rename
+# and go-to-definition on declaration names, we need the symbol pointer on
+# the declaration node too.
+#
+# strategy: walk all expression idents with node.symbol set, extract
+# sym.decl_node, and set decl_node.symbol = sym if it's currently nil.
+# this is safe because sema never sets node.symbol on declarations.
+
+fun patch_decl_symbols(root: *ast.Node) {
+    if (root == nil) { ret; }
+    patch_walk(root);
+}
+
+fun patch_walk(node: *ast.Node) {
+    if (node == nil) { ret; }
+
+    # if this is an expression ident with a resolved symbol, patch the declaration
+    if (node.kind == ast.NODE_EXPR_IDENT && node.symbol != nil) {
+        val sym: *symbol.Symbol = node.symbol::*symbol.Symbol;
+        if (sym.decl_node != nil && sym.decl_node.symbol == nil) {
+            sym.decl_node.symbol = node.symbol;
+        }
+    }
+
+    # also patch call nodes — sema sets node.symbol on CALL nodes for the called function
+    if (node.kind == ast.NODE_EXPR_CALL && node.symbol != nil) {
+        val sym: *symbol.Symbol = node.symbol::*symbol.Symbol;
+        if (sym.decl_node != nil && sym.decl_node.symbol == nil) {
+            sym.decl_node.symbol = node.symbol;
+        }
+    }
+
+    # also patch field access nodes
+    if (node.kind == ast.NODE_EXPR_FIELD && node.symbol != nil) {
+        val sym: *symbol.Symbol = node.symbol::*symbol.Symbol;
+        if (sym.decl_node != nil && sym.decl_node.symbol == nil) {
+            sym.decl_node.symbol = node.symbol;
+        }
+    }
+
+    val kind: u8 = node.kind;
+
+    if (kind == ast.NODE_DECL_PUB) {
+        patch_walk(node.info.wrapper.inner);
+        ret;
+    }
+
+    if (kind == ast.NODE_DECL_FUN) {
+        patch_walk_list(node.info.fun_decl.params);
+        patch_walk(node.info.fun_decl.body);
+        patch_walk(node.info.fun_decl.ret_type);
+        patch_walk(node.info.fun_decl.generics);
+        ret;
+    }
+
+    if (kind == ast.NODE_DECL_VAL || kind == ast.NODE_DECL_VAR) {
+        patch_walk(node.info.var_decl.type_node);
+        patch_walk(node.info.var_decl.init);
+        ret;
+    }
+
+    if (kind == ast.NODE_DECL_REC || kind == ast.NODE_DECL_UNI) {
+        patch_walk_list(node.info.type_decl.fields);
+        patch_walk(node.info.type_decl.generics);
+        ret;
+    }
+
+    if (kind == ast.NODE_DECL_DEF) {
+        patch_walk(node.info.def_decl.type_node);
+        patch_walk(node.info.def_decl.generics);
+        ret;
+    }
+
+    if (kind == ast.NODE_DECL_EXT) {
+        patch_walk(node.info.ext_decl.inner);
+        ret;
+    }
+
+    if (kind == ast.NODE_DECL_TEST) {
+        patch_walk(node.info.test_decl.body);
+        ret;
+    }
+
+    if (kind == ast.NODE_PROGRAM || kind == ast.NODE_STMT_LIST || kind == ast.NODE_STMT_BLOCK) {
+        patch_walk_list(node.info.block_stmt.stmts);
+        ret;
+    }
+
+    if (kind == ast.NODE_STMT_IF || kind == ast.NODE_STMT_OR ||
+        kind == ast.NODE_COMPTIME_IF || kind == ast.NODE_COMPTIME_OR ||
+        kind == ast.NODE_OR_BRANCH) {
+        patch_walk(node.info.cond_stmt.cond);
+        patch_walk(node.info.cond_stmt.body);
+        patch_walk(node.info.cond_stmt.or_branch);
+        ret;
+    }
+
+    if (kind == ast.NODE_STMT_FOR) {
+        patch_walk(node.info.for_stmt.cond);
+        patch_walk(node.info.for_stmt.body);
+        ret;
+    }
+
+    if (kind == ast.NODE_STMT_EXPR || kind == ast.NODE_STMT_RET ||
+        kind == ast.NODE_STMT_FIN || kind == ast.NODE_COMPTIME ||
+        kind == ast.NODE_EXPR_PAREN) {
+        patch_walk(node.info.wrapper.inner);
+        ret;
+    }
+
+    if (kind == ast.NODE_EXPR_BINARY) {
+        patch_walk(node.info.binary_expr.left);
+        patch_walk(node.info.binary_expr.right);
+        ret;
+    }
+
+    if (kind == ast.NODE_EXPR_UNARY ||
+        kind == ast.NODE_EXPR_ADDR || kind == ast.NODE_EXPR_DEREF) {
+        patch_walk(node.info.unary_expr.expr);
+        ret;
+    }
+
+    if (kind == ast.NODE_EXPR_CALL) {
+        patch_walk(node.info.call_expr.callee);
+        patch_walk_list(node.info.call_expr.args);
+        patch_walk(node.info.call_expr.type_args);
+        ret;
+    }
+
+    if (kind == ast.NODE_EXPR_INDEX) {
+        patch_walk(node.info.index_expr.base);
+        patch_walk(node.info.index_expr.index);
+        ret;
+    }
+
+    if (kind == ast.NODE_EXPR_FIELD) {
+        patch_walk(node.info.field_expr.object);
+        ret;
+    }
+
+    if (kind == ast.NODE_EXPR_CAST) {
+        patch_walk(node.info.cast_expr.expr);
+        patch_walk(node.info.cast_expr.type_node);
+        ret;
+    }
+
+    if (kind == ast.NODE_EXPR_ARRAY_LIT) {
+        patch_walk(node.info.array_lit.size);
+        patch_walk(node.info.array_lit.type_node);
+        patch_walk_list(node.info.array_lit.elements);
+        ret;
+    }
+
+    if (kind == ast.NODE_EXPR_STRUCT_LIT) {
+        patch_walk(node.info.struct_lit.type_node);
+        patch_walk_list(node.info.struct_lit.fields);
+        ret;
+    }
+
+    if (kind == ast.NODE_PARAM) {
+        patch_walk(node.info.field_decl.type_node);
+        ret;
+    }
+
+    if (kind == ast.NODE_FIELD) {
+        patch_walk(node.info.field_decl.type_node);
+        ret;
+    }
+}
+
+fun patch_walk_list(list: *ast.List) {
+    if (list == nil) { ret; }
+    var i: i32 = 0;
+    for (i < list.count) {
+        patch_walk(list.nodes[i]);
+        i = i + 1;
+    }
+}
+
 # --- AST walking ---
 
-fun walk_node(node: *ast.Node, offset: i32) *ast.Node {
+fun walk_node(node: *ast.Node, offset: i32, source: str) *ast.Node {
     if (node == nil) { ret nil; }
 
     # check if this node is a name node whose token contains the offset
@@ -598,108 +864,124 @@ fun walk_node(node: *ast.Node, offset: i32) *ast.Node {
     # --- declarations ---
 
     if (kind == ast.NODE_DECL_PUB) {
-        ret walk_node(node.info.wrapper.inner, offset);
+        ret walk_node(node.info.wrapper.inner, offset, source);
     }
 
     if (kind == ast.NODE_DECL_FUN) {
+        # check if offset is on the function name
+        if (is_decl_name_hit(node, node.info.fun_decl.name, offset, source)) {
+            ret node;
+        }
         var found: *ast.Node = nil;
-        found = walk_list(node.info.fun_decl.params, offset);
+        found = walk_list(node.info.fun_decl.params, offset, source);
         if (found != nil) { ret found; }
-        found = walk_node(node.info.fun_decl.body, offset);
+        found = walk_node(node.info.fun_decl.body, offset, source);
         if (found != nil) { ret found; }
-        found = walk_node(node.info.fun_decl.ret_type, offset);
+        found = walk_node(node.info.fun_decl.ret_type, offset, source);
         if (found != nil) { ret found; }
-        found = walk_node(node.info.fun_decl.generics, offset);
+        found = walk_node(node.info.fun_decl.generics, offset, source);
         ret found;
     }
 
     if (kind == ast.NODE_DECL_VAL || kind == ast.NODE_DECL_VAR) {
+        # check if offset is on the variable/constant name
+        if (is_decl_name_hit(node, node.info.var_decl.name, offset, source)) {
+            ret node;
+        }
         var found: *ast.Node = nil;
-        found = walk_node(node.info.var_decl.type_node, offset);
+        found = walk_node(node.info.var_decl.type_node, offset, source);
         if (found != nil) { ret found; }
-        ret walk_node(node.info.var_decl.init, offset);
+        ret walk_node(node.info.var_decl.init, offset, source);
     }
 
     if (kind == ast.NODE_DECL_REC || kind == ast.NODE_DECL_UNI) {
+        # check if offset is on the record/union name
+        if (is_decl_name_hit(node, node.info.type_decl.name, offset, source)) {
+            ret node;
+        }
         var found: *ast.Node = nil;
-        found = walk_list(node.info.type_decl.fields, offset);
+        found = walk_list(node.info.type_decl.fields, offset, source);
         if (found != nil) { ret found; }
-        ret walk_node(node.info.type_decl.generics, offset);
+        ret walk_node(node.info.type_decl.generics, offset, source);
     }
 
     if (kind == ast.NODE_DECL_DEF) {
+        # check if offset is on the def name
+        if (is_decl_name_hit(node, node.info.def_decl.name, offset, source)) {
+            ret node;
+        }
         var found: *ast.Node = nil;
-        found = walk_node(node.info.def_decl.type_node, offset);
+        found = walk_node(node.info.def_decl.type_node, offset, source);
         if (found != nil) { ret found; }
-        ret walk_node(node.info.def_decl.generics, offset);
+        ret walk_node(node.info.def_decl.generics, offset, source);
     }
 
     if (kind == ast.NODE_DECL_EXT) {
-        ret walk_node(node.info.ext_decl.inner, offset);
+        ret walk_node(node.info.ext_decl.inner, offset, source);
     }
 
     if (kind == ast.NODE_DECL_TEST) {
-        ret walk_node(node.info.test_decl.body, offset);
+        ret walk_node(node.info.test_decl.body, offset, source);
     }
 
     # --- statements ---
 
     if (kind == ast.NODE_PROGRAM || kind == ast.NODE_STMT_LIST || kind == ast.NODE_STMT_BLOCK) {
-        ret walk_list(node.info.block_stmt.stmts, offset);
+        ret walk_list(node.info.block_stmt.stmts, offset, source);
     }
 
     if (kind == ast.NODE_STMT_IF || kind == ast.NODE_STMT_OR ||
         kind == ast.NODE_COMPTIME_IF || kind == ast.NODE_COMPTIME_OR ||
         kind == ast.NODE_OR_BRANCH) {
         var found: *ast.Node = nil;
-        found = walk_node(node.info.cond_stmt.cond, offset);
+        found = walk_node(node.info.cond_stmt.cond, offset, source);
         if (found != nil) { ret found; }
-        found = walk_node(node.info.cond_stmt.body, offset);
+        found = walk_node(node.info.cond_stmt.body, offset, source);
         if (found != nil) { ret found; }
-        ret walk_node(node.info.cond_stmt.or_branch, offset);
+        ret walk_node(node.info.cond_stmt.or_branch, offset, source);
     }
 
     if (kind == ast.NODE_STMT_FOR) {
         var found: *ast.Node = nil;
-        found = walk_node(node.info.for_stmt.cond, offset);
+        found = walk_node(node.info.for_stmt.cond, offset, source);
         if (found != nil) { ret found; }
-        ret walk_node(node.info.for_stmt.body, offset);
+        ret walk_node(node.info.for_stmt.body, offset, source);
     }
 
     if (kind == ast.NODE_STMT_EXPR || kind == ast.NODE_STMT_RET ||
         kind == ast.NODE_STMT_FIN || kind == ast.NODE_COMPTIME ||
-        kind == ast.NODE_EXPR_ADDR || kind == ast.NODE_EXPR_DEREF ||
         kind == ast.NODE_EXPR_PAREN) {
-        ret walk_node(node.info.wrapper.inner, offset);
+        ret walk_node(node.info.wrapper.inner, offset, source);
     }
 
     # --- expressions ---
 
     if (kind == ast.NODE_EXPR_BINARY) {
         var found: *ast.Node = nil;
-        found = walk_node(node.info.binary_expr.left, offset);
+        found = walk_node(node.info.binary_expr.left, offset, source);
         if (found != nil) { ret found; }
-        ret walk_node(node.info.binary_expr.right, offset);
+        ret walk_node(node.info.binary_expr.right, offset, source);
     }
 
-    if (kind == ast.NODE_EXPR_UNARY) {
-        ret walk_node(node.info.unary_expr.expr, offset);
+    if (kind == ast.NODE_EXPR_UNARY ||
+        kind == ast.NODE_EXPR_ADDR || kind == ast.NODE_EXPR_DEREF) {
+        ret walk_node(node.info.unary_expr.expr, offset, source);
     }
 
     if (kind == ast.NODE_EXPR_CALL) {
         var found: *ast.Node = nil;
-        found = walk_node(node.info.call_expr.callee, offset);
+        found = walk_node(node.info.call_expr.callee, offset, source);
         if (found != nil) { ret found; }
-        found = walk_list(node.info.call_expr.args, offset);
+        found = walk_list(node.info.call_expr.args, offset, source);
         if (found != nil) { ret found; }
-        ret walk_node(node.info.call_expr.type_args, offset);
+        ret walk_node(node.info.call_expr.type_args, offset, source);
     }
 
     if (kind == ast.NODE_EXPR_INDEX) {
         var found: *ast.Node = nil;
-        found = walk_node(node.info.index_expr.base, offset);
+        found = walk_node(node.info.index_expr.base, offset, source);
         if (found != nil) { ret found; }
-        ret walk_node(node.info.index_expr.index, offset);
+        ret walk_node(node.info.index_expr.index, offset, source);
     }
 
     if (kind == ast.NODE_EXPR_FIELD) {
@@ -713,30 +995,30 @@ fun walk_node(node: *ast.Node, offset: i32) *ast.Node {
                 ret node;
             }
         }
-        ret walk_node(node.info.field_expr.object, offset);
+        ret walk_node(node.info.field_expr.object, offset, source);
     }
 
     if (kind == ast.NODE_EXPR_CAST) {
         var found: *ast.Node = nil;
-        found = walk_node(node.info.cast_expr.expr, offset);
+        found = walk_node(node.info.cast_expr.expr, offset, source);
         if (found != nil) { ret found; }
-        ret walk_node(node.info.cast_expr.type_node, offset);
+        ret walk_node(node.info.cast_expr.type_node, offset, source);
     }
 
     if (kind == ast.NODE_EXPR_ARRAY_LIT) {
         var found: *ast.Node = nil;
-        found = walk_node(node.info.array_lit.size, offset);
+        found = walk_node(node.info.array_lit.size, offset, source);
         if (found != nil) { ret found; }
-        found = walk_node(node.info.array_lit.type_node, offset);
+        found = walk_node(node.info.array_lit.type_node, offset, source);
         if (found != nil) { ret found; }
-        ret walk_list(node.info.array_lit.elements, offset);
+        ret walk_list(node.info.array_lit.elements, offset, source);
     }
 
     if (kind == ast.NODE_EXPR_STRUCT_LIT) {
         var found: *ast.Node = nil;
-        found = walk_node(node.info.struct_lit.type_node, offset);
+        found = walk_node(node.info.struct_lit.type_node, offset, source);
         if (found != nil) { ret found; }
-        ret walk_list(node.info.struct_lit.fields, offset);
+        ret walk_list(node.info.struct_lit.fields, offset, source);
     }
 
     # --- types ---
@@ -752,50 +1034,58 @@ fun walk_node(node: *ast.Node, offset: i32) *ast.Node {
                 ret node;
             }
         }
-        ret walk_node(node.info.type_name.args, offset);
+        ret walk_node(node.info.type_name.args, offset, source);
     }
 
     if (kind == ast.NODE_TYPE_PTR || kind == ast.NODE_TYPE_REF) {
-        ret walk_node(node.info.type_ptr.inner, offset);
+        ret walk_node(node.info.type_ptr.inner, offset, source);
     }
 
     if (kind == ast.NODE_TYPE_ARRAY) {
         var found: *ast.Node = nil;
-        found = walk_node(node.info.type_array.elem_type, offset);
+        found = walk_node(node.info.type_array.elem_type, offset, source);
         if (found != nil) { ret found; }
-        ret walk_node(node.info.type_array.size, offset);
+        ret walk_node(node.info.type_array.size, offset, source);
     }
 
     if (kind == ast.NODE_TYPE_FUN) {
         var found: *ast.Node = nil;
-        found = walk_list(node.info.type_fun.params, offset);
+        found = walk_list(node.info.type_fun.params, offset, source);
         if (found != nil) { ret found; }
-        ret walk_node(node.info.type_fun.ret_type, offset);
+        ret walk_node(node.info.type_fun.ret_type, offset, source);
     }
 
     # --- misc ---
 
     if (kind == ast.NODE_GENERIC) {
-        ret walk_list(node.info.generic_node.args, offset);
+        ret walk_list(node.info.generic_node.args, offset, source);
     }
 
     if (kind == ast.NODE_PARAM) {
-        ret walk_node(node.info.field_decl.type_node, offset);
+        # check if offset is on the parameter name
+        if (is_decl_name_hit(node, node.info.field_decl.name, offset, source)) {
+            ret node;
+        }
+        ret walk_node(node.info.field_decl.type_node, offset, source);
     }
 
     if (kind == ast.NODE_FIELD) {
-        ret walk_node(node.info.field_decl.type_node, offset);
+        # check if offset is on the field name
+        if (is_decl_name_hit(node, node.info.field_decl.name, offset, source)) {
+            ret node;
+        }
+        ret walk_node(node.info.field_decl.type_node, offset, source);
     }
 
     # leaf or unknown: no children to walk
     ret nil;
 }
 
-fun walk_list(list: *ast.List, offset: i32) *ast.Node {
+fun walk_list(list: *ast.List, offset: i32, source: str) *ast.Node {
     if (list == nil) { ret nil; }
     var i: i32 = 0;
     for (i < list.count) {
-        val found: *ast.Node = walk_node(list.nodes[i], offset);
+        val found: *ast.Node = walk_node(list.nodes[i], offset, source);
         if (found != nil) { ret found; }
         i = i + 1;
     }
@@ -890,7 +1180,6 @@ fun collect_walk_node(rc: *RefCollector, node: *ast.Node) {
 
     if (kind == ast.NODE_STMT_EXPR || kind == ast.NODE_STMT_RET ||
         kind == ast.NODE_STMT_FIN || kind == ast.NODE_COMPTIME ||
-        kind == ast.NODE_EXPR_ADDR || kind == ast.NODE_EXPR_DEREF ||
         kind == ast.NODE_EXPR_PAREN) {
         collect_walk_node(rc, node.info.wrapper.inner);
         ret;
@@ -902,7 +1191,8 @@ fun collect_walk_node(rc: *RefCollector, node: *ast.Node) {
         ret;
     }
 
-    if (kind == ast.NODE_EXPR_UNARY) {
+    if (kind == ast.NODE_EXPR_UNARY ||
+        kind == ast.NODE_EXPR_ADDR || kind == ast.NODE_EXPR_DEREF) {
         collect_walk_node(rc, node.info.unary_expr.expr);
         ret;
     }

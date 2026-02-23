@@ -2,6 +2,7 @@ use std.types.bool;
 use std.types.size;
 use std.types.string;
 use std.types.result;
+use std.types.option;
 
 use allocator: std.allocator;
 use mem:       std.memory;
@@ -265,7 +266,7 @@ pub fun handle_definition(srv: *lsp_types.Server, body: str) {
 
     val offset: usize = workspace.position_to_offset(doc, line::usize, character::usize);
 
-    val node: *ast.Node = analysis.find_node_at_offset(ar.root, offset::i32);
+    val node: *ast.Node = analysis.find_node_at_offset(ar.root, offset::i32, ar.source);
     if (node == nil) {
         # fallback: check if cursor is in a use declaration
         val use_node: *ast.Node = analysis.find_use_at_offset(ar.root, offset::i32);
@@ -306,7 +307,19 @@ pub fun handle_definition(srv: *lsp_types.Server, body: str) {
         ret;
     }
 
-    val sym: *symbol.Symbol = analysis.get_node_symbol(node);
+    var sym: *symbol.Symbol = analysis.get_node_symbol(node);
+
+    # for declaration nodes (val/var/fun/rec/uni/def/param/field), node.symbol is
+    # not set by sema. look up by name in the symbol table instead.
+    if (sym == nil && analysis.is_decl_node(node)) {
+        val decl_name: str = analysis.get_decl_name(node);
+        if (decl_name != nil) {
+            val sym_opt: Option[*symbol.Symbol] = symbol.table_lookup(ar.sem.symbols, decl_name);
+            if (option_is_some[*symbol.Symbol](sym_opt)) {
+                sym = option_unwrap[*symbol.Symbol](sym_opt);
+            }
+        }
+    }
 
     # primary path: symbol resolved directly on the node
     if (sym != nil && sym.decl_node != nil) {
@@ -636,7 +649,7 @@ pub fun handle_references(srv: *lsp_types.Server, body: str) {
     }
 
     val offset: usize = workspace.position_to_offset(doc, line::usize, character::usize);
-    val node: *ast.Node = analysis.find_node_at_offset(ar.root, offset::i32);
+    val node: *ast.Node = analysis.find_node_at_offset(ar.root, offset::i32, ar.source);
     if (node == nil) {
         send_result(srv, id, "[]");
         free_str(uri, a);
@@ -644,7 +657,19 @@ pub fun handle_references(srv: *lsp_types.Server, body: str) {
         ret;
     }
 
-    val sym: *symbol.Symbol = analysis.get_node_symbol(node);
+    var sym: *symbol.Symbol = analysis.get_node_symbol(node);
+
+    # for declaration nodes, look up symbol by name
+    if (sym == nil && analysis.is_decl_node(node)) {
+        val decl_name: str = analysis.get_decl_name(node);
+        if (decl_name != nil) {
+            val sym_opt: Option[*symbol.Symbol] = symbol.table_lookup(ar.sem.symbols, decl_name);
+            if (option_is_some[*symbol.Symbol](sym_opt)) {
+                sym = option_unwrap[*symbol.Symbol](sym_opt);
+            }
+        }
+    }
+
     if (sym == nil) {
         send_result(srv, id, "[]");
         free_str(uri, a);
@@ -715,7 +740,7 @@ pub fun handle_prepare_rename(srv: *lsp_types.Server, body: str) {
     }
 
     val offset: usize = workspace.position_to_offset(doc, line::usize, character::usize);
-    val node: *ast.Node = analysis.find_node_at_offset(ar.root, offset::i32);
+    val node: *ast.Node = analysis.find_node_at_offset(ar.root, offset::i32, ar.source);
     if (node == nil) {
         send_null_result(srv, id);
         free_str(uri, a);
@@ -723,7 +748,19 @@ pub fun handle_prepare_rename(srv: *lsp_types.Server, body: str) {
         ret;
     }
 
-    val sym: *symbol.Symbol = analysis.get_node_symbol(node);
+    var sym: *symbol.Symbol = analysis.get_node_symbol(node);
+
+    # for declaration nodes, look up symbol by name
+    if (sym == nil && analysis.is_decl_node(node)) {
+        val decl_name: str = analysis.get_decl_name(node);
+        if (decl_name != nil) {
+            val sym_opt: Option[*symbol.Symbol] = symbol.table_lookup(ar.sem.symbols, decl_name);
+            if (option_is_some[*symbol.Symbol](sym_opt)) {
+                sym = option_unwrap[*symbol.Symbol](sym_opt);
+            }
+        }
+    }
+
     if (sym == nil || sym.decl_node == nil) {
         send_null_result(srv, id);
         free_str(uri, a);
@@ -739,18 +776,32 @@ pub fun handle_prepare_rename(srv: *lsp_types.Server, body: str) {
         ret;
     }
 
-    # use the declaration node's token for the range
-    val decl_pos: i32 = sym.decl_node.tok.pos;
-    val decl_len: i32 = sym.decl_node.tok.len;
+    # compute the name range — for expression idents use the node's tok,
+    # for declaration nodes compute from source text
+    var name_pos: i32 = 0;
+    var name_len: i32 = 0;
+
+    if (node.kind == ast.NODE_EXPR_IDENT) {
+        name_pos = node.tok.pos;
+        name_len = node.tok.len;
+    }
+    or {
+        # declaration node: compute name position from source
+        if (!analysis.get_decl_name_pos(node, ar.source, ?name_pos, ?name_len)) {
+            # fallback to keyword token
+            name_pos = node.tok.pos;
+            name_len = node.tok.len;
+        }
+    }
 
     var sl: usize = 0;
     var sc: usize = 0;
-    workspace.offset_to_position(doc, decl_pos::usize, ?sl, ?sc);
+    workspace.offset_to_position(doc, name_pos::usize, ?sl, ?sc);
 
     var el: usize = 0;
     var ec: usize = 0;
-    if (decl_len > 0) {
-        workspace.offset_to_position(doc, (decl_pos + decl_len)::usize, ?el, ?ec);
+    if (name_len > 0) {
+        workspace.offset_to_position(doc, (name_pos + name_len)::usize, ?el, ?ec);
     }
     or {
         el = sl;
@@ -832,7 +883,7 @@ pub fun handle_rename(srv: *lsp_types.Server, body: str) {
     }
 
     val offset: usize = workspace.position_to_offset(doc, line::usize, character::usize);
-    val node: *ast.Node = analysis.find_node_at_offset(ar.root, offset::i32);
+    val node: *ast.Node = analysis.find_node_at_offset(ar.root, offset::i32, ar.source);
     if (node == nil) {
         send_null_result(srv, id);
         free_str(uri, a);
@@ -841,7 +892,19 @@ pub fun handle_rename(srv: *lsp_types.Server, body: str) {
         ret;
     }
 
-    val sym: *symbol.Symbol = analysis.get_node_symbol(node);
+    var sym: *symbol.Symbol = analysis.get_node_symbol(node);
+
+    # for declaration nodes, look up symbol by name
+    if (sym == nil && analysis.is_decl_node(node)) {
+        val decl_name: str = analysis.get_decl_name(node);
+        if (decl_name != nil) {
+            val sym_opt: Option[*symbol.Symbol] = symbol.table_lookup(ar.sem.symbols, decl_name);
+            if (option_is_some[*symbol.Symbol](sym_opt)) {
+                sym = option_unwrap[*symbol.Symbol](sym_opt);
+            }
+        }
+    }
+
     if (sym == nil) {
         send_null_result(srv, id);
         free_str(uri, a);
