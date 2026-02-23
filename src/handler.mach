@@ -16,6 +16,7 @@ use pipeline: mach.compiler.pipeline;
 use sema:     mach.compiler.sema;
 use symbol:   mach.compiler.symbol;
 use token:    mach.compiler.token;
+use type:     mach.compiler.type;
 
 use lsp_types:   mls.lsp_types;
 use diagnostics: mls.diagnostics;
@@ -263,8 +264,42 @@ pub fun handle_definition(srv: *lsp_types.Server, body: str) {
     }
 
     val offset: usize = workspace.position_to_offset(doc, line::usize, character::usize);
+
     val node: *ast.Node = analysis.find_node_at_offset(ar.root, offset::i32);
     if (node == nil) {
+        # fallback: check if cursor is in a use declaration
+        val use_node: *ast.Node = analysis.find_use_at_offset(ar.root, offset::i32);
+        if (use_node != nil) {
+            val use_path: str = analysis.get_use_path(use_node);
+            if (use_path != nil) {
+                val target_mod: *sema.SemaModule = analysis.find_module_by_path(ar, use_path);
+                if (target_mod != nil && target_mod.file_path != nil) {
+                    val mod_uri: str = workspace.path_to_uri(target_mod.file_path, a);
+                    if (mod_uri != nil) {
+                        val location: str = build_location_json(mod_uri, 0, 0, 0, 0, a);
+                        if (location != nil) {
+                            val arr: str = wrap_in_array(location, a);
+                            if (arr != nil) {
+                                send_result(srv, id, arr);
+                                free_str(arr, a);
+                            }
+                            or {
+                                send_result(srv, id, location);
+                            }
+                            free_str(location, a);
+                        }
+                        or {
+                            send_null_result(srv, id);
+                        }
+                        free_str(mod_uri, a);
+                        free_str(uri, a);
+                        free_str(id, a);
+                        ret;
+                    }
+                }
+            }
+        }
+
         send_null_result(srv, id);
         free_str(uri, a);
         free_str(id, a);
@@ -272,12 +307,226 @@ pub fun handle_definition(srv: *lsp_types.Server, body: str) {
     }
 
     val sym: *symbol.Symbol = analysis.get_node_symbol(node);
-    if (sym == nil || sym.decl_node == nil) {
-        send_null_result(srv, id);
+
+    # primary path: symbol resolved directly on the node
+    if (sym != nil && sym.decl_node != nil) {
+        send_definition_for_symbol(srv, id, uri, doc, ar, sym, a);
         free_str(uri, a);
         free_str(id, a);
         ret;
     }
+
+    # fallback 1: module alias identifier — navigate to the module's source file
+    if (node.kind == ast.NODE_EXPR_IDENT) {
+        val ident_name: str = analysis.get_ident_name(node);
+        if (ident_name != nil) {
+            val alias_mod: *sema.SemaModule = analysis.find_module_alias(ar, ident_name);
+            if (alias_mod != nil && alias_mod.file_path != nil) {
+                val mod_uri: str = workspace.path_to_uri(alias_mod.file_path, a);
+                if (mod_uri != nil) {
+                    # navigate to line 0, col 0 of the module file
+                    val location: str = build_location_json(mod_uri, 0, 0, 0, 0, a);
+                    if (location != nil) {
+                        val arr: str = wrap_in_array(location, a);
+                        if (arr != nil) {
+                            send_result(srv, id, arr);
+                            free_str(arr, a);
+                        }
+                        or {
+                            send_result(srv, id, location);
+                        }
+                        free_str(location, a);
+                    }
+                    or {
+                        send_null_result(srv, id);
+                    }
+                    free_str(mod_uri, a);
+                    free_str(uri, a);
+                    free_str(id, a);
+                    ret;
+                }
+            }
+        }
+    }
+
+    # fallback 2: dotted TYPE_NAME (e.g. lsp_types.Server) — resolve the
+    # module alias and optionally the named declaration within that module.
+    if (node.kind == ast.NODE_TYPE_NAME) {
+        val type_path: str = analysis.get_type_name_path(node);
+        if (type_path != nil) {
+            # find the dot separating module alias from type name
+            val path_len: usize = str_len(type_path);
+            var dot_pos: usize = 0;
+            var found_dot: bool = false;
+            for (dot_pos < path_len) {
+                if (type_path[dot_pos] == 46) { # 46 = '.'
+                    found_dot = true;
+                    brk;
+                }
+                dot_pos = dot_pos + 1;
+            }
+
+            if (found_dot && dot_pos > 0 && dot_pos + 1 < path_len) {
+                # extract module alias (before dot) via substring match
+                # build alias name from the path up to the dot
+                val alias_res: Result[*u8, allocator.AllocError] =
+                    allocator.allocator_alloc[u8](?a, dot_pos + 1);
+                if (alias_res.tag) {
+                    val alias_buf: *u8 = alias_res.value.ok;
+                    mem.raw_copy(alias_buf::ptr, type_path::ptr, dot_pos);
+                    alias_buf[dot_pos] = 0;
+                    val alias_name: str = alias_buf::str;
+
+                    val target_mod: *sema.SemaModule = analysis.find_module_alias(ar, alias_name);
+                    allocator.allocator_free[u8](?a, alias_buf, dot_pos + 1);
+
+                    if (target_mod != nil && target_mod.file_path != nil) {
+                        # cursor is after the dot — try to find the specific declaration
+                        val tok_start: i32 = node.tok.pos;
+                        val dot_byte: i32 = tok_start + dot_pos::i32;
+
+                        if (offset::i32 > dot_byte) {
+                            # cursor is on the type name part — find the declaration
+                            val type_name_res: Result[*u8, allocator.AllocError] =
+                                allocator.allocator_alloc[u8](?a, path_len - dot_pos);
+                            if (type_name_res.tag) {
+                                val tn_buf: *u8 = type_name_res.value.ok;
+                                val tn_len: usize = path_len - dot_pos - 1;
+                                val tn_off: usize = dot_pos + 1;
+                                mem.raw_copy(tn_buf::ptr, (type_path::ptr + tn_off)::ptr, tn_len);
+                                tn_buf[tn_len] = 0;
+                                val decl_name: str = tn_buf::str;
+
+                                val decl_node: *ast.Node = analysis.find_decl_in_module(target_mod, decl_name);
+                                allocator.allocator_free[u8](?a, tn_buf, path_len - dot_pos);
+
+                                if (decl_node != nil && target_mod.source != nil) {
+                                    val mod_uri: str = workspace.path_to_uri(target_mod.file_path, a);
+                                    if (mod_uri != nil) {
+                                        val dp: i32 = decl_node.tok.pos;
+                                        val dl: i32 = pipeline.pos_to_line(target_mod.source, dp);
+                                        val dc: i32 = pipeline.pos_to_col(target_mod.source, dp);
+                                        var tl: usize = 0;
+                                        var tc: usize = 0;
+                                        if (dl > 0) { tl = (dl - 1)::usize; }
+                                        if (dc > 0) { tc = (dc - 1)::usize; }
+                                        val location: str = build_location_json(mod_uri, tl, tc, tl, tc + 1, a);
+                                        if (location != nil) {
+                                            val arr: str = wrap_in_array(location, a);
+                                            if (arr != nil) {
+                                                send_result(srv, id, arr);
+                                                free_str(arr, a);
+                                            }
+                                            or {
+                                                send_result(srv, id, location);
+                                            }
+                                            free_str(location, a);
+                                        }
+                                        or {
+                                            send_null_result(srv, id);
+                                        }
+                                        free_str(mod_uri, a);
+                                        free_str(uri, a);
+                                        free_str(id, a);
+                                        ret;
+                                    }
+                                }
+                            }
+                        }
+
+                        # cursor is on the module alias part, or couldn't find the decl
+                        # navigate to the module file
+                        val mod_uri: str = workspace.path_to_uri(target_mod.file_path, a);
+                        if (mod_uri != nil) {
+                            val location: str = build_location_json(mod_uri, 0, 0, 0, 0, a);
+                            if (location != nil) {
+                                val arr: str = wrap_in_array(location, a);
+                                if (arr != nil) {
+                                    send_result(srv, id, arr);
+                                    free_str(arr, a);
+                                }
+                                or {
+                                    send_result(srv, id, location);
+                                }
+                                free_str(location, a);
+                            }
+                            or {
+                                send_null_result(srv, id);
+                            }
+                            free_str(mod_uri, a);
+                            free_str(uri, a);
+                            free_str(id, a);
+                            ret;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    # fallback 3: struct field access — resolve field declaration via type info
+    if (node.kind == ast.NODE_EXPR_FIELD) {
+        val field_name: str = analysis.get_field_name(node);
+        val record_type: *type.Type = analysis.get_object_record_type(node);
+
+        if (field_name != nil && record_type != nil && record_type.name != nil) {
+            val rec_mod: *sema.SemaModule = analysis.find_record_module(ar, record_type.name);
+            if (rec_mod != nil) {
+                val rec_decl: *ast.Node = analysis.find_decl_in_module(rec_mod, record_type.name);
+                if (rec_decl != nil) {
+                    val field_decl: *ast.Node = analysis.find_field_in_record_decl(rec_decl, field_name);
+                    if (field_decl != nil) {
+                        val mod_uri: str = workspace.path_to_uri(rec_mod.file_path, a);
+                        if (mod_uri != nil) {
+                            val fp: i32 = field_decl.tok.pos;
+
+                            var fl: usize = 0;
+                            var fc: usize = 0;
+
+                            if (rec_mod.source != nil) {
+                                val rl: i32 = pipeline.pos_to_line(rec_mod.source, fp);
+                                val rc: i32 = pipeline.pos_to_col(rec_mod.source, fp);
+                                if (rl > 0) { fl = (rl - 1)::usize; }
+                                if (rc > 0) { fc = (rc - 1)::usize; }
+                            }
+
+                            val location: str = build_location_json(mod_uri, fl, fc, fl, fc + 1, a);
+                            if (location != nil) {
+                                val arr: str = wrap_in_array(location, a);
+                                if (arr != nil) {
+                                    send_result(srv, id, arr);
+                                    free_str(arr, a);
+                                }
+                                or {
+                                    send_result(srv, id, location);
+                                }
+                                free_str(location, a);
+                            }
+                            or {
+                                send_null_result(srv, id);
+                            }
+                            free_str(mod_uri, a);
+                            free_str(uri, a);
+                            free_str(id, a);
+                            ret;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    send_null_result(srv, id);
+    free_str(uri, a);
+    free_str(id, a);
+}
+
+fun send_definition_for_symbol(
+    srv: *lsp_types.Server, id: str, uri: str,
+    doc: *workspace.Document, ar: *analysis.AnalysisResult,
+    sym: *symbol.Symbol, alloc: allocator.Allocator
+) {
+    var a: allocator.Allocator = alloc;
 
     val decl_pos: i32 = sym.decl_node.tok.pos;
     val decl_len: i32 = sym.decl_node.tok.len;
@@ -304,7 +553,6 @@ pub fun handle_definition(srv: *lsp_types.Server, body: str) {
     var end_char: usize = 0;
 
     if (is_cross_file) {
-        # use pipeline pos_to_line/col on the target module's source (1-based, convert to 0-based)
         val l: i32 = pipeline.pos_to_line(target_source, decl_pos);
         val c: i32 = pipeline.pos_to_col(target_source, decl_pos);
         if (l > 0) { def_line = (l - 1)::usize; }
@@ -321,7 +569,6 @@ pub fun handle_definition(srv: *lsp_types.Server, body: str) {
         }
     }
     or {
-        # local symbol: use the document's precomputed line offsets
         workspace.offset_to_position(doc, decl_pos::usize, ?def_line, ?def_char);
         if (decl_len > 0) {
             workspace.offset_to_position(doc, (decl_pos + decl_len)::usize, ?end_line, ?end_char);
@@ -337,7 +584,6 @@ pub fun handle_definition(srv: *lsp_types.Server, body: str) {
 
     val location: str = build_location_json(loc_uri, def_line, def_char, end_line, end_char, a);
     if (location != nil) {
-        # wrap in array — LSP spec allows Location | Location[], but many clients expect array
         val arr: str = wrap_in_array(location, a);
         if (arr != nil) {
             send_result(srv, id, arr);
@@ -353,9 +599,6 @@ pub fun handle_definition(srv: *lsp_types.Server, body: str) {
     }
 
     if (target_uri != nil) { free_str(target_uri, a); }
-
-    free_str(uri, a);
-    free_str(id, a);
 }
 
 pub fun handle_references(srv: *lsp_types.Server, body: str) {
