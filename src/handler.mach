@@ -382,21 +382,219 @@ pub fun handle_references(srv: *lsp_types.Server, body: str) {
 pub fun handle_prepare_rename(srv: *lsp_types.Server, body: str) {
     var a: allocator.Allocator = srv.alloc;
     val id: str = json.extract_raw(body, "\"id\"", a);
-    if (id != nil) {
-        # TODO: #7 — validate symbol is renameable, return range + placeholder
+    if (id == nil) { ret; }
+
+    val td_anchor: str = "\"textDocument\"";
+    val uri: str = json.extract_after(body, td_anchor, "\"uri\"", a);
+
+    val pos_anchor: str = "\"position\"";
+    val line: i64 = json.extract_number_after(body, pos_anchor, "\"line\"", a);
+    val character: i64 = json.extract_number_after(body, pos_anchor, "\"character\"", a);
+
+    if (uri == nil) {
         send_null_result(srv, id);
         free_str(id, a);
+        ret;
     }
+
+    val doc: *workspace.Document = workspace.find(?srv.ws, uri);
+    if (doc == nil) {
+        send_null_result(srv, id);
+        free_str(uri, a);
+        free_str(id, a);
+        ret;
+    }
+
+    val ar: *analysis.AnalysisResult = analysis.get_analysis(?srv.ac, doc);
+    if (ar == nil) {
+        send_null_result(srv, id);
+        free_str(uri, a);
+        free_str(id, a);
+        ret;
+    }
+
+    val offset: usize = workspace.position_to_offset(doc, line::usize, character::usize);
+    val node: *ast.Node = analysis.find_node_at_offset(ar.root, offset::i32);
+    if (node == nil) {
+        send_null_result(srv, id);
+        free_str(uri, a);
+        free_str(id, a);
+        ret;
+    }
+
+    val sym: *symbol.Symbol = analysis.get_node_symbol(node);
+    if (sym == nil || sym.decl_node == nil) {
+        send_null_result(srv, id);
+        free_str(uri, a);
+        free_str(id, a);
+        ret;
+    }
+
+    # reject external symbols — they live in other files we can't edit
+    if (sym.kind == symbol.SYM_EXT || sym.kind == symbol.SYM_MODULE) {
+        send_null_result(srv, id);
+        free_str(uri, a);
+        free_str(id, a);
+        ret;
+    }
+
+    # use the declaration node's token for the range
+    val decl_pos: i32 = sym.decl_node.tok.pos;
+    val decl_len: i32 = sym.decl_node.tok.len;
+
+    var sl: usize = 0;
+    var sc: usize = 0;
+    workspace.offset_to_position(doc, decl_pos::usize, ?sl, ?sc);
+
+    var el: usize = 0;
+    var ec: usize = 0;
+    if (decl_len > 0) {
+        workspace.offset_to_position(doc, (decl_pos + decl_len)::usize, ?el, ?ec);
+    }
+    or {
+        el = sl;
+        ec = sc + 1;
+    }
+
+    # build { "range": {...}, "placeholder": "name" }
+    val result_str: str = build_prepare_rename_json(sym.name, sl, sc, el, ec, a);
+    if (result_str != nil) {
+        send_result(srv, id, result_str);
+        free_str(result_str, a);
+    }
+    or {
+        send_null_result(srv, id);
+    }
+
+    free_str(uri, a);
+    free_str(id, a);
 }
 
 pub fun handle_rename(srv: *lsp_types.Server, body: str) {
     var a: allocator.Allocator = srv.alloc;
     val id: str = json.extract_raw(body, "\"id\"", a);
-    if (id != nil) {
-        # TODO: #7 — find all references, build WorkspaceEdit
+    if (id == nil) { ret; }
+
+    val td_anchor: str = "\"textDocument\"";
+    val uri: str = json.extract_after(body, td_anchor, "\"uri\"", a);
+
+    val pos_anchor: str = "\"position\"";
+    val line: i64 = json.extract_number_after(body, pos_anchor, "\"line\"", a);
+    val character: i64 = json.extract_number_after(body, pos_anchor, "\"character\"", a);
+
+    val new_name: str = json.extract_string(body, "\"newName\"", a);
+
+    if (uri == nil || new_name == nil) {
         send_null_result(srv, id);
+        free_str(uri, a);
+        free_str(new_name, a);
         free_str(id, a);
+        ret;
     }
+
+    # validate new name is not empty
+    val new_name_len: usize = str_len(new_name);
+    if (new_name_len == 0) {
+        send_null_result(srv, id);
+        free_str(uri, a);
+        free_str(new_name, a);
+        free_str(id, a);
+        ret;
+    }
+
+    # reject if new name is a keyword
+    val tag: u8 = token.keyword_from_str(new_name);
+    if (tag != token.TAG_IDENT) {
+        send_error(srv, id, -32602, "new name is a keyword");
+        free_str(uri, a);
+        free_str(new_name, a);
+        free_str(id, a);
+        ret;
+    }
+
+    val doc: *workspace.Document = workspace.find(?srv.ws, uri);
+    if (doc == nil) {
+        send_null_result(srv, id);
+        free_str(uri, a);
+        free_str(new_name, a);
+        free_str(id, a);
+        ret;
+    }
+
+    val ar: *analysis.AnalysisResult = analysis.get_analysis(?srv.ac, doc);
+    if (ar == nil) {
+        send_null_result(srv, id);
+        free_str(uri, a);
+        free_str(new_name, a);
+        free_str(id, a);
+        ret;
+    }
+
+    val offset: usize = workspace.position_to_offset(doc, line::usize, character::usize);
+    val node: *ast.Node = analysis.find_node_at_offset(ar.root, offset::i32);
+    if (node == nil) {
+        send_null_result(srv, id);
+        free_str(uri, a);
+        free_str(new_name, a);
+        free_str(id, a);
+        ret;
+    }
+
+    val sym: *symbol.Symbol = analysis.get_node_symbol(node);
+    if (sym == nil) {
+        send_null_result(srv, id);
+        free_str(uri, a);
+        free_str(new_name, a);
+        free_str(id, a);
+        ret;
+    }
+
+    # reject external/module symbols
+    if (sym.kind == symbol.SYM_EXT || sym.kind == symbol.SYM_MODULE) {
+        send_error(srv, id, -32602, "cannot rename external or module symbol");
+        free_str(uri, a);
+        free_str(new_name, a);
+        free_str(id, a);
+        ret;
+    }
+
+    # collect references (including declaration)
+    val max_refs: i32 = 1024;
+    val refs_res: Result[**ast.Node, allocator.AllocError] =
+        allocator.allocator_alloc[*ast.Node](?a, max_refs::usize);
+    if (!refs_res.tag) {
+        send_null_result(srv, id);
+        free_str(uri, a);
+        free_str(new_name, a);
+        free_str(id, a);
+        ret;
+    }
+    val refs: **ast.Node = refs_res.value.ok;
+
+    val ref_count: i32 = analysis.collect_references(ar.root, sym, true, refs, max_refs);
+    if (ref_count == 0) {
+        send_null_result(srv, id);
+        allocator.allocator_free[*ast.Node](?a, refs, max_refs::usize);
+        free_str(uri, a);
+        free_str(new_name, a);
+        free_str(id, a);
+        ret;
+    }
+
+    # build WorkspaceEdit: { "changes": { "<uri>": [ TextEdit, ... ] } }
+    val result_str: str = build_workspace_edit_json(doc, refs, ref_count, new_name, a);
+    if (result_str != nil) {
+        send_result(srv, id, result_str);
+        free_str(result_str, a);
+    }
+    or {
+        send_null_result(srv, id);
+    }
+
+    allocator.allocator_free[*ast.Node](?a, refs, max_refs::usize);
+    free_str(uri, a);
+    free_str(new_name, a);
+    free_str(id, a);
 }
 
 pub fun handle_completion(srv: *lsp_types.Server, body: str) {
@@ -574,6 +772,235 @@ fun build_locations_json(
     i = 0;
     for (i < count) { free_str(locs[i], a); i = i + 1; }
     allocator.allocator_free[str](?a, locs, count::usize);
+
+    ret buf::str;
+}
+
+fun build_prepare_rename_json(
+    name: str, start_line: usize, start_char: usize,
+    end_line: usize, end_char: usize,
+    alloc: allocator.Allocator
+) str {
+    var a: allocator.Allocator = alloc;
+
+    val quoted_name: str = json.quote(name, a);
+    val sl: str = json.format_usize(start_line, a);
+    val sc: str = json.format_usize(start_char, a);
+    val el: str = json.format_usize(end_line, a);
+    val ec: str = json.format_usize(end_char, a);
+
+    val p1: str = "{\"range\":{\"start\":{\"line\":";
+    val p2: str = ",\"character\":";
+    val p3: str = "},\"end\":{\"line\":";
+    val p4: str = ",\"character\":";
+    val p5: str = "}},\"placeholder\":";
+    val p6: str = "}";
+
+    var qn_len: usize = 0;
+    if (quoted_name != nil) { qn_len = str_len(quoted_name); }
+    var sl_len: usize = 0;
+    if (sl != nil) { sl_len = str_len(sl); }
+    var sc_len: usize = 0;
+    if (sc != nil) { sc_len = str_len(sc); }
+    var el_len: usize = 0;
+    if (el != nil) { el_len = str_len(el); }
+    var ec_len: usize = 0;
+    if (ec != nil) { ec_len = str_len(ec); }
+
+    val total: usize = str_len(p1) + sl_len + str_len(p2) + sc_len +
+                       str_len(p3) + el_len + str_len(p4) + ec_len +
+                       str_len(p5) + qn_len + str_len(p6);
+
+    val buf_res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, total + 1);
+    if (!buf_res.tag) {
+        free_str(quoted_name, a);
+        free_str(sl, a);
+        free_str(sc, a);
+        free_str(el, a);
+        free_str(ec, a);
+        ret nil;
+    }
+    val buf: *u8 = buf_res.value.ok;
+
+    var off: usize = 0;
+    off = append(buf, off, p1);
+    off = append(buf, off, sl);
+    off = append(buf, off, p2);
+    off = append(buf, off, sc);
+    off = append(buf, off, p3);
+    off = append(buf, off, el);
+    off = append(buf, off, p4);
+    off = append(buf, off, ec);
+    off = append(buf, off, p5);
+    off = append(buf, off, quoted_name);
+    off = append(buf, off, p6);
+    buf[off] = 0;
+
+    free_str(quoted_name, a);
+    free_str(sl, a);
+    free_str(sc, a);
+    free_str(el, a);
+    free_str(ec, a);
+
+    ret buf::str;
+}
+
+fun build_workspace_edit_json(
+    doc: *workspace.Document, refs: **ast.Node, count: i32,
+    new_name: str, alloc: allocator.Allocator
+) str {
+    if (count == 0) { ret nil; }
+
+    var a: allocator.Allocator = alloc;
+
+    # build text edits array
+    val edits_res: Result[*str, allocator.AllocError] =
+        allocator.allocator_alloc[str](?a, count::usize);
+    if (!edits_res.tag) { ret nil; }
+    val edits: *str = edits_res.value.ok;
+
+    val quoted_new_name: str = json.quote(new_name, a);
+
+    var edits_total: usize = 0;
+    var i: i32 = 0;
+    for (i < count) {
+        val ref_node: *ast.Node = refs[i];
+        val ref_pos: i32 = ref_node.tok.pos;
+        val ref_len: i32 = ref_node.tok.len;
+
+        var sl: usize = 0;
+        var sc: usize = 0;
+        workspace.offset_to_position(doc, ref_pos::usize, ?sl, ?sc);
+
+        var el: usize = 0;
+        var ec: usize = 0;
+        if (ref_len > 0) {
+            workspace.offset_to_position(doc, (ref_pos + ref_len)::usize, ?el, ?ec);
+        }
+        or {
+            el = sl;
+            ec = sc + 1;
+        }
+
+        val edit: str = build_text_edit_json(sl, sc, el, ec, quoted_new_name, a);
+        edits[i] = edit;
+        if (edit != nil) { edits_total = edits_total + str_len(edit); }
+        if (i > 0) { edits_total = edits_total + 1; }  # comma
+        i = i + 1;
+    }
+
+    # build: {"changes":{"<uri>":[edit1,edit2,...]}}
+    val quoted_uri: str = json.quote(doc.uri, a);
+
+    val h1: str = "{\"changes\":{";
+    val h2: str = ":[";
+    val h3: str = "]}}";
+
+    var qu_len: usize = 0;
+    if (quoted_uri != nil) { qu_len = str_len(quoted_uri); }
+
+    val total: usize = str_len(h1) + qu_len + str_len(h2) + edits_total + str_len(h3);
+
+    val buf_res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, total + 1);
+    if (!buf_res.tag) {
+        i = 0;
+        for (i < count) { free_str(edits[i], a); i = i + 1; }
+        allocator.allocator_free[str](?a, edits, count::usize);
+        free_str(quoted_uri, a);
+        free_str(quoted_new_name, a);
+        ret nil;
+    }
+    val buf: *u8 = buf_res.value.ok;
+
+    var off: usize = 0;
+    off = append(buf, off, h1);
+    off = append(buf, off, quoted_uri);
+    off = append(buf, off, h2);
+
+    i = 0;
+    for (i < count) {
+        if (i > 0) {
+            buf[off] = ',';
+            off = off + 1;
+        }
+        off = append(buf, off, edits[i]);
+        i = i + 1;
+    }
+
+    off = append(buf, off, h3);
+    buf[off] = 0;
+
+    i = 0;
+    for (i < count) { free_str(edits[i], a); i = i + 1; }
+    allocator.allocator_free[str](?a, edits, count::usize);
+    free_str(quoted_uri, a);
+    free_str(quoted_new_name, a);
+
+    ret buf::str;
+}
+
+fun build_text_edit_json(
+    start_line: usize, start_char: usize,
+    end_line: usize, end_char: usize,
+    quoted_new_text: str, alloc: allocator.Allocator
+) str {
+    var a: allocator.Allocator = alloc;
+
+    val sl: str = json.format_usize(start_line, a);
+    val sc: str = json.format_usize(start_char, a);
+    val el: str = json.format_usize(end_line, a);
+    val ec: str = json.format_usize(end_char, a);
+
+    val p1: str = "{\"range\":{\"start\":{\"line\":";
+    val p2: str = ",\"character\":";
+    val p3: str = "},\"end\":{\"line\":";
+    val p4: str = ",\"character\":";
+    val p5: str = "}},\"newText\":";
+    val p6: str = "}";
+
+    var sl_len: usize = 0;
+    if (sl != nil) { sl_len = str_len(sl); }
+    var sc_len: usize = 0;
+    if (sc != nil) { sc_len = str_len(sc); }
+    var el_len: usize = 0;
+    if (el != nil) { el_len = str_len(el); }
+    var ec_len: usize = 0;
+    if (ec != nil) { ec_len = str_len(ec); }
+    var qnt_len: usize = 0;
+    if (quoted_new_text != nil) { qnt_len = str_len(quoted_new_text); }
+
+    val total: usize = str_len(p1) + sl_len + str_len(p2) + sc_len +
+                       str_len(p3) + el_len + str_len(p4) + ec_len +
+                       str_len(p5) + qnt_len + str_len(p6);
+
+    val buf_res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, total + 1);
+    if (!buf_res.tag) {
+        free_str(sl, a);
+        free_str(sc, a);
+        free_str(el, a);
+        free_str(ec, a);
+        ret nil;
+    }
+    val buf: *u8 = buf_res.value.ok;
+
+    var off: usize = 0;
+    off = append(buf, off, p1);
+    off = append(buf, off, sl);
+    off = append(buf, off, p2);
+    off = append(buf, off, sc);
+    off = append(buf, off, p3);
+    off = append(buf, off, el);
+    off = append(buf, off, p4);
+    off = append(buf, off, ec);
+    off = append(buf, off, p5);
+    off = append(buf, off, quoted_new_text);
+    off = append(buf, off, p6);
+    buf[off] = 0;
+
+    free_str(sl, a);
+    free_str(sc, a);
+    free_str(el, a);
+    free_str(ec, a);
 
     ret buf::str;
 }
