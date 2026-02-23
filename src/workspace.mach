@@ -7,6 +7,8 @@ use allocator: std.allocator;
 use mem:       std.memory;
 use print:     std.print;
 
+use config: mach.config.config;
+
 # mls.workspace: document and workspace state management.
 
 val INITIAL_DOC_CAP:  usize = 16;
@@ -22,10 +24,13 @@ pub rec Document {
 }
 
 pub rec Workspace {
-    docs:  *Document;
-    count: usize;
-    cap:   usize;
-    alloc: allocator.Allocator;
+    docs:      *Document;
+    count:     usize;
+    cap:       usize;
+    alloc:     allocator.Allocator;
+    root_path: str;
+    cfg:       config.Config;
+    cfg_ok:    bool;
 }
 
 pub fun init(ws: *Workspace, alloc: allocator.Allocator) {
@@ -33,6 +38,8 @@ pub fun init(ws: *Workspace, alloc: allocator.Allocator) {
     ws.count = 0;
     ws.cap = 0;
     ws.alloc = alloc;
+    ws.root_path = nil;
+    ws.cfg_ok = false;
 }
 
 pub fun deinit(ws: *Workspace, alloc: allocator.Allocator) {
@@ -48,6 +55,221 @@ pub fun deinit(ws: *Workspace, alloc: allocator.Allocator) {
     ws.docs = nil;
     ws.count = 0;
     ws.cap = 0;
+}
+
+# set_root: set the workspace root path and load mach.toml.
+# root_uri should be a file:// URI from the initialize request.
+pub fun set_root(ws: *Workspace, root_uri: str) {
+    if (root_uri == nil) { ret; }
+
+    # strip file:// prefix to get filesystem path
+    ws.root_path = uri_to_path(root_uri, ws.alloc);
+    if (ws.root_path == nil) { ret; }
+
+    # build path to mach.toml
+    val root_len: usize = str_len(ws.root_path);
+    val toml_name: str = "mach.toml";
+    val toml_len: usize = str_len(toml_name);
+
+    # ensure root_path ends with /
+    var sep: usize = 0;
+    if (root_len > 0 && ws.root_path[root_len - 1] != '/') {
+        sep = 1;
+    }
+
+    val path_len: usize = root_len + sep + toml_len;
+    var a: allocator.Allocator = ws.alloc;
+    val buf_res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, path_len + 1);
+    if (!buf_res.tag) { ret; }
+    val buf: *u8 = buf_res.value.ok;
+
+    mem.raw_copy(buf::ptr, ws.root_path::ptr, root_len);
+    if (sep > 0) { buf[root_len] = '/'; }
+    mem.raw_copy((buf + root_len + sep)::ptr, toml_name::ptr, toml_len);
+    buf[path_len] = 0;
+
+    val config_path: str = buf::str;
+
+    val cfg_res: Result[config.Config, str] = config.load(config_path, ?a);
+    allocator.allocator_free[u8](?a, buf, path_len + 1);
+
+    if (cfg_res.tag) {
+        ws.cfg = cfg_res.value.ok;
+        ws.cfg_ok = true;
+        print.eprintln("mach-lsp: workspace: loaded mach.toml");
+    }
+    or {
+        print.eprintln("mach-lsp: workspace: failed to load mach.toml");
+    }
+}
+
+# uri_to_path: convert a file:// URI to a filesystem path.
+# strips the "file://" prefix. caller owns the returned string.
+pub fun uri_to_path(uri: str, alloc: allocator.Allocator) str {
+    if (uri == nil) { ret nil; }
+    val uri_len: usize = str_len(uri);
+
+    # check for "file://" prefix (7 chars)
+    val prefix: str = "file://";
+    val prefix_len: usize = 7;
+    if (uri_len <= prefix_len) { ret clone_str(uri, alloc); }
+
+    var match: bool = true;
+    var i: usize = 0;
+    for (i < prefix_len) {
+        if (uri[i] != prefix[i]) { match = false; brk; }
+        i = i + 1;
+    }
+
+    if (match) {
+        val path_len: usize = uri_len - prefix_len;
+        val path_start: &u8 = (uri::ptr + prefix_len)::&u8;
+        ret make_str(path_start, path_len, alloc);
+    }
+
+    ret clone_str(uri, alloc);
+}
+
+# build_src_root: construct absolute path to src directory.
+pub fun build_src_root(ws: *Workspace) str {
+    if (ws.root_path == nil || !ws.cfg_ok) { ret nil; }
+    ret path_join(ws.root_path, ws.cfg.dir_src, ws.alloc);
+}
+
+# build_dep_root: construct absolute path to dep directory.
+pub fun build_dep_root(ws: *Workspace) str {
+    if (ws.root_path == nil || !ws.cfg_ok) { ret nil; }
+    ret path_join(ws.root_path, ws.cfg.dir_dep, ws.alloc);
+}
+
+# path_join: join two path segments with /.
+pub fun path_join(base: str, rel: str, alloc: allocator.Allocator) str {
+    if (base == nil) { ret clone_str(rel, alloc); }
+    if (rel == nil) { ret clone_str(base, alloc); }
+
+    val base_len: usize = str_len(base);
+    val rel_len: usize = str_len(rel);
+
+    var sep: usize = 0;
+    if (base_len > 0 && base[base_len - 1] != '/') { sep = 1; }
+
+    val total: usize = base_len + sep + rel_len;
+    var a: allocator.Allocator = alloc;
+    val res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, total + 1);
+    if (!res.tag) { ret nil; }
+    val buf: *u8 = res.value.ok;
+
+    mem.raw_copy(buf::ptr, base::ptr, base_len);
+    if (sep > 0) { buf[base_len] = '/'; }
+    mem.raw_copy((buf + base_len + sep)::ptr, rel::ptr, rel_len);
+    buf[total] = 0;
+
+    ret buf::str;
+}
+
+# uri_to_module_path: convert a file:// URI to a dot-separated module path.
+# e.g. "file:///opt/.../src/server.mach" → "mls.server"
+pub fun uri_to_module_path(uri: str, ws: *Workspace) str {
+    if (uri == nil || !ws.cfg_ok || ws.root_path == nil) { ret nil; }
+
+    val file_path: str = uri_to_path(uri, ws.alloc);
+    if (file_path == nil) { ret nil; }
+
+    val src_root: str = build_src_root(ws);
+    if (src_root == nil) {
+        free_str(file_path, ws.alloc);
+        ret nil;
+    }
+
+    val fp_len: usize = str_len(file_path);
+    val sr_len: usize = str_len(src_root);
+
+    # check if file_path starts with src_root
+    var prefix_len: usize = sr_len;
+    if (fp_len <= prefix_len) {
+        free_str(file_path, ws.alloc);
+        free_str(src_root, ws.alloc);
+        ret nil;
+    }
+
+    # compare prefix
+    var match: bool = true;
+    var i: usize = 0;
+    for (i < sr_len) {
+        if (file_path[i] != src_root[i]) { match = false; brk; }
+        i = i + 1;
+    }
+
+    if (!match) {
+        free_str(file_path, ws.alloc);
+        free_str(src_root, ws.alloc);
+        ret nil;
+    }
+
+    # skip trailing / on src_root
+    if (prefix_len < fp_len && file_path[prefix_len] == '/') {
+        prefix_len = prefix_len + 1;
+    }
+
+    # strip .mach suffix (5 chars)
+    var suffix_len: usize = 0;
+    val mach_suffix: str = ".mach";
+    if (fp_len >= prefix_len + 5) {
+        var suf_match: bool = true;
+        var s: usize = 0;
+        for (s < 5) {
+            if (file_path[fp_len - 5 + s] != mach_suffix[s]) { suf_match = false; brk; }
+            s = s + 1;
+        }
+        if (suf_match) { suffix_len = 5; }
+    }
+
+    # relative part: file_path[prefix_len .. fp_len - suffix_len]
+    val rel_len: usize = fp_len - prefix_len - suffix_len;
+    if (rel_len == 0) {
+        free_str(file_path, ws.alloc);
+        free_str(src_root, ws.alloc);
+        ret nil;
+    }
+
+    # build: project_id + "." + relative (with / replaced by .)
+    val pid: str = ws.cfg.id;
+    var pid_len: usize = 0;
+    if (pid != nil) { pid_len = str_len(pid); }
+
+    val mod_len: usize = pid_len + 1 + rel_len;
+    var a: allocator.Allocator = ws.alloc;
+    val buf_res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, mod_len + 1);
+    if (!buf_res.tag) {
+        free_str(file_path, ws.alloc);
+        free_str(src_root, ws.alloc);
+        ret nil;
+    }
+    val buf: *u8 = buf_res.value.ok;
+
+    var off: usize = 0;
+    if (pid != nil) {
+        mem.raw_copy(buf::ptr, pid::ptr, pid_len);
+        off = pid_len;
+    }
+    buf[off] = '.';
+    off = off + 1;
+
+    # copy relative path, replacing / with .
+    i = 0;
+    for (i < rel_len) {
+        val ch: u8 = file_path[prefix_len + i];
+        if (ch == '/') { buf[off] = '.'; }
+        or { buf[off] = ch; }
+        off = off + 1;
+        i = i + 1;
+    }
+    buf[off] = 0;
+
+    free_str(file_path, ws.alloc);
+    free_str(src_root, ws.alloc);
+
+    ret buf::str;
 }
 
 pub fun open(ws: *Workspace, uri: str, text: str) *Document {
@@ -268,6 +490,22 @@ pub fun make_str(data: &u8, len: usize, alloc: allocator.Allocator) str {
     val buf: *u8 = res.value.ok;
     mem.raw_copy(buf::ptr, data::ptr, len);
     buf[len] = 0;
+    ret buf::str;
+}
+
+pub fun path_to_uri(path: str, alloc: allocator.Allocator) str {
+    if (path == nil) { ret nil; }
+    val prefix: str = "file://";
+    val prefix_len: usize = 7;
+    val path_len: usize = str_len(path);
+    val total: usize = prefix_len + path_len;
+    var a: allocator.Allocator = alloc;
+    val res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, total + 1);
+    if (!res.tag) { ret nil; }
+    val buf: *u8 = res.value.ok;
+    mem.raw_copy(buf::ptr, prefix::ptr, prefix_len);
+    mem.raw_copy((buf + prefix_len)::ptr, path::ptr, path_len);
+    buf[total] = 0;
     ret buf::str;
 }
 
