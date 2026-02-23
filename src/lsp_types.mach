@@ -5,6 +5,7 @@ use std.types.string;
 use allocator: std.allocator;
 
 use workspace: mls.workspace;
+use analysis:  mls.analysis;
 
 # mls.lsp_types: shared type definitions for the LSP server.
 # ---
@@ -25,9 +26,11 @@ pub val STATUS_EXITED:        u8 = 4;
 # exit_code:  exit code to return from the process
 # alloc:      allocator used for all server-owned memory
 # ws:         workspace state (open documents, project info)
+# ac:         analysis cache (lazy per-document sema results)
 pub rec Server {
     status:    u8;
     exit_code: i64;
     alloc:     allocator.Allocator;
     ws:        workspace.Workspace;
+    ac:        analysis.AnalysisCache;
 }
