@@ -1,0 +1,20 @@
+use std.types.size;
+use std.types.string;
+
+use pfs: std.system.platform.linux.filesystem;
+use plc: std.system.platform.linux.constants;
+
+# mls.trace: shared file-based trace logging for debugging.
+
+val LOG_PATH: str = "/tmp/mach-lsp.log";
+
+pub fun log(msg: str) {
+    if (msg == nil) { ret; }
+    val len: usize = str_len(msg);
+    if (len == 0) { ret; }
+    val flags: i32 = plc.O_WRONLY | plc.O_CREAT | plc.O_APPEND;
+    val fd: i64 = pfs.openat(plc.AT_FDCWD, LOG_PATH, flags, 420);
+    if (fd < 0) { ret; }
+    pfs.write(fd::i32, msg::ptr, len);
+    pfs.close(fd::i32);
+}

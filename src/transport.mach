@@ -9,6 +9,8 @@ use stream:    std.stream;
 use stdio:     std.system.stdio;
 use print:     std.print;
 
+use trace: mls.trace;
+
 # mls.transport: JSON-RPC transport over stdin/stdout.
 
 pub rec Message {
@@ -157,6 +159,10 @@ pub fun send_message(body: str, alloc: allocator.Allocator) {
     mem.raw_copy((buf + offset)::ptr, CRLF_CRLF::ptr, sep_len);
     offset = offset + sep_len;
     mem.raw_copy((buf + offset)::ptr, body::ptr, body_len);
+
+    trace.log("send: ");
+    trace.log(body);
+    trace.log("\n");
 
     stream.write_all(?writer, buf, total);
     allocator.allocator_free[u8](?a, buf, total);

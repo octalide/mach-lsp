@@ -12,6 +12,7 @@ use workspace: mls.workspace;
 use json:      mls.json;
 use lsp_types: mls.lsp_types;
 use analysis:  mls.analysis;
+use trace:     mls.trace;
 
 # mls.server: top-level LSP server state and message loop.
 
@@ -30,26 +31,35 @@ pub fun deinit(srv: *lsp_types.Server) {
 }
 
 pub fun run(srv: *lsp_types.Server) i64 {
+    trace.log("=== mach-lsp started ===\n");
+
     for (srv.status != lsp_types.STATUS_EXITED) {
         var msg: transport.Message;
         val read_ok: bool = transport.read_message(?msg, srv.alloc);
 
         if (!read_ok) {
             if (srv.status == lsp_types.STATUS_SHUTTING_DOWN) {
+                trace.log("stdin closed (shutting down)\n");
                 srv.status = lsp_types.STATUS_EXITED;
                 brk;
             }
 
+            trace.log("stdin read failed\n");
             print.eprintln("mach-lsp: error: failed to read message");
             srv.exit_code = 1;
             srv.status = lsp_types.STATUS_EXITED;
             brk;
         }
 
+        trace.log("recv: ");
+        trace.log(msg.body);
+        trace.log("\n");
+
         dispatch(srv, ?msg);
         transport.message_free(?msg);
     }
 
+    trace.log("=== mach-lsp exiting ===\n");
     ret srv.exit_code;
 }
 
@@ -60,6 +70,9 @@ fun dispatch(srv: *lsp_types.Server, msg: *transport.Message) {
     if (method == nil) {
         ret;
     }
+
+    print.eprint("mach-lsp: dispatch: ");
+    print.eprintln(method);
 
     # lifecycle
     if (str_equals(method, "initialize")) {
@@ -164,6 +177,9 @@ fun dispatch(srv: *lsp_types.Server, msg: *transport.Message) {
     }
 
     # fallback
+    trace.log("unhandled method: ");
+    trace.log(method);
+    trace.log("\n");
     json.free_str(method, srv.alloc);
 
     val id: str = json.extract_raw(body, "\"id\"", srv.alloc);
@@ -172,3 +188,4 @@ fun dispatch(srv: *lsp_types.Server, msg: *transport.Message) {
         json.free_str(id, srv.alloc);
     }
 }
+
