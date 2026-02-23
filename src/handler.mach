@@ -11,9 +11,11 @@ use transport: mls.transport;
 use workspace: mls.workspace;
 use json:      mls.json;
 
-use ast:    mach.compiler.ast;
-use symbol: mach.compiler.symbol;
-use token:  mach.compiler.token;
+use ast:      mach.compiler.ast;
+use pipeline: mach.compiler.pipeline;
+use sema:     mach.compiler.sema;
+use symbol:   mach.compiler.symbol;
+use token:    mach.compiler.token;
 
 use lsp_types:   mls.lsp_types;
 use diagnostics: mls.diagnostics;
@@ -113,6 +115,13 @@ pub fun handle_initialize(srv: *lsp_types.Server, body: str) {
     if (id == nil) {
         print.eprintln("mach-lsp: initialize: missing id");
         ret;
+    }
+
+    # extract rootUri from params for workspace config
+    val root_uri: str = json.extract_string(body, "\"rootUri\"", a);
+    if (root_uri != nil) {
+        workspace.set_root(?srv.ws, root_uri);
+        free_str(root_uri, a);
     }
 
     srv.status = lsp_types.STATUS_RUNNING;
@@ -245,7 +254,7 @@ pub fun handle_definition(srv: *lsp_types.Server, body: str) {
         ret;
     }
 
-    val ar: *analysis.AnalysisResult = analysis.get_analysis(?srv.ac, doc);
+    val ar: *analysis.AnalysisResult = analysis.get_analysis(?srv.ac, doc, ?srv.ws);
     if (ar == nil) {
         send_null_result(srv, id);
         free_str(uri, a);
@@ -273,21 +282,60 @@ pub fun handle_definition(srv: *lsp_types.Server, body: str) {
     val decl_pos: i32 = sym.decl_node.tok.pos;
     val decl_len: i32 = sym.decl_node.tok.len;
 
+    # check if symbol is from a different module (cross-file)
+    var target_uri: str = nil;
+    var target_source: str = nil;
+    var is_cross_file: bool = false;
+
+    if (sym.module_path != nil && ar.sem.module_path != nil) {
+        if (!str_equals(sym.module_path, ar.sem.module_path)) {
+            val target_mod: *sema.SemaModule = analysis.find_module_by_path(ar, sym.module_path);
+            if (target_mod != nil && target_mod.file_path != nil && target_mod.source != nil) {
+                target_uri = workspace.path_to_uri(target_mod.file_path, a);
+                target_source = target_mod.source;
+                is_cross_file = true;
+            }
+        }
+    }
+
     var def_line: usize = 0;
     var def_char: usize = 0;
-    workspace.offset_to_position(doc, decl_pos::usize, ?def_line, ?def_char);
-
     var end_line: usize = 0;
     var end_char: usize = 0;
-    if (decl_len > 0) {
-        workspace.offset_to_position(doc, (decl_pos + decl_len)::usize, ?end_line, ?end_char);
+
+    if (is_cross_file) {
+        # use pipeline pos_to_line/col on the target module's source (1-based, convert to 0-based)
+        val l: i32 = pipeline.pos_to_line(target_source, decl_pos);
+        val c: i32 = pipeline.pos_to_col(target_source, decl_pos);
+        if (l > 0) { def_line = (l - 1)::usize; }
+        if (c > 0) { def_char = (c - 1)::usize; }
+        if (decl_len > 0) {
+            val el: i32 = pipeline.pos_to_line(target_source, decl_pos + decl_len);
+            val ec: i32 = pipeline.pos_to_col(target_source, decl_pos + decl_len);
+            if (el > 0) { end_line = (el - 1)::usize; }
+            if (ec > 0) { end_char = (ec - 1)::usize; }
+        }
+        or {
+            end_line = def_line;
+            end_char = def_char + 1;
+        }
     }
     or {
-        end_line = def_line;
-        end_char = def_char + 1;
+        # local symbol: use the document's precomputed line offsets
+        workspace.offset_to_position(doc, decl_pos::usize, ?def_line, ?def_char);
+        if (decl_len > 0) {
+            workspace.offset_to_position(doc, (decl_pos + decl_len)::usize, ?end_line, ?end_char);
+        }
+        or {
+            end_line = def_line;
+            end_char = def_char + 1;
+        }
     }
 
-    val location: str = build_location_json(doc.uri, def_line, def_char, end_line, end_char, a);
+    var loc_uri: str = doc.uri;
+    if (is_cross_file && target_uri != nil) { loc_uri = target_uri; }
+
+    val location: str = build_location_json(loc_uri, def_line, def_char, end_line, end_char, a);
     if (location != nil) {
         send_result(srv, id, location);
         free_str(location, a);
@@ -295,6 +343,8 @@ pub fun handle_definition(srv: *lsp_types.Server, body: str) {
     or {
         send_null_result(srv, id);
     }
+
+    if (target_uri != nil) { free_str(target_uri, a); }
 
     free_str(uri, a);
     free_str(id, a);
@@ -326,7 +376,7 @@ pub fun handle_references(srv: *lsp_types.Server, body: str) {
         ret;
     }
 
-    val ar: *analysis.AnalysisResult = analysis.get_analysis(?srv.ac, doc);
+    val ar: *analysis.AnalysisResult = analysis.get_analysis(?srv.ac, doc, ?srv.ws);
     if (ar == nil) {
         send_result(srv, id, "[]");
         free_str(uri, a);
@@ -405,7 +455,7 @@ pub fun handle_prepare_rename(srv: *lsp_types.Server, body: str) {
         ret;
     }
 
-    val ar: *analysis.AnalysisResult = analysis.get_analysis(?srv.ac, doc);
+    val ar: *analysis.AnalysisResult = analysis.get_analysis(?srv.ac, doc, ?srv.ws);
     if (ar == nil) {
         send_null_result(srv, id);
         free_str(uri, a);
@@ -521,7 +571,7 @@ pub fun handle_rename(srv: *lsp_types.Server, body: str) {
         ret;
     }
 
-    val ar: *analysis.AnalysisResult = analysis.get_analysis(?srv.ac, doc);
+    val ar: *analysis.AnalysisResult = analysis.get_analysis(?srv.ac, doc, ?srv.ws);
     if (ar == nil) {
         send_null_result(srv, id);
         free_str(uri, a);

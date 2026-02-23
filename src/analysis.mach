@@ -8,10 +8,12 @@ use mem:       std.memory;
 use print:     std.print;
 
 use ast:      mach.compiler.ast;
+use config:   mach.config.config;
 use parser:   mach.compiler.parser;
 use pipeline: mach.compiler.pipeline;
-use sema:     mach.compiler.sema;
-use sema_a:   mach.compiler.sema.analyze;
+use sema:    mach.compiler.sema;
+use collect: mach.compiler.sema.collect;
+use resolve: mach.compiler.sema.resolve;
 use symbol:   mach.compiler.symbol;
 use type:     mach.compiler.type;
 use target:   mach.compiler.target;
@@ -101,7 +103,7 @@ pub fun invalidate(cache: *AnalysisCache, uri: str) {
 
 # get_analysis: return analysis result for a document, running analysis if needed.
 # returns nil if analysis cannot be performed (no target, allocation failure, etc.).
-pub fun get_analysis(cache: *AnalysisCache, doc: *workspace.Document) *AnalysisResult {
+pub fun get_analysis(cache: *AnalysisCache, doc: *workspace.Document, ws: *workspace.Workspace) *AnalysisResult {
     if (doc == nil || doc.uri == nil || !cache.tgt_ok) { ret nil; }
 
     var entry: *CacheEntry = find_entry(cache, doc.uri);
@@ -126,7 +128,7 @@ pub fun get_analysis(cache: *AnalysisCache, doc: *workspace.Document) *AnalysisR
     }
 
     entry.stale = false;
-    run_analysis(cache, entry, doc);
+    run_analysis(cache, entry, doc, ws);
 
     if (entry.result.ok) { ret ?entry.result; }
     ret nil;
@@ -147,6 +149,20 @@ pub fun find_node_at_offset(root: *ast.Node, offset: i32) *ast.Node {
 pub fun get_node_symbol(node: *ast.Node) *symbol.Symbol {
     if (node == nil || node.symbol == nil) { ret nil; }
     ret node.symbol::*symbol.Symbol;
+}
+
+# find_module_by_path: walk the sema's loaded modules list to find a module
+# by its dot-separated path (e.g. "mls.handler"). returns nil if not found.
+pub fun find_module_by_path(ar: *AnalysisResult, module_path: str) *sema.SemaModule {
+    if (ar == nil || module_path == nil) { ret nil; }
+    var mod: *sema.SemaModule = ar.sem.modules;
+    for (mod != nil) {
+        if (mod.path != nil && str_equals(mod.path, module_path)) {
+            ret mod;
+        }
+        mod = mod.next;
+    }
+    ret nil;
 }
 
 # collect_references: find all AST nodes that reference a given symbol.
@@ -180,7 +196,7 @@ rec RefCollector {
 
 # --- internal ---
 
-fun run_analysis(cache: *AnalysisCache, entry: *CacheEntry, doc: *workspace.Document) {
+fun run_analysis(cache: *AnalysisCache, entry: *CacheEntry, doc: *workspace.Document, ws: *workspace.Workspace) {
     entry.result.root = nil;
     entry.result.ok = false;
     entry.result.source = doc.text;
@@ -195,6 +211,17 @@ fun run_analysis(cache: *AnalysisCache, entry: *CacheEntry, doc: *workspace.Docu
 
     # set up sema
     var sem: sema.Sema = sema.init(?a, cache.tgt);
+
+    # set up module resolution if workspace config is loaded
+    if (ws != nil && ws.cfg_ok) {
+        val src_root: str = workspace.build_src_root(ws);
+        val dep_root: str = workspace.build_dep_root(ws);
+
+        if (src_root != nil) {
+            sema.set_module_roots(?sem, ws.cfg.id, src_root, dep_root,
+                ws.cfg.deps, ws.cfg.dep_count);
+        }
+    }
 
     # create symbol table
     val table_res: Result[symbol.Table, str] = symbol.init(?a);
@@ -213,8 +240,77 @@ fun run_analysis(cache: *AnalysisCache, entry: *CacheEntry, doc: *workspace.Docu
     @tbl_ptr = table_res.value.ok;
     sem.symbols = tbl_ptr;
 
-    # run 4-pass analysis, tolerating errors for partial results
-    sema_a.analyze(?sem, pr.root, entry.uri, doc.text, nil);
+    # convert file URI to filesystem path for sema context
+    var file_path: str = nil;
+    if (ws != nil) {
+        file_path = workspace.uri_to_path(entry.uri, cache.alloc);
+    }
+
+    # set up sema state — replicating sema/analyze.mach setup but running
+    # passes individually so we can reset error_count between collect and
+    # resolve. the standard analyze() skips resolve if collect had ANY errors,
+    # which prevents local symbol resolution when dep modules have errors.
+    var fp: str = file_path;
+    if (fp == nil) { fp = entry.uri; }
+
+    sem.file_path = fp;
+    sem.source = doc.text;
+    sem.error_count = 0;
+    sem.had_error = false;
+
+    if (sem.module_path == nil) {
+        if (sem.project_id != nil) {
+            sem.module_path = sem.project_id;
+        }
+        or {
+            sem.module_path = "main";
+        }
+    }
+
+    # create SemaModule for the main module
+    val mod_res: Result[*sema.SemaModule, allocator.AllocError] =
+        allocator.allocator_alloc[sema.SemaModule](?a, 1);
+    if (mod_res.tag) {
+        val main_mod: *sema.SemaModule = mod_res.value.ok;
+        main_mod.path = sem.module_path;
+        main_mod.file_path = fp;
+        main_mod.source = doc.text;
+        main_mod.ast = pr.root;
+        main_mod.is_analyzed = false;
+        main_mod.next = nil;
+        main_mod.aliases = nil;
+        main_mod.imports = nil;
+        main_mod.table = sem.symbols;
+        sem.current_module = main_mod;
+    }
+
+    # push root scope
+    val scope_res: Result[bool, str] = sema.push_scope(?sem);
+    if (!scope_res.tag) {
+        if (file_path != nil) { workspace.free_str(file_path, cache.alloc); }
+        sema.dnit(?sem);
+        ret;
+    }
+
+    # pass 1: collect declarations — loads dep modules, may produce errors
+    collect.collect_declarations(?sem, pr.root);
+
+    # reset error count so resolve passes run even when dep modules had errors.
+    sem.error_count = 0;
+    sem.had_error = false;
+
+    # pass 2: resolve types and identifiers
+    resolve.resolve_types(?sem, pr.root);
+
+    # pass 2b: resolve function bodies — sets node.symbol on identifier nodes
+    resolve.resolve_functions(?sem, pr.root);
+
+    # clean up scopes
+    for (sem.current_scope != nil) {
+        sema.pop_scope(?sem);
+    }
+
+    if (file_path != nil) { workspace.free_str(file_path, cache.alloc); }
 
     entry.result.root = pr.root;
     entry.result.sem = sem;
@@ -388,6 +484,16 @@ fun walk_node(node: *ast.Node, offset: i32) *ast.Node {
     }
 
     if (kind == ast.NODE_EXPR_FIELD) {
+        # field access: node.tok is the DOT, field name follows immediately after.
+        # check if offset falls within the field name region.
+        val field_name: str = node.info.field_expr.field;
+        if (field_name != nil) {
+            val field_start: i32 = node.tok.pos + node.tok.len;
+            val field_len: i32 = str_len(field_name)::i32;
+            if (offset >= field_start && offset < field_start + field_len) {
+                ret node;
+            }
+        }
         ret walk_node(node.info.field_expr.object, offset);
     }
 
@@ -465,8 +571,9 @@ fun walk_list(list: *ast.List, offset: i32) *ast.Node {
 
 fun is_name_node(node: *ast.Node) bool {
     val k: u8 = node.kind;
+    # NODE_EXPR_FIELD is handled specially in walk_node (tok is the DOT,
+    # field name follows) — do not include it here.
     ret k == ast.NODE_EXPR_IDENT ||
-        k == ast.NODE_EXPR_FIELD ||
         k == ast.NODE_TYPE_NAME;
 }
 
