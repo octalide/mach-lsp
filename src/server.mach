@@ -1,0 +1,171 @@
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use print:     std.print;
+
+use transport: mls.transport;
+use handler:   mls.handler;
+use workspace: mls.workspace;
+use json:      mls.json;
+use lsp_types: mls.lsp_types;
+
+# mls.server: top-level LSP server state and message loop.
+
+pub fun init(srv: *lsp_types.Server) {
+    srv.status = lsp_types.STATUS_UNINITIALIZED;
+    srv.exit_code = 0;
+    srv.alloc = allocator.heap_allocator();
+    workspace.init(?srv.ws, srv.alloc);
+}
+
+pub fun deinit(srv: *lsp_types.Server) {
+    workspace.deinit(?srv.ws, srv.alloc);
+    srv.status = lsp_types.STATUS_EXITED;
+}
+
+pub fun run(srv: *lsp_types.Server) i64 {
+    for (srv.status != lsp_types.STATUS_EXITED) {
+        var msg: transport.Message;
+        val read_ok: bool = transport.read_message(?msg, srv.alloc);
+
+        if (!read_ok) {
+            if (srv.status == lsp_types.STATUS_SHUTTING_DOWN) {
+                srv.status = lsp_types.STATUS_EXITED;
+                brk;
+            }
+
+            print.eprintln("mach-lsp: error: failed to read message");
+            srv.exit_code = 1;
+            srv.status = lsp_types.STATUS_EXITED;
+            brk;
+        }
+
+        dispatch(srv, ?msg);
+        transport.message_free(?msg);
+    }
+
+    ret srv.exit_code;
+}
+
+fun dispatch(srv: *lsp_types.Server, msg: *transport.Message) {
+    val body: str = msg.body;
+    val method: str = json.extract_string(body, "\"method\"", srv.alloc);
+
+    if (method == nil) {
+        ret;
+    }
+
+    # lifecycle
+    if (str_equals(method, "initialize")) {
+        json.free_str(method, srv.alloc);
+        handler.handle_initialize(srv, body);
+        ret;
+    }
+
+    if (str_equals(method, "initialized")) {
+        json.free_str(method, srv.alloc);
+        ret;
+    }
+
+    if (str_equals(method, "shutdown")) {
+        json.free_str(method, srv.alloc);
+        handler.handle_shutdown(srv, body);
+        ret;
+    }
+
+    if (str_equals(method, "exit")) {
+        json.free_str(method, srv.alloc);
+        handler.handle_exit(srv);
+        ret;
+    }
+
+    # reject before initialize
+    if (srv.status != lsp_types.STATUS_RUNNING) {
+        json.free_str(method, srv.alloc);
+        val id: str = json.extract_raw(body, "\"id\"", srv.alloc);
+        if (id != nil) {
+            handler.send_error(srv, id, -32002, "server not initialized");
+            json.free_str(id, srv.alloc);
+        }
+        ret;
+    }
+
+    # document synchronization
+    if (str_equals(method, "textDocument/didOpen")) {
+        json.free_str(method, srv.alloc);
+        handler.handle_did_open(srv, body);
+        ret;
+    }
+
+    if (str_equals(method, "textDocument/didChange")) {
+        json.free_str(method, srv.alloc);
+        handler.handle_did_change(srv, body);
+        ret;
+    }
+
+    if (str_equals(method, "textDocument/didClose")) {
+        json.free_str(method, srv.alloc);
+        handler.handle_did_close(srv, body);
+        ret;
+    }
+
+    if (str_equals(method, "textDocument/didSave")) {
+        json.free_str(method, srv.alloc);
+        ret;
+    }
+
+    # language features
+    if (str_equals(method, "textDocument/hover")) {
+        json.free_str(method, srv.alloc);
+        handler.handle_hover(srv, body);
+        ret;
+    }
+
+    if (str_equals(method, "textDocument/definition")) {
+        json.free_str(method, srv.alloc);
+        handler.handle_definition(srv, body);
+        ret;
+    }
+
+    if (str_equals(method, "textDocument/references")) {
+        json.free_str(method, srv.alloc);
+        handler.handle_references(srv, body);
+        ret;
+    }
+
+    if (str_equals(method, "textDocument/prepareRename")) {
+        json.free_str(method, srv.alloc);
+        handler.handle_prepare_rename(srv, body);
+        ret;
+    }
+
+    if (str_equals(method, "textDocument/rename")) {
+        json.free_str(method, srv.alloc);
+        handler.handle_rename(srv, body);
+        ret;
+    }
+
+    if (str_equals(method, "textDocument/completion")) {
+        json.free_str(method, srv.alloc);
+        handler.handle_completion(srv, body);
+        ret;
+    }
+
+    if (str_equals(method, "textDocument/documentSymbol")) {
+        json.free_str(method, srv.alloc);
+        handler.handle_document_symbol(srv, body);
+        ret;
+    }
+
+    # fallback
+    json.free_str(method, srv.alloc);
+
+    val id: str = json.extract_raw(body, "\"id\"", srv.alloc);
+    if (id != nil) {
+        handler.send_error(srv, id, -32601, "method not found");
+        json.free_str(id, srv.alloc);
+    }
+}

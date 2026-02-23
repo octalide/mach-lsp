@@ -1,0 +1,279 @@
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use mem:       std.memory;
+use print:     std.print;
+
+# mls.workspace: document and workspace state management.
+
+val INITIAL_DOC_CAP:  usize = 16;
+val INITIAL_LINE_CAP: usize = 256;
+
+pub rec Document {
+    uri:        str;
+    text:       str;
+    text_len:   usize;
+    lines:      *usize;
+    line_count: usize;
+    line_cap:   usize;
+}
+
+pub rec Workspace {
+    docs:  *Document;
+    count: usize;
+    cap:   usize;
+    alloc: allocator.Allocator;
+}
+
+pub fun init(ws: *Workspace, alloc: allocator.Allocator) {
+    ws.docs = nil;
+    ws.count = 0;
+    ws.cap = 0;
+    ws.alloc = alloc;
+}
+
+pub fun deinit(ws: *Workspace, alloc: allocator.Allocator) {
+    var i: usize = 0;
+    for (i < ws.count) {
+        doc_free(?ws.docs[i], alloc);
+        i = i + 1;
+    }
+    if (ws.docs != nil && ws.cap > 0) {
+        var a: allocator.Allocator = alloc;
+        allocator.allocator_free[Document](?a, ws.docs, ws.cap);
+    }
+    ws.docs = nil;
+    ws.count = 0;
+    ws.cap = 0;
+}
+
+pub fun open(ws: *Workspace, uri: str, text: str) *Document {
+    val existing: *Document = find(ws, uri);
+    if (existing != nil) {
+        update(ws, existing, text);
+        ret existing;
+    }
+
+    if (ws.count >= ws.cap) {
+        if (!grow_docs(ws)) { ret nil; }
+    }
+
+    val doc: *Document = ?ws.docs[ws.count];
+
+    doc.uri = clone_str(uri, ws.alloc);
+    if (uri != nil && doc.uri == nil) { ret nil; }
+
+    doc.text = clone_str(text, ws.alloc);
+    if (text != nil && doc.text == nil) {
+        free_str(doc.uri, ws.alloc);
+        doc.uri = nil;
+        ret nil;
+    }
+
+    if (doc.text != nil) { doc.text_len = str_len(doc.text); }
+    or { doc.text_len = 0; }
+
+    doc.lines = nil;
+    doc.line_count = 0;
+    doc.line_cap = 0;
+    rebuild_lines(doc, ws.alloc);
+
+    ws.count = ws.count + 1;
+    ret doc;
+}
+
+pub fun close(ws: *Workspace, uri: str) bool {
+    var idx: isize = -1;
+    var i: usize = 0;
+    for (i < ws.count) {
+        if (ws.docs[i].uri != nil && str_equals(ws.docs[i].uri, uri)) {
+            idx = i::isize;
+            brk;
+        }
+        i = i + 1;
+    }
+
+    if (idx < 0) { ret false; }
+
+    val remove_at: usize = idx::usize;
+    doc_free(?ws.docs[remove_at], ws.alloc);
+
+    var j: usize = remove_at + 1;
+    for (j < ws.count) {
+        mem.raw_copy((?ws.docs[j - 1])::ptr, (?ws.docs[j])::ptr, $size_of(Document));
+        j = j + 1;
+    }
+
+    ws.count = ws.count - 1;
+    mem.raw_zero((?ws.docs[ws.count])::ptr, $size_of(Document));
+    ret true;
+}
+
+pub fun update(ws: *Workspace, doc: *Document, text: str) {
+    free_str(doc.text, ws.alloc);
+    doc.text = clone_str(text, ws.alloc);
+    if (doc.text != nil) { doc.text_len = str_len(doc.text); }
+    or { doc.text_len = 0; }
+    rebuild_lines(doc, ws.alloc);
+}
+
+pub fun find(ws: *Workspace, uri: str) *Document {
+    if (uri == nil) { ret nil; }
+    var i: usize = 0;
+    for (i < ws.count) {
+        if (ws.docs[i].uri != nil && str_equals(ws.docs[i].uri, uri)) {
+            ret ?ws.docs[i];
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+pub fun offset_to_position(doc: &Document, offset: usize, line_out: *usize, char_out: *usize) {
+    if (doc.line_count == 0 || doc.lines == nil) {
+        @line_out = 0;
+        @char_out = offset;
+        ret;
+    }
+
+    var low: usize = 0;
+    var high: usize = doc.line_count;
+
+    for (low + 1 < high) {
+        val mid: usize = (low + high) >> 1;
+        if (doc.lines[mid] <= offset) { low = mid; }
+        or { high = mid; }
+    }
+
+    @line_out = low;
+    val line_start: usize = doc.lines[low];
+    if (offset >= line_start) { @char_out = offset - line_start; }
+    or { @char_out = 0; }
+}
+
+pub fun position_to_offset(doc: &Document, line: usize, character: usize) usize {
+    if (doc.line_count == 0 || doc.lines == nil) { ret character; }
+    if (line >= doc.line_count) {
+        val last: usize = doc.line_count - 1;
+        ret doc.lines[last] + character;
+    }
+    ret doc.lines[line] + character;
+}
+
+fun doc_free(doc: *Document, alloc: allocator.Allocator) {
+    free_str(doc.uri, alloc);
+    free_str(doc.text, alloc);
+    if (doc.lines != nil && doc.line_cap > 0) {
+        var a: allocator.Allocator = alloc;
+        allocator.allocator_free[usize](?a, doc.lines, doc.line_cap);
+    }
+    doc.uri = nil;
+    doc.text = nil;
+    doc.text_len = 0;
+    doc.lines = nil;
+    doc.line_count = 0;
+    doc.line_cap = 0;
+}
+
+fun grow_docs(ws: *Workspace) bool {
+    var new_cap: usize = ws.cap;
+    if (new_cap == 0) { new_cap = INITIAL_DOC_CAP; }
+    or { new_cap = new_cap + (new_cap >> 1) + 4; }
+
+    var a: allocator.Allocator = ws.alloc;
+    val res: Result[*Document, allocator.AllocError] = allocator.allocator_resize[Document](?a, ws.docs, ws.cap, new_cap);
+    if (!res.tag) {
+        print.eprintln("mach-lsp: workspace: failed to grow document array");
+        ret false;
+    }
+
+    ws.docs = res.value.ok;
+
+    var i: usize = ws.cap;
+    for (i < new_cap) {
+        mem.raw_zero((?ws.docs[i])::ptr, $size_of(Document));
+        i = i + 1;
+    }
+
+    ws.cap = new_cap;
+    ret true;
+}
+
+fun rebuild_lines(doc: *Document, alloc: allocator.Allocator) {
+    var a: allocator.Allocator = alloc;
+
+    if (doc.lines != nil && doc.line_cap > 0) {
+        allocator.allocator_free[usize](?a, doc.lines, doc.line_cap);
+    }
+    doc.lines = nil;
+    doc.line_count = 0;
+    doc.line_cap = 0;
+
+    if (doc.text == nil || doc.text_len == 0) { ret; }
+
+    var count: usize = 1;
+    var i: usize = 0;
+    for (i < doc.text_len) {
+        if (doc.text[i] == '\n') { count = count + 1; }
+        i = i + 1;
+    }
+
+    var cap: usize = count;
+    if (cap < INITIAL_LINE_CAP) { cap = INITIAL_LINE_CAP; }
+
+    val res: Result[*usize, allocator.AllocError] = allocator.allocator_alloc[usize](?a, cap);
+    if (!res.tag) { ret; }
+
+    val lines: *usize = res.value.ok;
+
+    var line_idx: usize = 0;
+    lines[line_idx] = 0;
+    line_idx = line_idx + 1;
+
+    i = 0;
+    for (i < doc.text_len) {
+        if (doc.text[i] == '\n') {
+            lines[line_idx] = i + 1;
+            line_idx = line_idx + 1;
+        }
+        i = i + 1;
+    }
+
+    doc.lines = lines;
+    doc.line_count = line_idx;
+    doc.line_cap = cap;
+}
+
+pub fun clone_str(s: str, alloc: allocator.Allocator) str {
+    if (s == nil) { ret nil; }
+    val len: usize = str_len(s);
+    if (len == 0) { ret nil; }
+    var a: allocator.Allocator = alloc;
+    val res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, len + 1);
+    if (!res.tag) { ret nil; }
+    val buf: *u8 = res.value.ok;
+    mem.raw_copy(buf::ptr, s::ptr, len);
+    buf[len] = 0;
+    ret buf::str;
+}
+
+pub fun make_str(data: &u8, len: usize, alloc: allocator.Allocator) str {
+    if (data == nil || len == 0) { ret nil; }
+    var a: allocator.Allocator = alloc;
+    val res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, len + 1);
+    if (!res.tag) { ret nil; }
+    val buf: *u8 = res.value.ok;
+    mem.raw_copy(buf::ptr, data::ptr, len);
+    buf[len] = 0;
+    ret buf::str;
+}
+
+pub fun free_str(s: str, alloc: allocator.Allocator) {
+    if (s == nil) { ret; }
+    val len: usize = str_len(s);
+    var a: allocator.Allocator = alloc;
+    allocator.allocator_free_bytes(?a, s::ptr, len + 1, 1);
+}

@@ -1,0 +1,364 @@
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use mem:       std.memory;
+use print:     std.print;
+
+use parser:    mach.compiler.parser;
+use token:     mach.compiler.token;
+use ast:       mach.compiler.ast;
+
+use transport: mls.transport;
+use workspace: mls.workspace;
+use json:      mls.json;
+
+# mls.diagnostics: compile-time diagnostic collection and publishing.
+
+val SEVERITY_ERROR:       i64 = 1;
+val SEVERITY_WARNING:     i64 = 2;
+val SEVERITY_INFORMATION: i64 = 3;
+val SEVERITY_HINT:        i64 = 4;
+
+val MAX_DIAGNOSTICS: i32 = 50;
+
+pub fun publish_diagnostics(doc: *workspace.Document, alloc: allocator.Allocator) {
+    if (doc == nil || doc.uri == nil) {
+        ret;
+    }
+
+    var a: allocator.Allocator = alloc;
+
+    val source: str = doc.text;
+
+    var alloc_copy: allocator.Allocator = alloc;
+    var p: parser.Parser = parser.init(source, ?alloc_copy);
+
+    val result: Result[*ast.Node, str] = parser.parser_parse_program(?p);
+
+    val error_count: i32 = p.error_count;
+    var diag_count: i32 = error_count;
+    if (diag_count > MAX_DIAGNOSTICS) {
+        diag_count = MAX_DIAGNOSTICS;
+    }
+
+    val hdr_prefix: str = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":";
+    val hdr_mid:    str = ",\"diagnostics\":[";
+    val hdr_suffix: str = "]}}";
+
+    val quoted_uri: str = json.quote(doc.uri, a);
+
+    var diag_strs: *str = nil;
+    var diag_str_count: i32 = 0;
+
+    if (diag_count > 0) {
+        val arr_res: Result[*str, allocator.AllocError] = allocator.allocator_alloc[str](?a, diag_count::usize);
+        if (!arr_res.tag) {
+            parser.parser_dnit(?p);
+            free_str(quoted_uri, a);
+            ret;
+        }
+        diag_strs = arr_res.value.ok;
+    }
+
+    var i: i32 = 0;
+    for (i < diag_count) {
+        val err_tok: token.Token = p.errors[i].tok;
+        val err_msg: str = p.errors[i].message;
+
+        var line_num: usize = 0;
+        var char_num: usize = 0;
+        workspace.offset_to_position(doc, err_tok.pos::usize, ?line_num, ?char_num);
+
+        var end_char: usize = char_num + 1;
+        if (err_tok.len > 0) {
+            end_char = char_num + err_tok.len::usize;
+        }
+
+        val diag_str: str = build_diagnostic_json(
+            line_num, char_num, line_num, end_char,
+            SEVERITY_ERROR, err_msg, a
+        );
+
+        diag_strs[i] = diag_str;
+        diag_str_count = diag_str_count + 1;
+        i = i + 1;
+    }
+
+    val hdr_prefix_len: usize = str_len(hdr_prefix);
+    val hdr_mid_len: usize = str_len(hdr_mid);
+    val hdr_suffix_len: usize = str_len(hdr_suffix);
+    val quoted_uri_len: usize = str_len(quoted_uri);
+
+    var total: usize = hdr_prefix_len + quoted_uri_len + hdr_mid_len + hdr_suffix_len;
+
+    var d: i32 = 0;
+    for (d < diag_str_count) {
+        if (diag_strs[d] != nil) {
+            total = total + str_len(diag_strs[d]);
+        }
+        if (d > 0) {
+            total = total + 1;
+        }
+        d = d + 1;
+    }
+
+    val buf_res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, total + 1);
+    if (!buf_res.tag) {
+        cleanup_diag_strs(diag_strs, diag_str_count, a);
+        free_str(quoted_uri, a);
+        parser.parser_dnit(?p);
+        ret;
+    }
+    val buf: *u8 = buf_res.value.ok;
+
+    var off: usize = 0;
+    off = append(buf, off, hdr_prefix);
+    off = append(buf, off, quoted_uri);
+    off = append(buf, off, hdr_mid);
+
+    var j: i32 = 0;
+    for (j < diag_str_count) {
+        if (j > 0) {
+            @(buf + off) = ',';
+            off = off + 1;
+        }
+        off = append(buf, off, diag_strs[j]);
+        j = j + 1;
+    }
+
+    off = append(buf, off, hdr_suffix);
+    buf[off] = 0;
+
+    transport.send_message(buf::str, a);
+
+    allocator.allocator_free[u8](?a, buf, total + 1);
+    cleanup_diag_strs(diag_strs, diag_str_count, a);
+    free_str(quoted_uri, a);
+    parser.parser_dnit(?p);
+}
+
+pub fun clear_diagnostics(doc: *workspace.Document, alloc: allocator.Allocator) {
+    if (doc == nil || doc.uri == nil) {
+        ret;
+    }
+
+    var a: allocator.Allocator = alloc;
+
+    val quoted_uri: str = json.quote(doc.uri, a);
+
+    val prefix: str = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":";
+    val suffix: str = ",\"diagnostics\":[]}}";
+
+    val prefix_len: usize = str_len(prefix);
+    val suffix_len: usize = str_len(suffix);
+    val quoted_uri_len: usize = str_len(quoted_uri);
+    val total: usize = prefix_len + quoted_uri_len + suffix_len;
+
+    val buf_res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, total + 1);
+    if (!buf_res.tag) {
+        free_str(quoted_uri, a);
+        ret;
+    }
+    val buf: *u8 = buf_res.value.ok;
+
+    var off: usize = 0;
+    off = append(buf, off, prefix);
+    off = append(buf, off, quoted_uri);
+    off = append(buf, off, suffix);
+    buf[off] = 0;
+
+    transport.send_message(buf::str, a);
+
+    allocator.allocator_free[u8](?a, buf, total + 1);
+    free_str(quoted_uri, a);
+}
+
+fun build_diagnostic_json(
+    start_line: usize, start_char: usize,
+    end_line: usize, end_char: usize,
+    severity: i64, message: str,
+    alloc: allocator.Allocator
+) str {
+    var a: allocator.Allocator = alloc;
+
+    val sl: str = format_usize(start_line, a);
+    val sc: str = format_usize(start_char, a);
+    val el: str = format_usize(end_line, a);
+    val ec: str = format_usize(end_char, a);
+    val sev: str = format_i64(severity, a);
+
+    val quoted_msg: str = json.quote(message, a);
+
+    val p1: str = "{\"range\":{\"start\":{\"line\":";
+    val p2: str = ",\"character\":";
+    val p3: str = "},\"end\":{\"line\":";
+    val p4: str = ",\"character\":";
+    val p5: str = "}},\"severity\":";
+    val p6: str = ",\"source\":\"mach\",\"message\":";
+    val p7: str = "}";
+
+    var sl_len: usize = 0;
+    if (sl != nil) { sl_len = str_len(sl); }
+    var sc_len: usize = 0;
+    if (sc != nil) { sc_len = str_len(sc); }
+    var el_len: usize = 0;
+    if (el != nil) { el_len = str_len(el); }
+    var ec_len: usize = 0;
+    if (ec != nil) { ec_len = str_len(ec); }
+    var sev_len: usize = 0;
+    if (sev != nil) { sev_len = str_len(sev); }
+    var quoted_msg_len: usize = 0;
+    if (quoted_msg != nil) { quoted_msg_len = str_len(quoted_msg); }
+
+    val total: usize = str_len(p1) + sl_len + str_len(p2) + sc_len + str_len(p3) + el_len +
+                       str_len(p4) + ec_len + str_len(p5) + sev_len + str_len(p6) + quoted_msg_len + str_len(p7);
+
+    val buf_res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, total + 1);
+    if (!buf_res.tag) {
+        free_str(sl, a);
+        free_str(sc, a);
+        free_str(el, a);
+        free_str(ec, a);
+        free_str(sev, a);
+        free_str(quoted_msg, a);
+        ret nil;
+    }
+    val buf: *u8 = buf_res.value.ok;
+
+    var off: usize = 0;
+    off = append(buf, off, p1);
+    off = append(buf, off, sl);
+    off = append(buf, off, p2);
+    off = append(buf, off, sc);
+    off = append(buf, off, p3);
+    off = append(buf, off, el);
+    off = append(buf, off, p4);
+    off = append(buf, off, ec);
+    off = append(buf, off, p5);
+    off = append(buf, off, sev);
+    off = append(buf, off, p6);
+    off = append(buf, off, quoted_msg);
+    off = append(buf, off, p7);
+    buf[off] = 0;
+
+    free_str(sl, a);
+    free_str(sc, a);
+    free_str(el, a);
+    free_str(ec, a);
+    free_str(sev, a);
+    free_str(quoted_msg, a);
+
+    ret buf::str;
+}
+
+fun cleanup_diag_strs(strs: *str, count: i32, alloc: allocator.Allocator) {
+    if (strs == nil) {
+        ret;
+    }
+
+    var a: allocator.Allocator = alloc;
+    var i: i32 = 0;
+    for (i < count) {
+        free_str(strs[i], a);
+        i = i + 1;
+    }
+
+    if (count > 0) {
+        allocator.allocator_free[str](?a, strs, count::usize);
+    }
+}
+
+fun append(buf: *u8, offset: usize, s: str) usize {
+    if (s != nil) {
+        val slen: usize = str_len(s);
+        if (slen > 0) {
+            mem.raw_copy((buf + offset)::ptr, s::ptr, slen);
+        }
+        ret offset + slen;
+    }
+    ret offset;
+}
+
+fun free_str(s: str, alloc: allocator.Allocator) {
+    if (s != nil) {
+        val len: usize = str_len(s);
+        var a: allocator.Allocator = alloc;
+        allocator.allocator_free_bytes(?a, s::ptr, len + 1, 1);
+    }
+}
+
+fun format_usize(value: usize, alloc: allocator.Allocator) str {
+    var tmp: [21]u8;
+    var pos: usize = 21;
+    var v: usize = value;
+
+    if (v == 0) {
+        pos = pos - 1;
+        tmp[pos] = '0';
+    }
+    or {
+        for (v > 0 && pos > 0) {
+            pos = pos - 1;
+            val rem: usize = v % 10;
+            tmp[pos] = ('0' + rem)::u8;
+            v = v / 10;
+        }
+    }
+
+    val len: usize = 21 - pos;
+    var a: allocator.Allocator = alloc;
+    val res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, len + 1);
+    if (!res.tag) {
+        ret nil;
+    }
+    val buf: *u8 = res.value.ok;
+    mem.raw_copy(buf::ptr, (?tmp[pos])::ptr, len);
+    buf[len] = 0;
+
+    ret buf::str;
+}
+
+fun format_i64(value: i64, alloc: allocator.Allocator) str {
+    var tmp: [21]u8;
+    var pos: usize = 21;
+    var negative: bool = false;
+    var v: i64 = value;
+
+    if (v < 0) {
+        negative = true;
+        v = -v;
+    }
+
+    if (v == 0) {
+        pos = pos - 1;
+        tmp[pos] = '0';
+    }
+    or {
+        for (v > 0 && pos > 0) {
+            pos = pos - 1;
+            val rem: i64 = v % 10;
+            tmp[pos] = ('0' + rem)::u8;
+            v = v / 10;
+        }
+    }
+
+    if (negative && pos > 0) {
+        pos = pos - 1;
+        tmp[pos] = '-';
+    }
+
+    val len: usize = 21 - pos;
+    var a: allocator.Allocator = alloc;
+    val res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, len + 1);
+    if (!res.tag) {
+        ret nil;
+    }
+    val buf: *u8 = res.value.ok;
+    mem.raw_copy(buf::ptr, (?tmp[pos])::ptr, len);
+    buf[len] = 0;
+
+    ret buf::str;
+}

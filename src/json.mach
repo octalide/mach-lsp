@@ -1,0 +1,340 @@
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use mem:       std.memory;
+
+# mls.json: minimal JSON extraction and construction utilities.
+
+pub fun extract_string(data: str, key: str, alloc: allocator.Allocator) str {
+    val idx: isize = find_key(data, key);
+    if (idx < 0) { ret nil; }
+
+    val data_len: usize = str_len(data);
+    val key_len: usize = str_len(key);
+    var pos: usize = (idx::usize) + key_len;
+
+    pos = skip_whitespace(data, pos);
+    if (pos >= data_len || data[pos] != ':') { ret nil; }
+    pos = pos + 1;
+
+    pos = skip_whitespace(data, pos);
+    if (pos >= data_len || data[pos] != '"') { ret nil; }
+    pos = pos + 1;
+
+    var scan: usize = pos;
+    var out_len: usize = 0;
+    for (scan < data_len) {
+        val ch: u8 = data[scan];
+        if (ch == '\\') { scan = scan + 2; out_len = out_len + 1; }
+        or (ch == '"') { brk; }
+        or { scan = scan + 1; out_len = out_len + 1; }
+    }
+
+    if (scan >= data_len) { ret nil; }
+    if (out_len == 0) { ret nil; }
+
+    var a: allocator.Allocator = alloc;
+    val res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, out_len + 1);
+    if (!res.tag) { ret nil; }
+    val buf: *u8 = res.value.ok;
+
+    scan = pos;
+    var w: usize = 0;
+    for (scan < data_len && w < out_len) {
+        val ch: u8 = data[scan];
+        if (ch == '\\') {
+            scan = scan + 1;
+            if (scan >= data_len) { brk; }
+            val esc: u8 = data[scan];
+            if (esc == 'n')       { buf[w] = '\n'; }
+            or (esc == 'r')       { buf[w] = '\r'; }
+            or (esc == 't')       { buf[w] = '\t'; }
+            or (esc == '"')       { buf[w] = '"'; }
+            or (esc == '\\')      { buf[w] = '\\'; }
+            or                    { buf[w] = esc; }
+            scan = scan + 1;
+            w = w + 1;
+        }
+        or (ch == '"') { brk; }
+        or { buf[w] = ch; scan = scan + 1; w = w + 1; }
+    }
+
+    buf[w] = 0;
+    ret buf::str;
+}
+
+pub fun extract_raw(data: str, key: str, alloc: allocator.Allocator) str {
+    val idx: isize = find_key(data, key);
+    if (idx < 0) { ret nil; }
+
+    val data_len: usize = str_len(data);
+    val key_len: usize = str_len(key);
+    var pos: usize = (idx::usize) + key_len;
+
+    pos = skip_whitespace(data, pos);
+    if (pos >= data_len || data[pos] != ':') { ret nil; }
+    pos = pos + 1;
+
+    pos = skip_whitespace(data, pos);
+    if (pos >= data_len) { ret nil; }
+
+    val start: usize = pos;
+
+    if (data[pos] == '"') {
+        pos = pos + 1;
+        for (pos < data_len) {
+            val ch: u8 = data[pos];
+            if (ch == '\\') { pos = pos + 2; }
+            or (ch == '"') { pos = pos + 1; brk; }
+            or { pos = pos + 1; }
+        }
+        ret make_str_copy(data, start, pos, alloc);
+    }
+
+    for (pos < data_len) {
+        val ch: u8 = data[pos];
+        if (ch == ',' || ch == '}' || ch == ']' ||
+            ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') { brk; }
+        pos = pos + 1;
+    }
+
+    if (pos == start) { ret nil; }
+    ret make_str_copy(data, start, pos, alloc);
+}
+
+pub fun extract_number_i64(data: str, key: str, alloc: allocator.Allocator) i64 {
+    val raw: str = extract_raw(data, key, alloc);
+    if (raw == nil) { ret 0; }
+    val result: i64 = parse_i64(raw);
+    free_str(raw, alloc);
+    ret result;
+}
+
+pub fun extract_after(data: str, anchor: str, key: str, alloc: allocator.Allocator) str {
+    val idx: isize = find_key(data, anchor);
+    if (idx < 0) { ret nil; }
+
+    val data_len: usize = str_len(data);
+    val anchor_len: usize = str_len(anchor);
+    val offset: usize = (idx::usize) + anchor_len;
+    if (offset >= data_len) { ret nil; }
+
+    val sub: str = (data + offset)::str;
+    ret extract_string(sub, key, alloc);
+}
+
+pub fun extract_number_after(data: str, anchor: str, key: str, alloc: allocator.Allocator) i64 {
+    val idx: isize = find_key(data, anchor);
+    if (idx < 0) { ret 0; }
+
+    val data_len: usize = str_len(data);
+    val anchor_len: usize = str_len(anchor);
+    val offset: usize = (idx::usize) + anchor_len;
+    if (offset >= data_len) { ret 0; }
+
+    val sub: str = (data + offset)::str;
+    ret extract_number_i64(sub, key, alloc);
+}
+
+pub fun quote(s: str, alloc: allocator.Allocator) str {
+    if (s == nil) { ret nil; }
+    val s_len: usize = str_len(s);
+    if (s_len == 0) { ret nil; }
+
+    var encoded_len: usize = 2;
+    var i: usize = 0;
+    for (i < s_len) {
+        val ch: u8 = s[i];
+        if (ch == '"' || ch == '\\' || ch == '\n' || ch == '\r' || ch == '\t') {
+            encoded_len = encoded_len + 2;
+        }
+        or (ch < 32) { encoded_len = encoded_len + 1; }
+        or { encoded_len = encoded_len + 1; }
+        i = i + 1;
+    }
+
+    var a: allocator.Allocator = alloc;
+    val res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, encoded_len + 1);
+    if (!res.tag) { ret nil; }
+    val buf: *u8 = res.value.ok;
+
+    var pos: usize = 0;
+    buf[pos] = '"';
+    pos = pos + 1;
+
+    i = 0;
+    for (i < s_len) {
+        val ch: u8 = s[i];
+        if (ch == '"') { buf[pos] = '\\'; buf[pos + 1] = '"'; pos = pos + 2; }
+        or (ch == '\\') { buf[pos] = '\\'; buf[pos + 1] = '\\'; pos = pos + 2; }
+        or (ch == '\n') { buf[pos] = '\\'; buf[pos + 1] = 'n'; pos = pos + 2; }
+        or (ch == '\r') { buf[pos] = '\\'; buf[pos + 1] = 'r'; pos = pos + 2; }
+        or (ch == '\t') { buf[pos] = '\\'; buf[pos + 1] = 't'; pos = pos + 2; }
+        or (ch < 32) { buf[pos] = '?'; pos = pos + 1; }
+        or { buf[pos] = ch; pos = pos + 1; }
+        i = i + 1;
+    }
+
+    buf[pos] = '"';
+    pos = pos + 1;
+    buf[pos] = 0;
+    ret buf::str;
+}
+
+pub fun format_usize(value: usize, alloc: allocator.Allocator) str {
+    var tmp: [20]u8;
+    var pos: usize = 20;
+    var v: usize = value;
+
+    if (v == 0) { pos = pos - 1; tmp[pos] = '0'; }
+    or {
+        for (v > 0 && pos > 0) {
+            pos = pos - 1;
+            tmp[pos] = ('0' + (v % 10))::u8;
+            v = v / 10;
+        }
+    }
+
+    val len: usize = 20 - pos;
+    var a: allocator.Allocator = alloc;
+    val res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, len + 1);
+    if (!res.tag) { ret nil; }
+    val buf: *u8 = res.value.ok;
+    mem.raw_copy(buf::ptr, (?tmp[pos])::ptr, len);
+    buf[len] = 0;
+    ret buf::str;
+}
+
+pub fun format_i64(value: i64, alloc: allocator.Allocator) str {
+    var tmp: [21]u8;
+    var pos: usize = 21;
+    var negative: bool = false;
+    var v: i64 = value;
+
+    if (v < 0) { negative = true; v = -v; }
+
+    if (v == 0) { pos = pos - 1; tmp[pos] = '0'; }
+    or {
+        for (v > 0 && pos > 0) {
+            pos = pos - 1;
+            tmp[pos] = ('0' + (v % 10))::u8;
+            v = v / 10;
+        }
+    }
+
+    if (negative && pos > 0) { pos = pos - 1; tmp[pos] = '-'; }
+
+    val len: usize = 21 - pos;
+    var a: allocator.Allocator = alloc;
+    val res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, len + 1);
+    if (!res.tag) { ret nil; }
+    val buf: *u8 = res.value.ok;
+    mem.raw_copy(buf::ptr, (?tmp[pos])::ptr, len);
+    buf[len] = 0;
+    ret buf::str;
+}
+
+# --- internal helpers ---
+
+fun find_key(data: str, key: str) isize {
+    val key_len: usize = str_len(key);
+    val data_len: usize = str_len(data);
+    if (key_len == 0 || key_len > data_len) { ret -1; }
+
+    var in_string: bool = false;
+    var i: usize = 0;
+    val limit: usize = data_len - key_len;
+
+    for (i <= limit) {
+        val ch: u8 = data[i];
+        if (ch == '"' && !is_escaped(data, i)) {
+            if (!in_string) {
+                if (match_at(data, i, key)) { ret i::isize; }
+                in_string = true;
+            }
+            or { in_string = false; }
+        }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+fun is_escaped(data: str, index: usize) bool {
+    if (index == 0) { ret false; }
+    var back: usize = index - 1;
+    var count: usize = 0;
+    for {
+        if (data[back] != '\\') { brk; }
+        count = count + 1;
+        if (back == 0) { brk; }
+        back = back - 1;
+    }
+    ret (count & 1) == 1;
+}
+
+fun match_at(data: str, offset: usize, pattern: str) bool {
+    val pattern_len: usize = str_len(pattern);
+    val data_len: usize = str_len(data);
+    if (offset + pattern_len > data_len) { ret false; }
+    var i: usize = 0;
+    for (i < pattern_len) {
+        if (data[offset + i] != pattern[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun skip_whitespace(data: str, pos: usize) usize {
+    val data_len: usize = str_len(data);
+    var p: usize = pos;
+    for (p < data_len) {
+        val ch: u8 = data[p];
+        if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n') { brk; }
+        p = p + 1;
+    }
+    ret p;
+}
+
+fun parse_i64(s: str) i64 {
+    if (s == nil) { ret 0; }
+    val s_len: usize = str_len(s);
+    if (s_len == 0) { ret 0; }
+
+    var pos: usize = 0;
+    var negative: bool = false;
+    if (s[pos] == '-') { negative = true; pos = pos + 1; }
+
+    var result: i64 = 0;
+    for (pos < s_len) {
+        val ch: u8 = s[pos];
+        if (ch >= '0' && ch <= '9') { result = result * 10 + ((ch - '0')::i64); }
+        or { brk; }
+        pos = pos + 1;
+    }
+
+    if (negative) { ret -result; }
+    ret result;
+}
+
+fun make_str_copy(data: str, start: usize, end: usize, alloc: allocator.Allocator) str {
+    val len: usize = end - start;
+    if (len == 0) { ret nil; }
+    var a: allocator.Allocator = alloc;
+    val res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, len + 1);
+    if (!res.tag) { ret nil; }
+    val buf: *u8 = res.value.ok;
+    mem.raw_copy(buf::ptr, (data + start)::ptr, len);
+    buf[len] = 0;
+    ret buf::str;
+}
+
+pub fun free_str(s: str, alloc: allocator.Allocator) {
+    if (s != nil) {
+        val len: usize = str_len(s);
+        var a: allocator.Allocator = alloc;
+        allocator.allocator_free_bytes(?a, s::ptr, len + 1, 1);
+    }
+}
