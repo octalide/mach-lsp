@@ -574,6 +574,68 @@ pub fun find_project_config(file_path: str, alloc: allocator.Allocator) ProjectC
     ret result;
 }
 
+# derive_module_path: compute dotted module path from file path.
+# e.g. "/root/src/compiler/target.mach" with src_root="/root/src" and
+# project_id="mach" → "mach.compiler.target"
+pub fun derive_module_path(file_path: str, src_root: str, project_id: str,
+    alloc: allocator.Allocator) str {
+    if (file_path == nil || src_root == nil || project_id == nil) { ret nil; }
+
+    val fp_len: usize = str_len(file_path);
+    val sr_len: usize = str_len(src_root);
+
+    # file_path must start with src_root
+    if (fp_len <= sr_len) { ret nil; }
+    var i: usize = 0;
+    for (i < sr_len) {
+        if (file_path[i] != src_root[i]) { ret nil; }
+        i = i + 1;
+    }
+
+    # skip leading /
+    var rel_start: usize = sr_len;
+    if (file_path[rel_start] == '/') { rel_start = rel_start + 1; }
+
+    # compute relative path length, stripping .mach extension
+    var rel_end: usize = fp_len;
+    if (fp_len >= 5) {
+        val ext_start: usize = fp_len - 5;
+        if (file_path[ext_start] == '.' && file_path[ext_start + 1] == 'm' &&
+            file_path[ext_start + 2] == 'a' && file_path[ext_start + 3] == 'c' &&
+            file_path[ext_start + 4] == 'h') {
+            rel_end = ext_start;
+        }
+    }
+
+    val rel_len: usize = rel_end - rel_start;
+    if (rel_len == 0) { ret nil; }
+
+    val pid_len: usize = str_len(project_id);
+    val total: usize = pid_len + 1 + rel_len + 1;
+
+    var a: allocator.Allocator = alloc;
+    val res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, total);
+    if (!res.tag) { ret nil; }
+    val buf: *u8 = res.value.ok;
+
+    # copy project_id
+    mem.raw_copy(buf::ptr, project_id::ptr, pid_len);
+    buf[pid_len] = '.';
+
+    # copy relative path, replacing / with .
+    var j: usize = 0;
+    i = rel_start;
+    for (i < rel_end) {
+        val ch: u8 = file_path[i];
+        if (ch == '/') { buf[pid_len + 1 + j] = '.'; }
+        or              { buf[pid_len + 1 + j] = ch; }
+        j = j + 1;
+        i = i + 1;
+    }
+    buf[pid_len + 1 + j] = 0;
+    ret buf::str;
+}
+
 pub fun path_to_uri(path: str, alloc: allocator.Allocator) str {
     if (path == nil) { ret nil; }
     val prefix: str = "file://";
