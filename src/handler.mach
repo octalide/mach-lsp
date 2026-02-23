@@ -337,7 +337,15 @@ pub fun handle_definition(srv: *lsp_types.Server, body: str) {
 
     val location: str = build_location_json(loc_uri, def_line, def_char, end_line, end_char, a);
     if (location != nil) {
-        send_result(srv, id, location);
+        # wrap in array — LSP spec allows Location | Location[], but many clients expect array
+        val arr: str = wrap_in_array(location, a);
+        if (arr != nil) {
+            send_result(srv, id, arr);
+            free_str(arr, a);
+        }
+        or {
+            send_result(srv, id, location);
+        }
         free_str(location, a);
     }
     or {
@@ -680,6 +688,22 @@ fun append(buf: *u8, offset: usize, s: str) usize {
         ret offset + slen;
     }
     ret offset;
+}
+
+fun wrap_in_array(json_str: str, alloc: allocator.Allocator) str {
+    if (json_str == nil) { ret nil; }
+    val len: usize = str_len(json_str);
+    val total: usize = len + 2;
+    var a: allocator.Allocator = alloc;
+    val res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, total + 1);
+    if (!res.tag) { ret nil; }
+    val buf: *u8 = res.value.ok;
+    buf[0] = '[';
+    val one: usize = 1;
+    mem.raw_copy((buf + one)::ptr, json_str::ptr, len);
+    buf[len + one] = ']';
+    buf[total] = 0;
+    ret buf::str;
 }
 
 fun build_location_json(
