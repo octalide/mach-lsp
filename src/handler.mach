@@ -541,8 +541,18 @@ fun send_definition_for_symbol(
 ) {
     var a: allocator.Allocator = alloc;
 
-    val decl_pos: i32 = sym.decl_node.tok.pos;
-    val decl_len: i32 = sym.decl_node.tok.len;
+    # for declaration nodes, use the name position, not the keyword token
+    var decl_pos: i32 = sym.decl_node.tok.pos;
+    var decl_len: i32 = sym.decl_node.tok.len;
+    var np: i32 = 0;
+    var nl: i32 = 0;
+    if (analysis.is_decl_node(sym.decl_node)) {
+        val dsrc: str = get_decl_source(ar, sym);
+        if (dsrc != nil && analysis.get_decl_name_pos(sym.decl_node, dsrc, ?np, ?nl)) {
+            decl_pos = np;
+            decl_len = nl;
+        }
+    }
 
     # check if symbol is from a different module (cross-file)
     var target_uri: str = nil;
@@ -691,7 +701,7 @@ pub fun handle_references(srv: *lsp_types.Server, body: str) {
 
     val ref_count: i32 = analysis.collect_references(ar.root, sym, true, refs, max_refs);
 
-    val result_str: str = build_locations_json(doc, refs, ref_count, a);
+    val result_str: str = build_locations_json(doc, refs, ref_count, ar.source, a);
     if (result_str != nil) {
         send_result(srv, id, result_str);
         free_str(result_str, a);
@@ -946,7 +956,7 @@ pub fun handle_rename(srv: *lsp_types.Server, body: str) {
     }
 
     # build WorkspaceEdit: { "changes": { "<uri>": [ TextEdit, ... ] } }
-    val result_str: str = build_workspace_edit_json(doc, refs, ref_count, new_name, a);
+    val result_str: str = build_workspace_edit_json(doc, refs, ref_count, new_name, ar.source, a);
     if (result_str != nil) {
         send_result(srv, id, result_str);
         free_str(result_str, a);
@@ -984,6 +994,40 @@ pub fun handle_document_symbol(srv: *lsp_types.Server, body: str) {
 # ============================================================================
 # internal utilities
 # ============================================================================
+
+# get_node_name_span: for a reference node, compute the byte position and length
+# of the actual name (not the keyword token). for expression idents, this is
+# just tok.pos/tok.len. for declaration nodes, the keyword token (val/var/fun/etc.)
+# is different from the name — we compute the name position from source.
+fun get_node_name_span(node: *ast.Node, source: str, out_pos: *i32, out_len: *i32) {
+    if (node == nil || out_pos == nil || out_len == nil) { ret; }
+    if (analysis.is_decl_node(node)) {
+        var np: i32 = 0;
+        var nl: i32 = 0;
+        if (analysis.get_decl_name_pos(node, source, ?np, ?nl)) {
+            @out_pos = np;
+            @out_len = nl;
+            ret;
+        }
+    }
+    # default: use tok directly (correct for idents, fields, etc.)
+    @out_pos = node.tok.pos;
+    @out_len = node.tok.len;
+}
+
+# get_decl_source: get the source text for a symbol's declaration.
+# for same-file symbols, returns ar.source. for cross-file symbols,
+# finds the module and returns its source.
+fun get_decl_source(ar: *analysis.AnalysisResult, sym: *symbol.Symbol) str {
+    if (ar == nil || sym == nil) { ret nil; }
+    # same-module: use current source
+    if (sym.module_path == nil || ar.sem.module_path == nil) { ret ar.source; }
+    if (str_equals(sym.module_path, ar.sem.module_path)) { ret ar.source; }
+    # cross-module: find the module's source
+    val target_mod: *sema.SemaModule = analysis.find_module_by_path(ar, sym.module_path);
+    if (target_mod != nil && target_mod.source != nil) { ret target_mod.source; }
+    ret ar.source;
+}
 
 fun append(buf: *u8, offset: usize, s: str) usize {
     if (s != nil) {
@@ -1082,7 +1126,7 @@ fun build_location_json(
 
 fun build_locations_json(
     doc: *workspace.Document, refs: **ast.Node, count: i32,
-    alloc: allocator.Allocator
+    source: str, alloc: allocator.Allocator
 ) str {
     if (count == 0) { ret nil; }
 
@@ -1098,8 +1142,9 @@ fun build_locations_json(
     var i: i32 = 0;
     for (i < count) {
         val ref_node: *ast.Node = refs[i];
-        val ref_pos: i32 = ref_node.tok.pos;
-        val ref_len: i32 = ref_node.tok.len;
+        var ref_pos: i32 = ref_node.tok.pos;
+        var ref_len: i32 = ref_node.tok.len;
+        get_node_name_span(ref_node, source, ?ref_pos, ?ref_len);
 
         var sl: usize = 0;
         var sc: usize = 0;
@@ -1227,7 +1272,7 @@ fun build_prepare_rename_json(
 
 fun build_workspace_edit_json(
     doc: *workspace.Document, refs: **ast.Node, count: i32,
-    new_name: str, alloc: allocator.Allocator
+    new_name: str, source: str, alloc: allocator.Allocator
 ) str {
     if (count == 0) { ret nil; }
 
@@ -1245,8 +1290,9 @@ fun build_workspace_edit_json(
     var i: i32 = 0;
     for (i < count) {
         val ref_node: *ast.Node = refs[i];
-        val ref_pos: i32 = ref_node.tok.pos;
-        val ref_len: i32 = ref_node.tok.len;
+        var ref_pos: i32 = ref_node.tok.pos;
+        var ref_len: i32 = ref_node.tok.len;
+        get_node_name_span(ref_node, source, ?ref_pos, ?ref_len);
 
         var sl: usize = 0;
         var sc: usize = 0;

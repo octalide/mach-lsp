@@ -450,6 +450,26 @@ pub fun collect_references(
     rc.include_decl = include_decl;
     rc.decl_node = sym.decl_node;
     collect_walk_node(?rc, root);
+
+    # ensure the declaration node is included when requested.
+    # patch_decl_symbols may not have patched it (e.g. symbol only used
+    # cross-file), so the walk might have missed it.
+    if (include_decl && sym.decl_node != nil && rc.count < rc.max) {
+        var found: bool = false;
+        var i: i32 = 0;
+        for (i < rc.count) {
+            if (rc.out[i] == sym.decl_node) {
+                found = true;
+                brk;
+            }
+            i = i + 1;
+        }
+        if (!found) {
+            rc.out[rc.count] = sym.decl_node;
+            rc.count = rc.count + 1;
+        }
+    }
+
     ret rc.count;
 }
 
