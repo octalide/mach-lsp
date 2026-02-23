@@ -303,11 +303,80 @@ pub fun handle_definition(srv: *lsp_types.Server, body: str) {
 pub fun handle_references(srv: *lsp_types.Server, body: str) {
     var a: allocator.Allocator = srv.alloc;
     val id: str = json.extract_raw(body, "\"id\"", a);
-    if (id != nil) {
-        # TODO: #6 — find all references to symbol at cursor
+    if (id == nil) { ret; }
+
+    val td_anchor: str = "\"textDocument\"";
+    val uri: str = json.extract_after(body, td_anchor, "\"uri\"", a);
+
+    val pos_anchor: str = "\"position\"";
+    val line: i64 = json.extract_number_after(body, pos_anchor, "\"line\"", a);
+    val character: i64 = json.extract_number_after(body, pos_anchor, "\"character\"", a);
+
+    if (uri == nil) {
         send_result(srv, id, "[]");
         free_str(id, a);
+        ret;
     }
+
+    val doc: *workspace.Document = workspace.find(?srv.ws, uri);
+    if (doc == nil) {
+        send_result(srv, id, "[]");
+        free_str(uri, a);
+        free_str(id, a);
+        ret;
+    }
+
+    val ar: *analysis.AnalysisResult = analysis.get_analysis(?srv.ac, doc);
+    if (ar == nil) {
+        send_result(srv, id, "[]");
+        free_str(uri, a);
+        free_str(id, a);
+        ret;
+    }
+
+    val offset: usize = workspace.position_to_offset(doc, line::usize, character::usize);
+    val node: *ast.Node = analysis.find_node_at_offset(ar.root, offset::i32);
+    if (node == nil) {
+        send_result(srv, id, "[]");
+        free_str(uri, a);
+        free_str(id, a);
+        ret;
+    }
+
+    val sym: *symbol.Symbol = analysis.get_node_symbol(node);
+    if (sym == nil) {
+        send_result(srv, id, "[]");
+        free_str(uri, a);
+        free_str(id, a);
+        ret;
+    }
+
+    # collect up to 1024 references
+    val max_refs: i32 = 1024;
+    val refs_res: Result[**ast.Node, allocator.AllocError] =
+        allocator.allocator_alloc[*ast.Node](?a, max_refs::usize);
+    if (!refs_res.tag) {
+        send_result(srv, id, "[]");
+        free_str(uri, a);
+        free_str(id, a);
+        ret;
+    }
+    val refs: **ast.Node = refs_res.value.ok;
+
+    val ref_count: i32 = analysis.collect_references(ar.root, sym, true, refs, max_refs);
+
+    val result_str: str = build_locations_json(doc, refs, ref_count, a);
+    if (result_str != nil) {
+        send_result(srv, id, result_str);
+        free_str(result_str, a);
+    }
+    or {
+        send_result(srv, id, "[]");
+    }
+
+    allocator.allocator_free[*ast.Node](?a, refs, max_refs::usize);
+    free_str(uri, a);
+    free_str(id, a);
 }
 
 pub fun handle_prepare_rename(srv: *lsp_types.Server, body: str) {
@@ -429,6 +498,82 @@ fun build_location_json(
     free_str(sc, a);
     free_str(el, a);
     free_str(ec, a);
+
+    ret buf::str;
+}
+
+fun build_locations_json(
+    doc: *workspace.Document, refs: **ast.Node, count: i32,
+    alloc: allocator.Allocator
+) str {
+    if (count == 0) { ret nil; }
+
+    var a: allocator.Allocator = alloc;
+
+    # build each location string and compute total length
+    val locs_res: Result[*str, allocator.AllocError] =
+        allocator.allocator_alloc[str](?a, count::usize);
+    if (!locs_res.tag) { ret nil; }
+    val locs: *str = locs_res.value.ok;
+
+    var total: usize = 2;  # "[]"
+    var i: i32 = 0;
+    for (i < count) {
+        val ref_node: *ast.Node = refs[i];
+        val ref_pos: i32 = ref_node.tok.pos;
+        val ref_len: i32 = ref_node.tok.len;
+
+        var sl: usize = 0;
+        var sc: usize = 0;
+        workspace.offset_to_position(doc, ref_pos::usize, ?sl, ?sc);
+
+        var el: usize = 0;
+        var ec: usize = 0;
+        if (ref_len > 0) {
+            workspace.offset_to_position(doc, (ref_pos + ref_len)::usize, ?el, ?ec);
+        }
+        or {
+            el = sl;
+            ec = sc + 1;
+        }
+
+        val loc: str = build_location_json(doc.uri, sl, sc, el, ec, a);
+        locs[i] = loc;
+        if (loc != nil) { total = total + str_len(loc); }
+        if (i > 0) { total = total + 1; }  # comma
+        i = i + 1;
+    }
+
+    val buf_res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, total + 1);
+    if (!buf_res.tag) {
+        i = 0;
+        for (i < count) { free_str(locs[i], a); i = i + 1; }
+        allocator.allocator_free[str](?a, locs, count::usize);
+        ret nil;
+    }
+    val buf: *u8 = buf_res.value.ok;
+
+    var off: usize = 0;
+    buf[off] = '[';
+    off = off + 1;
+
+    i = 0;
+    for (i < count) {
+        if (i > 0) {
+            buf[off] = ',';
+            off = off + 1;
+        }
+        off = append(buf, off, locs[i]);
+        i = i + 1;
+    }
+
+    buf[off] = ']';
+    off = off + 1;
+    buf[off] = 0;
+
+    i = 0;
+    for (i < count) { free_str(locs[i], a); i = i + 1; }
+    allocator.allocator_free[str](?a, locs, count::usize);
 
     ret buf::str;
 }

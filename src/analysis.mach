@@ -149,6 +149,35 @@ pub fun get_node_symbol(node: *ast.Node) *symbol.Symbol {
     ret node.symbol::*symbol.Symbol;
 }
 
+# collect_references: find all AST nodes that reference a given symbol.
+# fills the `out` array with up to `max` node pointers. returns the count.
+# set `include_decl` to true to also include the declaration node itself.
+pub fun collect_references(
+    root: *ast.Node, sym: *symbol.Symbol,
+    include_decl: bool,
+    out: **ast.Node, max: i32
+) i32 {
+    if (root == nil || sym == nil || out == nil || max <= 0) { ret 0; }
+    var rc: RefCollector;
+    rc.target = sym::ptr;
+    rc.out = out;
+    rc.count = 0;
+    rc.max = max;
+    rc.include_decl = include_decl;
+    rc.decl_node = sym.decl_node;
+    collect_walk_node(?rc, root);
+    ret rc.count;
+}
+
+rec RefCollector {
+    target:       ptr;
+    out:          **ast.Node;
+    count:        i32;
+    max:          i32;
+    include_decl: bool;
+    decl_node:    *ast.Node;
+}
+
 # --- internal ---
 
 fun run_analysis(cache: *AnalysisCache, entry: *CacheEntry, doc: *workspace.Document) {
@@ -436,4 +465,178 @@ fun is_name_node(node: *ast.Node) bool {
     ret k == ast.NODE_EXPR_IDENT ||
         k == ast.NODE_EXPR_FIELD ||
         k == ast.NODE_TYPE_NAME;
+}
+
+# --- reference collection walking ---
+
+fun collect_walk_node(rc: *RefCollector, node: *ast.Node) {
+    if (node == nil || rc.count >= rc.max) { ret; }
+
+    # check if this node references the target symbol
+    if (node.symbol == rc.target && node.symbol != nil) {
+        # skip declaration node if include_decl is false
+        if (node != rc.decl_node || rc.include_decl) {
+            rc.out[rc.count] = node;
+            rc.count = rc.count + 1;
+            if (rc.count >= rc.max) { ret; }
+        }
+    }
+
+    val kind: u8 = node.kind;
+
+    if (kind == ast.NODE_DECL_PUB) {
+        collect_walk_node(rc, node.info.wrapper.inner);
+        ret;
+    }
+
+    if (kind == ast.NODE_DECL_FUN) {
+        collect_walk_list(rc, node.info.fun_decl.params);
+        collect_walk_node(rc, node.info.fun_decl.body);
+        collect_walk_node(rc, node.info.fun_decl.ret_type);
+        collect_walk_node(rc, node.info.fun_decl.generics);
+        ret;
+    }
+
+    if (kind == ast.NODE_DECL_VAL || kind == ast.NODE_DECL_VAR) {
+        collect_walk_node(rc, node.info.var_decl.type_node);
+        collect_walk_node(rc, node.info.var_decl.init);
+        ret;
+    }
+
+    if (kind == ast.NODE_DECL_REC || kind == ast.NODE_DECL_UNI) {
+        collect_walk_list(rc, node.info.type_decl.fields);
+        collect_walk_node(rc, node.info.type_decl.generics);
+        ret;
+    }
+
+    if (kind == ast.NODE_DECL_DEF) {
+        collect_walk_node(rc, node.info.def_decl.type_node);
+        collect_walk_node(rc, node.info.def_decl.generics);
+        ret;
+    }
+
+    if (kind == ast.NODE_DECL_EXT) {
+        collect_walk_node(rc, node.info.ext_decl.inner);
+        ret;
+    }
+
+    if (kind == ast.NODE_DECL_TEST) {
+        collect_walk_node(rc, node.info.test_decl.body);
+        ret;
+    }
+
+    if (kind == ast.NODE_STMT_BLOCK) {
+        collect_walk_list(rc, node.info.block_stmt.stmts);
+        ret;
+    }
+
+    if (kind == ast.NODE_STMT_IF || kind == ast.NODE_STMT_OR) {
+        collect_walk_node(rc, node.info.cond_stmt.cond);
+        collect_walk_node(rc, node.info.cond_stmt.body);
+        collect_walk_node(rc, node.info.cond_stmt.or_branch);
+        ret;
+    }
+
+    if (kind == ast.NODE_STMT_FOR) {
+        collect_walk_node(rc, node.info.for_stmt.cond);
+        collect_walk_node(rc, node.info.for_stmt.body);
+        ret;
+    }
+
+    if (kind == ast.NODE_STMT_EXPR || kind == ast.NODE_STMT_RET ||
+        kind == ast.NODE_EXPR_ADDR || kind == ast.NODE_EXPR_DEREF ||
+        kind == ast.NODE_EXPR_PAREN) {
+        collect_walk_node(rc, node.info.wrapper.inner);
+        ret;
+    }
+
+    if (kind == ast.NODE_EXPR_BINARY) {
+        collect_walk_node(rc, node.info.binary_expr.left);
+        collect_walk_node(rc, node.info.binary_expr.right);
+        ret;
+    }
+
+    if (kind == ast.NODE_EXPR_UNARY) {
+        collect_walk_node(rc, node.info.unary_expr.expr);
+        ret;
+    }
+
+    if (kind == ast.NODE_EXPR_CALL) {
+        collect_walk_node(rc, node.info.call_expr.callee);
+        collect_walk_list(rc, node.info.call_expr.args);
+        collect_walk_node(rc, node.info.call_expr.type_args);
+        ret;
+    }
+
+    if (kind == ast.NODE_EXPR_INDEX) {
+        collect_walk_node(rc, node.info.index_expr.base);
+        collect_walk_node(rc, node.info.index_expr.index);
+        ret;
+    }
+
+    if (kind == ast.NODE_EXPR_FIELD) {
+        collect_walk_node(rc, node.info.field_expr.object);
+        ret;
+    }
+
+    if (kind == ast.NODE_EXPR_CAST) {
+        collect_walk_node(rc, node.info.cast_expr.expr);
+        collect_walk_node(rc, node.info.cast_expr.type_node);
+        ret;
+    }
+
+    if (kind == ast.NODE_EXPR_ARRAY_LIT) {
+        collect_walk_node(rc, node.info.array_lit.size);
+        collect_walk_node(rc, node.info.array_lit.type_node);
+        collect_walk_list(rc, node.info.array_lit.elements);
+        ret;
+    }
+
+    if (kind == ast.NODE_EXPR_STRUCT_LIT) {
+        collect_walk_node(rc, node.info.struct_lit.type_node);
+        collect_walk_list(rc, node.info.struct_lit.fields);
+        ret;
+    }
+
+    if (kind == ast.NODE_TYPE_PTR || kind == ast.NODE_TYPE_REF) {
+        collect_walk_node(rc, node.info.type_ptr.inner);
+        ret;
+    }
+
+    if (kind == ast.NODE_TYPE_ARRAY) {
+        collect_walk_node(rc, node.info.type_array.elem_type);
+        collect_walk_node(rc, node.info.type_array.size);
+        ret;
+    }
+
+    if (kind == ast.NODE_TYPE_FUN) {
+        collect_walk_list(rc, node.info.type_fun.params);
+        collect_walk_node(rc, node.info.type_fun.ret_type);
+        ret;
+    }
+
+    if (kind == ast.NODE_GENERIC) {
+        collect_walk_list(rc, node.info.generic_node.args);
+        ret;
+    }
+
+    if (kind == ast.NODE_PARAM) {
+        collect_walk_node(rc, node.info.field_decl.type_node);
+        ret;
+    }
+
+    if (kind == ast.NODE_FIELD) {
+        collect_walk_node(rc, node.info.field_decl.type_node);
+        ret;
+    }
+}
+
+fun collect_walk_list(rc: *RefCollector, list: *ast.List) {
+    if (list == nil || rc.count >= rc.max) { ret; }
+    var i: i32 = 0;
+    for (i < list.count) {
+        collect_walk_node(rc, list.nodes[i]);
+        if (rc.count >= rc.max) { ret; }
+        i = i + 1;
+    }
 }
