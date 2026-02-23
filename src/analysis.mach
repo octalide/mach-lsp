@@ -1,0 +1,439 @@
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use mem:       std.memory;
+use print:     std.print;
+
+use ast:      mach.compiler.ast;
+use parser:   mach.compiler.parser;
+use pipeline: mach.compiler.pipeline;
+use sema:     mach.compiler.sema;
+use sema_a:   mach.compiler.sema.analyze;
+use symbol:   mach.compiler.symbol;
+use type:     mach.compiler.type;
+use target:   mach.compiler.target;
+use token:    mach.compiler.token;
+
+use workspace: mls.workspace;
+
+# mls.analysis: semantic analysis integration for LSP.
+# ---
+# provides lazy per-document analysis with caching. on first query
+# for a document, parses and runs semantic analysis (tolerating errors
+# for partial results). subsequent queries use the cached result until
+# the document changes.
+
+# --- result record ---
+
+pub rec AnalysisResult {
+    root:   *ast.Node;
+    sem:    sema.Sema;
+    source: str;
+    ok:     bool;
+}
+
+# --- cache ---
+
+val INITIAL_CACHE_CAP: usize = 16;
+
+pub rec AnalysisCache {
+    entries: *CacheEntry;
+    count:   usize;
+    cap:     usize;
+    tgt:     target.Target;
+    tgt_ok:  bool;
+    alloc:   allocator.Allocator;
+}
+
+rec CacheEntry {
+    uri:    str;
+    result: AnalysisResult;
+    stale:  bool;
+}
+
+pub fun cache_init(cache: *AnalysisCache, alloc: allocator.Allocator) {
+    cache.entries = nil;
+    cache.count = 0;
+    cache.cap = 0;
+    cache.alloc = alloc;
+    cache.tgt_ok = false;
+
+    var a: allocator.Allocator = alloc;
+    val tgt_res: Result[target.Target, str] = target.host(?a);
+    if (tgt_res.tag) {
+        cache.tgt = tgt_res.value.ok;
+        cache.tgt_ok = true;
+    }
+    or {
+        print.eprintln("mach-lsp: analysis: failed to create host target");
+    }
+}
+
+pub fun cache_deinit(cache: *AnalysisCache) {
+    var i: usize = 0;
+    for (i < cache.count) {
+        result_free(?cache.entries[i].result, cache.alloc);
+        workspace.free_str(cache.entries[i].uri, cache.alloc);
+        i = i + 1;
+    }
+
+    if (cache.entries != nil && cache.cap > 0) {
+        var a: allocator.Allocator = cache.alloc;
+        allocator.allocator_free[CacheEntry](?a, cache.entries, cache.cap);
+    }
+
+    cache.entries = nil;
+    cache.count = 0;
+    cache.cap = 0;
+}
+
+# invalidate: mark a document's cached analysis as stale.
+# called on textDocument/didChange and textDocument/didClose.
+pub fun invalidate(cache: *AnalysisCache, uri: str) {
+    var entry: *CacheEntry = find_entry(cache, uri);
+    if (entry != nil) {
+        entry.stale = true;
+    }
+}
+
+# get_analysis: return analysis result for a document, running analysis if needed.
+# returns nil if analysis cannot be performed (no target, allocation failure, etc.).
+pub fun get_analysis(cache: *AnalysisCache, doc: *workspace.Document) *AnalysisResult {
+    if (doc == nil || doc.uri == nil || !cache.tgt_ok) { ret nil; }
+
+    var entry: *CacheEntry = find_entry(cache, doc.uri);
+
+    if (entry != nil && !entry.stale) {
+        if (entry.result.ok) { ret ?entry.result; }
+        ret nil;
+    }
+
+    # need to (re)analyze
+    if (entry != nil) {
+        result_free(?entry.result, cache.alloc);
+    }
+    or {
+        # allocate new entry
+        if (cache.count >= cache.cap) {
+            if (!grow_cache(cache)) { ret nil; }
+        }
+        entry = ?cache.entries[cache.count];
+        entry.uri = workspace.clone_str(doc.uri, cache.alloc);
+        cache.count = cache.count + 1;
+    }
+
+    entry.stale = false;
+    run_analysis(cache, entry, doc);
+
+    if (entry.result.ok) { ret ?entry.result; }
+    ret nil;
+}
+
+# --- AST query functions ---
+
+# find_node_at_offset: find the most specific AST node at a byte offset.
+# returns the innermost identifier, field access, or type name node
+# whose token span contains the given offset.
+pub fun find_node_at_offset(root: *ast.Node, offset: i32) *ast.Node {
+    if (root == nil || offset < 0) { ret nil; }
+    ret walk_node(root, offset);
+}
+
+# get_node_symbol: extract the resolved symbol from a node.
+# returns nil if the node has no resolved symbol (e.g. unresolved external).
+pub fun get_node_symbol(node: *ast.Node) *symbol.Symbol {
+    if (node == nil || node.symbol == nil) { ret nil; }
+    ret node.symbol::*symbol.Symbol;
+}
+
+# --- internal ---
+
+fun run_analysis(cache: *AnalysisCache, entry: *CacheEntry, doc: *workspace.Document) {
+    entry.result.root = nil;
+    entry.result.ok = false;
+    entry.result.source = doc.text;
+
+    var a: allocator.Allocator = cache.alloc;
+
+    # parse
+    val pr: pipeline.ParseResult = pipeline.parse_source(doc.text, ?a, false);
+    if (!pr.ok || pr.root == nil) {
+        ret;
+    }
+
+    # set up sema
+    var sem: sema.Sema = sema.init(?a, cache.tgt);
+
+    # create symbol table
+    val table_res: Result[symbol.Table, str] = symbol.init(?a);
+    if (!table_res.tag) {
+        sema.dnit(?sem);
+        ret;
+    }
+
+    val tbl_ptr_res: Result[*symbol.Table, allocator.AllocError] =
+        allocator.allocator_alloc[symbol.Table](?a, 1);
+    if (!tbl_ptr_res.tag) {
+        sema.dnit(?sem);
+        ret;
+    }
+    val tbl_ptr: *symbol.Table = tbl_ptr_res.value.ok;
+    @tbl_ptr = table_res.value.ok;
+    sem.symbols = tbl_ptr;
+
+    # run 4-pass analysis, tolerating errors for partial results
+    sema_a.analyze(?sem, pr.root, entry.uri, doc.text, nil);
+
+    entry.result.root = pr.root;
+    entry.result.sem = sem;
+    entry.result.ok = true;
+}
+
+fun result_free(result: *AnalysisResult, alloc: allocator.Allocator) {
+    if (result.ok) {
+        sema.dnit(?result.sem);
+    }
+    result.root = nil;
+    result.ok = false;
+}
+
+fun find_entry(cache: *AnalysisCache, uri: str) *CacheEntry {
+    if (uri == nil) { ret nil; }
+    var i: usize = 0;
+    for (i < cache.count) {
+        if (cache.entries[i].uri != nil && str_equals(cache.entries[i].uri, uri)) {
+            ret ?cache.entries[i];
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun grow_cache(cache: *AnalysisCache) bool {
+    var new_cap: usize = cache.cap;
+    if (new_cap == 0) { new_cap = INITIAL_CACHE_CAP; }
+    or { new_cap = new_cap + (new_cap >> 1) + 4; }
+
+    var a: allocator.Allocator = cache.alloc;
+    val res: Result[*CacheEntry, allocator.AllocError] =
+        allocator.allocator_resize[CacheEntry](?a, cache.entries, cache.cap, new_cap);
+    if (!res.tag) {
+        print.eprintln("mach-lsp: analysis: failed to grow cache");
+        ret false;
+    }
+
+    cache.entries = res.value.ok;
+
+    var i: usize = cache.cap;
+    for (i < new_cap) {
+        mem.raw_zero((?cache.entries[i])::ptr, $size_of(CacheEntry));
+        i = i + 1;
+    }
+
+    cache.cap = new_cap;
+    ret true;
+}
+
+# --- AST walking ---
+
+fun walk_node(node: *ast.Node, offset: i32) *ast.Node {
+    if (node == nil) { ret nil; }
+
+    # check if this node is a name node whose token contains the offset
+    if (is_name_node(node)) {
+        if (offset >= node.tok.pos && offset < node.tok.pos + node.tok.len) {
+            ret node;
+        }
+    }
+
+    val kind: u8 = node.kind;
+
+    # --- declarations ---
+
+    if (kind == ast.NODE_DECL_PUB) {
+        ret walk_node(node.info.wrapper.inner, offset);
+    }
+
+    if (kind == ast.NODE_DECL_FUN) {
+        var found: *ast.Node = nil;
+        found = walk_list(node.info.fun_decl.params, offset);
+        if (found != nil) { ret found; }
+        found = walk_node(node.info.fun_decl.body, offset);
+        if (found != nil) { ret found; }
+        found = walk_node(node.info.fun_decl.ret_type, offset);
+        if (found != nil) { ret found; }
+        found = walk_node(node.info.fun_decl.generics, offset);
+        ret found;
+    }
+
+    if (kind == ast.NODE_DECL_VAL || kind == ast.NODE_DECL_VAR) {
+        var found: *ast.Node = nil;
+        found = walk_node(node.info.var_decl.type_node, offset);
+        if (found != nil) { ret found; }
+        ret walk_node(node.info.var_decl.init, offset);
+    }
+
+    if (kind == ast.NODE_DECL_REC || kind == ast.NODE_DECL_UNI) {
+        var found: *ast.Node = nil;
+        found = walk_list(node.info.type_decl.fields, offset);
+        if (found != nil) { ret found; }
+        ret walk_node(node.info.type_decl.generics, offset);
+    }
+
+    if (kind == ast.NODE_DECL_DEF) {
+        var found: *ast.Node = nil;
+        found = walk_node(node.info.def_decl.type_node, offset);
+        if (found != nil) { ret found; }
+        ret walk_node(node.info.def_decl.generics, offset);
+    }
+
+    if (kind == ast.NODE_DECL_EXT) {
+        ret walk_node(node.info.ext_decl.inner, offset);
+    }
+
+    if (kind == ast.NODE_DECL_TEST) {
+        ret walk_node(node.info.test_decl.body, offset);
+    }
+
+    # --- statements ---
+
+    if (kind == ast.NODE_STMT_BLOCK) {
+        ret walk_list(node.info.block_stmt.stmts, offset);
+    }
+
+    if (kind == ast.NODE_STMT_IF || kind == ast.NODE_STMT_OR) {
+        var found: *ast.Node = nil;
+        found = walk_node(node.info.cond_stmt.cond, offset);
+        if (found != nil) { ret found; }
+        found = walk_node(node.info.cond_stmt.body, offset);
+        if (found != nil) { ret found; }
+        ret walk_node(node.info.cond_stmt.or_branch, offset);
+    }
+
+    if (kind == ast.NODE_STMT_FOR) {
+        var found: *ast.Node = nil;
+        found = walk_node(node.info.for_stmt.cond, offset);
+        if (found != nil) { ret found; }
+        ret walk_node(node.info.for_stmt.body, offset);
+    }
+
+    if (kind == ast.NODE_STMT_EXPR || kind == ast.NODE_STMT_RET ||
+        kind == ast.NODE_EXPR_ADDR || kind == ast.NODE_EXPR_DEREF ||
+        kind == ast.NODE_EXPR_PAREN) {
+        ret walk_node(node.info.wrapper.inner, offset);
+    }
+
+    # --- expressions ---
+
+    if (kind == ast.NODE_EXPR_BINARY) {
+        var found: *ast.Node = nil;
+        found = walk_node(node.info.binary_expr.left, offset);
+        if (found != nil) { ret found; }
+        ret walk_node(node.info.binary_expr.right, offset);
+    }
+
+    if (kind == ast.NODE_EXPR_UNARY) {
+        ret walk_node(node.info.unary_expr.expr, offset);
+    }
+
+    if (kind == ast.NODE_EXPR_CALL) {
+        var found: *ast.Node = nil;
+        found = walk_node(node.info.call_expr.callee, offset);
+        if (found != nil) { ret found; }
+        found = walk_list(node.info.call_expr.args, offset);
+        if (found != nil) { ret found; }
+        ret walk_node(node.info.call_expr.type_args, offset);
+    }
+
+    if (kind == ast.NODE_EXPR_INDEX) {
+        var found: *ast.Node = nil;
+        found = walk_node(node.info.index_expr.base, offset);
+        if (found != nil) { ret found; }
+        ret walk_node(node.info.index_expr.index, offset);
+    }
+
+    if (kind == ast.NODE_EXPR_FIELD) {
+        ret walk_node(node.info.field_expr.object, offset);
+    }
+
+    if (kind == ast.NODE_EXPR_CAST) {
+        var found: *ast.Node = nil;
+        found = walk_node(node.info.cast_expr.expr, offset);
+        if (found != nil) { ret found; }
+        ret walk_node(node.info.cast_expr.type_node, offset);
+    }
+
+    if (kind == ast.NODE_EXPR_ARRAY_LIT) {
+        var found: *ast.Node = nil;
+        found = walk_node(node.info.array_lit.size, offset);
+        if (found != nil) { ret found; }
+        found = walk_node(node.info.array_lit.type_node, offset);
+        if (found != nil) { ret found; }
+        ret walk_list(node.info.array_lit.elements, offset);
+    }
+
+    if (kind == ast.NODE_EXPR_STRUCT_LIT) {
+        var found: *ast.Node = nil;
+        found = walk_node(node.info.struct_lit.type_node, offset);
+        if (found != nil) { ret found; }
+        ret walk_list(node.info.struct_lit.fields, offset);
+    }
+
+    # --- types ---
+
+    if (kind == ast.NODE_TYPE_PTR || kind == ast.NODE_TYPE_REF) {
+        ret walk_node(node.info.type_ptr.inner, offset);
+    }
+
+    if (kind == ast.NODE_TYPE_ARRAY) {
+        var found: *ast.Node = nil;
+        found = walk_node(node.info.type_array.elem_type, offset);
+        if (found != nil) { ret found; }
+        ret walk_node(node.info.type_array.size, offset);
+    }
+
+    if (kind == ast.NODE_TYPE_FUN) {
+        var found: *ast.Node = nil;
+        found = walk_list(node.info.type_fun.params, offset);
+        if (found != nil) { ret found; }
+        ret walk_node(node.info.type_fun.ret_type, offset);
+    }
+
+    # --- misc ---
+
+    if (kind == ast.NODE_GENERIC) {
+        ret walk_list(node.info.generic_node.args, offset);
+    }
+
+    if (kind == ast.NODE_PARAM) {
+        ret walk_node(node.info.field_decl.type_node, offset);
+    }
+
+    if (kind == ast.NODE_FIELD) {
+        ret walk_node(node.info.field_decl.type_node, offset);
+    }
+
+    # leaf or unknown: no children to walk
+    ret nil;
+}
+
+fun walk_list(list: *ast.List, offset: i32) *ast.Node {
+    if (list == nil) { ret nil; }
+    var i: i32 = 0;
+    for (i < list.count) {
+        val found: *ast.Node = walk_node(list.nodes[i], offset);
+        if (found != nil) { ret found; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun is_name_node(node: *ast.Node) bool {
+    val k: u8 = node.kind;
+    ret k == ast.NODE_EXPR_IDENT ||
+        k == ast.NODE_EXPR_FIELD ||
+        k == ast.NODE_TYPE_NAME;
+}

@@ -13,6 +13,7 @@ use json:      mls.json;
 
 use lsp_types:   mls.lsp_types;
 use diagnostics: mls.diagnostics;
+use analysis:    mls.analysis;
 
 # mls.handler: LSP request/notification handler implementations.
 
@@ -169,6 +170,7 @@ pub fun handle_did_change(srv: *lsp_types.Server, body: str) {
     val text: str = json.extract_after(body, text_anchor, "\"text\"", a);
 
     if (uri != nil) {
+        analysis.invalidate(?srv.ac, uri);
         val doc: *workspace.Document = workspace.find(?srv.ws, uri);
         if (doc != nil) {
             workspace.update(?srv.ws, doc, text);
@@ -186,6 +188,7 @@ pub fun handle_did_close(srv: *lsp_types.Server, body: str) {
 
     val uri: str = json.extract_after(body, anchor, "\"uri\"", a);
     if (uri != nil) {
+        analysis.invalidate(?srv.ac, uri);
         val doc: *workspace.Document = workspace.find(?srv.ws, uri);
         if (doc != nil) {
             diagnostics.clear_diagnostics(doc, a);
