@@ -1,11 +1,11 @@
-use          std.system.runtime;
-use          std.types.string;
-use console: std.io.console;
+use std.runtime;
+use std.types.string;
 
+use print: std.print;
 
 $main.symbol = "main";
-fun main(args: []str) i64 {
-    console.print("Mach Language Server\n");
-    console.print("--------------------\n");
+fun main(argc: i64, argv: &&u8) i64 {
+    print.println("Mach Language Server");
+    print.println("--------------------");
     ret 0;
 }
