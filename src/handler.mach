@@ -1,0 +1,296 @@
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use mem:       std.memory;
+use print:     std.print;
+
+use transport: mls.transport;
+use workspace: mls.workspace;
+use json:      mls.json;
+
+use lsp_types:   mls.lsp_types;
+use diagnostics: mls.diagnostics;
+
+# mls.handler: LSP request/notification handler implementations.
+
+# ============================================================================
+# response construction helpers
+# ============================================================================
+
+pub fun send_error(srv: *lsp_types.Server, id: str, code: i64, message: str) {
+    var a: allocator.Allocator = srv.alloc;
+
+    val quoted_msg: str = json.quote(message, a);
+    val code_str: str = json.format_i64(code, a);
+
+    val prefix:  str = "{\"jsonrpc\":\"2.0\",\"id\":";
+    val mid1:    str = ",\"error\":{\"code\":";
+    val mid2:    str = ",\"message\":";
+    val suffix:  str = "}}";
+
+    val id_len: usize = str_len(id);
+    val quoted_msg_len: usize = str_len(quoted_msg);
+    val code_str_len: usize = str_len(code_str);
+
+    val total: usize = str_len(prefix) + id_len + str_len(mid1) + code_str_len +
+                       str_len(mid2) + quoted_msg_len + str_len(suffix);
+
+    val buf_res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, total + 1);
+    if (!buf_res.tag) {
+        free_str(quoted_msg, a);
+        free_str(code_str, a);
+        ret;
+    }
+    val buf: *u8 = buf_res.value.ok;
+
+    var off: usize = 0;
+    off = append(buf, off, prefix);
+    off = append(buf, off, id);
+    off = append(buf, off, mid1);
+    off = append(buf, off, code_str);
+    off = append(buf, off, mid2);
+    off = append(buf, off, quoted_msg);
+    off = append(buf, off, suffix);
+    buf[off] = 0;
+
+    transport.send_message(buf::str, a);
+
+    allocator.allocator_free[u8](?a, buf, total + 1);
+    free_str(quoted_msg, a);
+    free_str(code_str, a);
+}
+
+fun send_result(srv: *lsp_types.Server, id: str, result: str) {
+    var a: allocator.Allocator = srv.alloc;
+
+    val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
+    val mid:    str = ",\"result\":";
+    val suffix: str = "}";
+
+    val id_len: usize = str_len(id);
+    val result_len: usize = str_len(result);
+
+    val total: usize = str_len(prefix) + id_len + str_len(mid) + result_len + str_len(suffix);
+
+    val buf_res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, total + 1);
+    if (!buf_res.tag) {
+        ret;
+    }
+    val buf: *u8 = buf_res.value.ok;
+
+    var off: usize = 0;
+    off = append(buf, off, prefix);
+    off = append(buf, off, id);
+    off = append(buf, off, mid);
+    off = append(buf, off, result);
+    off = append(buf, off, suffix);
+    buf[off] = 0;
+
+    transport.send_message(buf::str, a);
+    allocator.allocator_free[u8](?a, buf, total + 1);
+}
+
+fun send_null_result(srv: *lsp_types.Server, id: str) {
+    send_result(srv, id, "null");
+}
+
+# ============================================================================
+# lifecycle handlers
+# ============================================================================
+
+pub fun handle_initialize(srv: *lsp_types.Server, body: str) {
+    var a: allocator.Allocator = srv.alloc;
+    val id: str = json.extract_raw(body, "\"id\"", a);
+
+    if (id == nil) {
+        print.eprintln("mach-lsp: initialize: missing id");
+        ret;
+    }
+
+    srv.status = lsp_types.STATUS_RUNNING;
+
+    val capabilities: str = "{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"completionProvider\":{},\"documentSymbolProvider\":true},\"serverInfo\":{\"name\":\"mach-lsp\",\"version\":\"0.3.2\"}}";
+
+    send_result(srv, id, capabilities);
+    free_str(id, a);
+}
+
+pub fun handle_shutdown(srv: *lsp_types.Server, body: str) {
+    var a: allocator.Allocator = srv.alloc;
+    val id: str = json.extract_raw(body, "\"id\"", a);
+
+    srv.status = lsp_types.STATUS_SHUTTING_DOWN;
+
+    if (id != nil) {
+        send_null_result(srv, id);
+        free_str(id, a);
+    }
+}
+
+pub fun handle_exit(srv: *lsp_types.Server) {
+    if (srv.status != lsp_types.STATUS_SHUTTING_DOWN) {
+        srv.exit_code = 1;
+    }
+    srv.status = lsp_types.STATUS_EXITED;
+}
+
+# ============================================================================
+# document synchronization
+# ============================================================================
+
+pub fun handle_did_open(srv: *lsp_types.Server, body: str) {
+    var a: allocator.Allocator = srv.alloc;
+    val anchor: str = "\"textDocument\"";
+
+    val uri: str = json.extract_after(body, anchor, "\"uri\"", a);
+    val text: str = json.extract_after(body, anchor, "\"text\"", a);
+
+    if (uri != nil) {
+        val doc: *workspace.Document = workspace.open(?srv.ws, uri, text);
+        if (doc != nil) {
+            diagnostics.publish_diagnostics(doc, a);
+        }
+    }
+
+    free_str(uri, a);
+    free_str(text, a);
+}
+
+pub fun handle_did_change(srv: *lsp_types.Server, body: str) {
+    var a: allocator.Allocator = srv.alloc;
+    val anchor: str = "\"textDocument\"";
+
+    val uri: str = json.extract_after(body, anchor, "\"uri\"", a);
+
+    val text_anchor: str = "\"contentChanges\"";
+    val text: str = json.extract_after(body, text_anchor, "\"text\"", a);
+
+    if (uri != nil) {
+        val doc: *workspace.Document = workspace.find(?srv.ws, uri);
+        if (doc != nil) {
+            workspace.update(?srv.ws, doc, text);
+            diagnostics.publish_diagnostics(doc, a);
+        }
+    }
+
+    free_str(uri, a);
+    free_str(text, a);
+}
+
+pub fun handle_did_close(srv: *lsp_types.Server, body: str) {
+    var a: allocator.Allocator = srv.alloc;
+    val anchor: str = "\"textDocument\"";
+
+    val uri: str = json.extract_after(body, anchor, "\"uri\"", a);
+    if (uri != nil) {
+        val doc: *workspace.Document = workspace.find(?srv.ws, uri);
+        if (doc != nil) {
+            diagnostics.clear_diagnostics(doc, a);
+        }
+        workspace.close(?srv.ws, uri);
+    }
+
+    free_str(uri, a);
+}
+
+# ============================================================================
+# language features (stubs — real implementations in subsequent issues)
+# ============================================================================
+
+pub fun handle_hover(srv: *lsp_types.Server, body: str) {
+    var a: allocator.Allocator = srv.alloc;
+    val id: str = json.extract_raw(body, "\"id\"", a);
+    if (id == nil) {
+        ret;
+    }
+
+    # TODO: #3 — resolve symbol at cursor, format type info as markdown
+    send_null_result(srv, id);
+    free_str(id, a);
+}
+
+pub fun handle_definition(srv: *lsp_types.Server, body: str) {
+    var a: allocator.Allocator = srv.alloc;
+    val id: str = json.extract_raw(body, "\"id\"", a);
+    if (id != nil) {
+        # TODO: #4 — resolve symbol at cursor, return definition Location
+        send_null_result(srv, id);
+        free_str(id, a);
+    }
+}
+
+pub fun handle_references(srv: *lsp_types.Server, body: str) {
+    var a: allocator.Allocator = srv.alloc;
+    val id: str = json.extract_raw(body, "\"id\"", a);
+    if (id != nil) {
+        # TODO: #6 — find all references to symbol at cursor
+        send_result(srv, id, "[]");
+        free_str(id, a);
+    }
+}
+
+pub fun handle_prepare_rename(srv: *lsp_types.Server, body: str) {
+    var a: allocator.Allocator = srv.alloc;
+    val id: str = json.extract_raw(body, "\"id\"", a);
+    if (id != nil) {
+        # TODO: #7 — validate symbol is renameable, return range + placeholder
+        send_null_result(srv, id);
+        free_str(id, a);
+    }
+}
+
+pub fun handle_rename(srv: *lsp_types.Server, body: str) {
+    var a: allocator.Allocator = srv.alloc;
+    val id: str = json.extract_raw(body, "\"id\"", a);
+    if (id != nil) {
+        # TODO: #7 — find all references, build WorkspaceEdit
+        send_null_result(srv, id);
+        free_str(id, a);
+    }
+}
+
+pub fun handle_completion(srv: *lsp_types.Server, body: str) {
+    var a: allocator.Allocator = srv.alloc;
+    val id: str = json.extract_raw(body, "\"id\"", a);
+    if (id != nil) {
+        # TODO: #8 — scope-aware symbol completion
+        send_result(srv, id, "[]");
+        free_str(id, a);
+    }
+}
+
+pub fun handle_document_symbol(srv: *lsp_types.Server, body: str) {
+    var a: allocator.Allocator = srv.alloc;
+    val id: str = json.extract_raw(body, "\"id\"", a);
+    if (id != nil) {
+        # TODO: #5 — walk AST for document symbols
+        send_result(srv, id, "[]");
+        free_str(id, a);
+    }
+}
+
+# ============================================================================
+# internal utilities
+# ============================================================================
+
+fun append(buf: *u8, offset: usize, s: str) usize {
+    if (s != nil) {
+        val slen: usize = str_len(s);
+        if (slen > 0) {
+            mem.raw_copy((buf + offset)::ptr, s::ptr, slen);
+        }
+        ret offset + slen;
+    }
+    ret offset;
+}
+
+fun free_str(s: str, alloc: allocator.Allocator) {
+    if (s != nil) {
+        val len: usize = str_len(s);
+        var a: allocator.Allocator = alloc;
+        allocator.allocator_free_bytes(?a, s::ptr, len + 1, 1);
+    }
+}

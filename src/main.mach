@@ -1,11 +1,27 @@
 use std.runtime;
-use std.types.string;
+use std.types.bool;
 
 use print: std.print;
 
+use server:    mls.server;
+use lsp_types: mls.lsp_types;
+
+# mach-lsp: language server entry point.
+# ---
+# initializes the server state and enters the main message loop.
+# communicates via JSON-RPC over stdin/stdout per the LSP specification.
+
 $main.symbol = "main";
 fun main(argc: i64, argv: &&u8) i64 {
-    print.println("Mach Language Server");
-    print.println("--------------------");
-    ret 0;
+    print.eprintln("mach-lsp: starting");
+
+    var srv: lsp_types.Server;
+    server.init(?srv);
+
+    val exit_code: i64 = server.run(?srv);
+
+    server.deinit(?srv);
+
+    print.eprintln("mach-lsp: exiting");
+    ret exit_code;
 }
