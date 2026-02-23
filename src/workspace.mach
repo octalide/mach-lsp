@@ -493,6 +493,87 @@ pub fun make_str(data: &u8, len: usize, alloc: allocator.Allocator) str {
     ret buf::str;
 }
 
+# find_project_config: walk up from a file path to find the nearest mach.toml.
+# returns the project root directory and loaded config if found.
+# the caller should free root_path when done.
+pub rec ProjectConfig {
+    root_path: str;
+    cfg:       config.Config;
+    ok:        bool;
+}
+
+pub fun find_project_config(file_path: str, alloc: allocator.Allocator) ProjectConfig {
+    var result: ProjectConfig;
+    result.root_path = nil;
+    result.ok = false;
+
+    if (file_path == nil) { ret result; }
+
+    val fp_len: usize = str_len(file_path);
+    if (fp_len == 0) { ret result; }
+
+    var a: allocator.Allocator = alloc;
+
+    # allocate a mutable buffer for path manipulation
+    val buf_res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, fp_len + 16);
+    if (!buf_res.tag) { ret result; }
+    val buf: *u8 = buf_res.value.ok;
+    mem.raw_copy(buf::ptr, file_path::ptr, fp_len);
+    buf[fp_len] = 0;
+
+    val toml_name: str = "/mach.toml";
+    val toml_len: usize = 10;
+
+    # find the directory of the file (last / before end)
+    var dir_end: usize = fp_len;
+    for (dir_end > 0) {
+        dir_end = dir_end - 1;
+        if (buf[dir_end] == '/') { brk; }
+    }
+    if (dir_end == 0) {
+        allocator.allocator_free[u8](?a, buf, fp_len + 16);
+        ret result;
+    }
+
+    # walk upward, max 32 levels
+    var depth: i32 = 0;
+    for (dir_end > 0 && depth < 32) {
+        # build dir/mach.toml path
+        val path_len: usize = dir_end + toml_len;
+        val path_res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](?a, path_len + 1);
+        if (!path_res.tag) { brk; }
+        val path_buf: *u8 = path_res.value.ok;
+        mem.raw_copy(path_buf::ptr, buf::ptr, dir_end);
+        mem.raw_copy((path_buf + dir_end)::ptr, toml_name::ptr, toml_len);
+        path_buf[path_len] = 0;
+
+        val config_path: str = path_buf::str;
+        val cfg_res: Result[config.Config, str] = config.load(config_path, ?a);
+        allocator.allocator_free[u8](?a, path_buf, path_len + 1);
+
+        if (cfg_res.tag) {
+            # found it — save the root dir
+            result.cfg = cfg_res.value.ok;
+            result.ok = true;
+            result.root_path = make_str(buf::&u8, dir_end, alloc);
+            allocator.allocator_free[u8](?a, buf, fp_len + 16);
+            ret result;
+        }
+
+        # move up: find previous /
+        if (dir_end == 0) { brk; }
+        dir_end = dir_end - 1;
+        for (dir_end > 0) {
+            if (buf[dir_end] == '/') { brk; }
+            dir_end = dir_end - 1;
+        }
+        depth = depth + 1;
+    }
+
+    allocator.allocator_free[u8](?a, buf, fp_len + 16);
+    ret result;
+}
+
 pub fun path_to_uri(path: str, alloc: allocator.Allocator) str {
     if (path == nil) { ret nil; }
     val prefix: str = "file://";

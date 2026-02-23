@@ -15,10 +15,10 @@ use sema:    mach.compiler.sema;
 use collect: mach.compiler.sema.collect;
 use resolve: mach.compiler.sema.resolve;
 use symbol:   mach.compiler.symbol;
-use type:     mach.compiler.type;
 use target:   mach.compiler.target;
 use token:    mach.compiler.token;
 
+use type:      mach.compiler.type;
 use workspace: mls.workspace;
 
 # mls.analysis: semantic analysis integration for LSP.
@@ -165,6 +165,206 @@ pub fun find_module_by_path(ar: *AnalysisResult, module_path: str) *sema.SemaMod
     ret nil;
 }
 
+# find_module_alias: look up a module alias name in the sema's current module.
+# returns the aliased SemaModule, or nil if no match.
+pub fun find_module_alias(ar: *AnalysisResult, alias_name: str) *sema.SemaModule {
+    if (ar == nil || alias_name == nil) { ret nil; }
+    if (ar.sem.current_module == nil) { ret nil; }
+
+    var ma: *sema.ModuleAlias = ar.sem.current_module.aliases;
+    for (ma != nil) {
+        if (ma.alias != nil && str_equals(ma.alias, alias_name)) {
+            ret ma.module;
+        }
+        ma = ma.next;
+    }
+    ret nil;
+}
+
+# get_ident_name: extract the identifier name from an IDENT node.
+pub fun get_ident_name(node: *ast.Node) str {
+    if (node == nil) { ret nil; }
+    if (node.kind == ast.NODE_EXPR_IDENT) {
+        ret node.info.ident_expr.name;
+    }
+    ret nil;
+}
+
+# get_field_name: extract the field name from a FIELD node.
+pub fun get_field_name(node: *ast.Node) str {
+    if (node == nil) { ret nil; }
+    if (node.kind == ast.NODE_EXPR_FIELD) {
+        ret node.info.field_expr.field;
+    }
+    ret nil;
+}
+
+# find_use_at_offset: find a use declaration that contains the given offset.
+# scans the program's top-level statement list for NODE_DECL_USE nodes
+# and checks if the offset falls between consecutive statements.
+pub fun find_use_at_offset(root: *ast.Node, offset: i32) *ast.Node {
+    if (root == nil || root.kind != ast.NODE_PROGRAM) { ret nil; }
+    val stmts: *ast.List = root.info.block_stmt.stmts;
+    if (stmts == nil) { ret nil; }
+
+    var i: i32 = 0;
+    for (i < stmts.count) {
+        val node: *ast.Node = stmts.nodes[i];
+        if (node == nil) { i = i + 1; cnt; }
+
+        # skip pub wrappers
+        var inner: *ast.Node = node;
+        if (inner.kind == ast.NODE_DECL_PUB) {
+            inner = inner.info.wrapper.inner;
+            if (inner == nil) { i = i + 1; cnt; }
+        }
+
+        if (inner.kind == ast.NODE_DECL_USE) {
+            val start: i32 = node.tok.pos;
+            # use next statement's position as end bound, or use a generous estimate
+            var end: i32 = start + 256;
+            if (i + 1 < stmts.count && stmts.nodes[i + 1] != nil) {
+                end = stmts.nodes[i + 1].tok.pos;
+            }
+            if (offset >= start && offset < end) {
+                ret inner;
+            }
+        }
+
+        i = i + 1;
+    }
+
+    ret nil;
+}
+
+# get_use_path: extract the module path from a use declaration node.
+pub fun get_use_path(node: *ast.Node) str {
+    if (node == nil || node.kind != ast.NODE_DECL_USE) { ret nil; }
+    ret node.info.use_decl.path;
+}
+
+# find_decl_in_module: search a module's top-level declarations for one named `name`.
+# returns the declaration node (the inner node, unwrapped from pub), or nil.
+pub fun find_decl_in_module(mod: *sema.SemaModule, name: str) *ast.Node {
+    if (mod == nil || mod.ast == nil || name == nil) { ret nil; }
+    val root: *ast.Node = mod.ast;
+    if (root.kind != ast.NODE_PROGRAM) { ret nil; }
+    val stmts: *ast.List = root.info.block_stmt.stmts;
+    if (stmts == nil) { ret nil; }
+
+    var i: i32 = 0;
+    for (i < stmts.count) {
+        val node: *ast.Node = stmts.nodes[i];
+        if (node == nil) { i = i + 1; cnt; }
+
+        var inner: *ast.Node = node;
+        if (inner.kind == ast.NODE_DECL_PUB) {
+            inner = inner.info.wrapper.inner;
+            if (inner == nil) { i = i + 1; cnt; }
+        }
+
+        val k: u8 = inner.kind;
+        if (k == ast.NODE_DECL_FUN) {
+            if (inner.info.fun_decl.name != nil && str_equals(inner.info.fun_decl.name, name)) {
+                ret inner;
+            }
+        }
+        if (k == ast.NODE_DECL_REC || k == ast.NODE_DECL_UNI) {
+            if (inner.info.type_decl.name != nil && str_equals(inner.info.type_decl.name, name)) {
+                ret inner;
+            }
+        }
+        if (k == ast.NODE_DECL_VAL || k == ast.NODE_DECL_VAR) {
+            if (inner.info.var_decl.name != nil && str_equals(inner.info.var_decl.name, name)) {
+                ret inner;
+            }
+        }
+        if (k == ast.NODE_DECL_DEF) {
+            if (inner.info.def_decl.name != nil && str_equals(inner.info.def_decl.name, name)) {
+                ret inner;
+            }
+        }
+
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# get_type_name_path: extract the path string from a TYPE_NAME node.
+pub fun get_type_name_path(node: *ast.Node) str {
+    if (node == nil || node.kind != ast.NODE_TYPE_NAME) { ret nil; }
+    ret node.info.type_name.path;
+}
+
+# get_object_record_type: given a FIELD expression node, extract the record type
+# from the object's type (unwrapping pointers). returns nil if not a record.
+pub fun get_object_record_type(node: *ast.Node) *type.Type {
+    if (node == nil || node.kind != ast.NODE_EXPR_FIELD) { ret nil; }
+    val obj: *ast.Node = node.info.field_expr.object;
+    if (obj == nil || obj.type == nil) { ret nil; }
+
+    var t: *type.Type = obj.type;
+    # unwrap pointer types (*T, &T)
+    if (t.kind == type.TYPE_POINTER && t.inner != nil) {
+        t = t.inner;
+    }
+    if (t.kind == type.TYPE_RECORD || t.kind == type.TYPE_UNION) {
+        ret t;
+    }
+    ret nil;
+}
+
+# find_record_module: find which SemaModule contains a record/union declaration
+# matching the given type name. searches all loaded modules and current module.
+pub fun find_record_module(ar: *AnalysisResult, record_name: str) *sema.SemaModule {
+    if (ar == nil || record_name == nil) { ret nil; }
+
+    # search loaded modules
+    var mod: *sema.SemaModule = ar.sem.modules;
+    for (mod != nil) {
+        val decl: *ast.Node = find_decl_in_module(mod, record_name);
+        if (decl != nil) {
+            val k: u8 = decl.kind;
+            if (k == ast.NODE_DECL_REC || k == ast.NODE_DECL_UNI) { ret mod; }
+        }
+        mod = mod.next;
+    }
+
+    # check current module
+    if (ar.sem.current_module != nil) {
+        val decl: *ast.Node = find_decl_in_module(ar.sem.current_module, record_name);
+        if (decl != nil) {
+            val k: u8 = decl.kind;
+            if (k == ast.NODE_DECL_REC || k == ast.NODE_DECL_UNI) { ret ar.sem.current_module; }
+        }
+    }
+
+    ret nil;
+}
+
+# find_field_in_record_decl: given a record declaration AST node, find the
+# field declaration matching `field_name`. returns the NODE_FIELD node.
+pub fun find_field_in_record_decl(decl: *ast.Node, field_name: str) *ast.Node {
+    if (decl == nil || field_name == nil) { ret nil; }
+    val k: u8 = decl.kind;
+    if (k != ast.NODE_DECL_REC && k != ast.NODE_DECL_UNI) { ret nil; }
+
+    val fields: *ast.List = decl.info.type_decl.fields;
+    if (fields == nil) { ret nil; }
+
+    var i: i32 = 0;
+    for (i < fields.count) {
+        val field: *ast.Node = fields.nodes[i];
+        if (field != nil && field.kind == ast.NODE_FIELD) {
+            if (field.info.field_decl.name != nil && str_equals(field.info.field_decl.name, field_name)) {
+                ret field;
+            }
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
 # collect_references: find all AST nodes that reference a given symbol.
 # fills the `out` array with up to `max` node pointers. returns the count.
 # set `include_decl` to true to also include the declaration node itself.
@@ -212,20 +412,42 @@ fun run_analysis(cache: *AnalysisCache, entry: *CacheEntry, doc: *workspace.Docu
     # set up sema
     var sem: sema.Sema = sema.init(?a, cache.tgt);
 
-    # set up module resolution if workspace config is loaded
-    if (ws != nil && ws.cfg_ok) {
-        val src_root: str = workspace.build_src_root(ws);
-        val dep_root: str = workspace.build_dep_root(ws);
+    # convert file URI to filesystem path for sema context
+    var file_path: str = nil;
+    file_path = workspace.uri_to_path(entry.uri, cache.alloc);
 
+    # find the nearest mach.toml by walking up from the file
+    var proj: workspace.ProjectConfig = workspace.find_project_config(file_path, cache.alloc);
+    if (proj.ok) {
+        print.eprint("mach-lsp: analysis: found mach.toml at ");
+        print.eprintln(proj.root_path);
+
+        val src_root: str = workspace.path_join(proj.root_path, proj.cfg.dir_src, cache.alloc);
+        val dep_root: str = workspace.path_join(proj.root_path, proj.cfg.dir_dep, cache.alloc);
         if (src_root != nil) {
-            sema.set_module_roots(?sem, ws.cfg.id, src_root, dep_root,
-                ws.cfg.deps, ws.cfg.dep_count);
+            sema.set_module_roots(?sem, proj.cfg.id, src_root, dep_root,
+                proj.cfg.deps, proj.cfg.dep_count);
+        }
+    }
+    or {
+        # fall back to workspace-level config
+        if (ws != nil && ws.cfg_ok) {
+            val src_root: str = workspace.build_src_root(ws);
+            val dep_root: str = workspace.build_dep_root(ws);
+            if (src_root != nil) {
+                sema.set_module_roots(?sem, ws.cfg.id, src_root, dep_root,
+                    ws.cfg.deps, ws.cfg.dep_count);
+            }
+        }
+        or {
+            print.eprintln("mach-lsp: analysis: no mach.toml found");
         }
     }
 
     # create symbol table
     val table_res: Result[symbol.Table, str] = symbol.init(?a);
     if (!table_res.tag) {
+        if (proj.root_path != nil) { workspace.free_str(proj.root_path, cache.alloc); }
         sema.dnit(?sem);
         ret;
     }
@@ -233,18 +455,13 @@ fun run_analysis(cache: *AnalysisCache, entry: *CacheEntry, doc: *workspace.Docu
     val tbl_ptr_res: Result[*symbol.Table, allocator.AllocError] =
         allocator.allocator_alloc[symbol.Table](?a, 1);
     if (!tbl_ptr_res.tag) {
+        if (proj.root_path != nil) { workspace.free_str(proj.root_path, cache.alloc); }
         sema.dnit(?sem);
         ret;
     }
     val tbl_ptr: *symbol.Table = tbl_ptr_res.value.ok;
     @tbl_ptr = table_res.value.ok;
     sem.symbols = tbl_ptr;
-
-    # convert file URI to filesystem path for sema context
-    var file_path: str = nil;
-    if (ws != nil) {
-        file_path = workspace.uri_to_path(entry.uri, cache.alloc);
-    }
 
     # set up sema state — replicating sema/analyze.mach setup but running
     # passes individually so we can reset error_count between collect and
@@ -288,6 +505,7 @@ fun run_analysis(cache: *AnalysisCache, entry: *CacheEntry, doc: *workspace.Docu
     val scope_res: Result[bool, str] = sema.push_scope(?sem);
     if (!scope_res.tag) {
         if (file_path != nil) { workspace.free_str(file_path, cache.alloc); }
+        if (proj.root_path != nil) { workspace.free_str(proj.root_path, cache.alloc); }
         sema.dnit(?sem);
         ret;
     }
@@ -311,6 +529,7 @@ fun run_analysis(cache: *AnalysisCache, entry: *CacheEntry, doc: *workspace.Docu
     }
 
     if (file_path != nil) { workspace.free_str(file_path, cache.alloc); }
+    if (proj.root_path != nil) { workspace.free_str(proj.root_path, cache.alloc); }
 
     entry.result.root = pr.root;
     entry.result.sem = sem;
@@ -522,6 +741,20 @@ fun walk_node(node: *ast.Node, offset: i32) *ast.Node {
 
     # --- types ---
 
+    if (kind == ast.NODE_TYPE_NAME) {
+        # type names may contain dotted paths (e.g. "lsp_types.Server").
+        # the token only covers the first identifier, but the full path
+        # string gives us the real span. also walk generic args.
+        val path: str = node.info.type_name.path;
+        if (path != nil) {
+            val path_len: i32 = str_len(path)::i32;
+            if (offset >= node.tok.pos && offset < node.tok.pos + path_len) {
+                ret node;
+            }
+        }
+        ret walk_node(node.info.type_name.args, offset);
+    }
+
     if (kind == ast.NODE_TYPE_PTR || kind == ast.NODE_TYPE_REF) {
         ret walk_node(node.info.type_ptr.inner, offset);
     }
@@ -573,8 +806,8 @@ fun is_name_node(node: *ast.Node) bool {
     val k: u8 = node.kind;
     # NODE_EXPR_FIELD is handled specially in walk_node (tok is the DOT,
     # field name follows) — do not include it here.
-    ret k == ast.NODE_EXPR_IDENT ||
-        k == ast.NODE_TYPE_NAME;
+    # NODE_TYPE_NAME is handled specially below for dotted paths.
+    ret k == ast.NODE_EXPR_IDENT;
 }
 
 # --- reference collection walking ---
