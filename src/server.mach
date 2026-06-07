@@ -1,53 +1,111 @@
-use std.types.bool;
-use std.types.size;
-use std.types.string;
-use std.types.result;
+# mls.server: top-level server state, lifecycle, message loop, and dispatch.
+#
+# owns the long-lived state of one server process: the lifecycle status, the
+# allocator, the compiler `session.Session` (SourceMap + DiagList), the
+# `editor.EditorSession` (per-buffer analysis), and the document registry that
+# binds LSP URIs to editor buffers. `run` reads framed messages until exit;
+# `dispatch` routes each by method. this slice implements the lifecycle and the
+# document-synchronization notifications that drive diagnostics; unimplemented
+# language-feature requests are answered with a `method not found` error.
 
-use allocator: std.allocator;
-use print:     std.print;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.string.str_equals;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+
+use mem: std.memory;
+
+use sess: mach.lang.session;
+use src:  mach.lang.source;
+use editor: mach.lang.editor;
 
 use transport: mls.transport;
-use handler:   mls.handler;
-use workspace: mls.workspace;
 use json:      mls.json;
-use lsp_types: mls.lsp_types;
-use analysis:  mls.analysis;
+use documents: mls.documents;
+use diagnostics: mls.diagnostics;
 use trace:     mls.trace;
 
-# mls.server: top-level LSP server state and message loop.
+# lifecycle statuses.
+pub val STATUS_UNINITIALIZED: u8 = 0;
+pub val STATUS_RUNNING:       u8 = 1;
+pub val STATUS_SHUTTING_DOWN: u8 = 2;
+pub val STATUS_EXITED:        u8 = 3;
 
-pub fun init(srv: *lsp_types.Server) {
-    srv.status = lsp_types.STATUS_UNINITIALIZED;
+# Server: the long-lived server state.
+# ---
+# status:    current lifecycle phase
+# exit_code: process exit code to return from `run`
+# alloc:     allocator backing all server-owned memory
+# s:         compiler session (SourceMap + DiagList)
+# es:        editor session over `s` (per-buffer analysis)
+# docs:      URI -> editor buffer registry
+pub rec Server {
+    status:    u8;
+    exit_code: i64;
+    alloc:     *Allocator;
+    s:         sess.Session;
+    es:        editor.EditorSession;
+    docs:      documents.Store;
+}
+
+# init: build a server over the given allocator.
+# ---
+# srv:   server to initialize
+# alloc: allocator backing all server-owned memory; must outlive the server
+# ret:   true on success, false when the compiler session fails to initialize
+pub fun init(srv: *Server, alloc: *Allocator) bool {
+    srv.status = STATUS_UNINITIALIZED;
     srv.exit_code = 0;
-    srv.alloc = allocator.heap_allocator();
-    workspace.init(?srv.ws, srv.alloc);
-    analysis.cache_init(?srv.ac, srv.alloc);
+    srv.alloc = alloc;
+
+    val sr: Result[sess.Session, str] = sess.init(alloc);
+    if (is_err[sess.Session, str](sr)) { ret false; }
+    srv.s = unwrap_ok[sess.Session, str](sr);
+
+    srv.es = editor.init(?srv.s);
+    srv.docs = documents.init(?srv.es, alloc);
+    ret true;
 }
 
-pub fun deinit(srv: *lsp_types.Server) {
-    analysis.cache_deinit(?srv.ac);
-    workspace.deinit(?srv.ws, srv.alloc);
-    srv.status = lsp_types.STATUS_EXITED;
+# dnit: tear down the server's owned state.
+# ---
+# srv: server to tear down
+pub fun dnit(srv: *Server) {
+    documents.dnit(?srv.docs);
+    editor.dnit(?srv.es);
+    sess.dnit(?srv.s);
+    srv.status = STATUS_EXITED;
 }
 
-pub fun run(srv: *lsp_types.Server) i64 {
+# run: read and dispatch framed messages until the server exits.
+# ---
+# srv: the server to drive
+# ret: the process exit code
+pub fun run(srv: *Server) i64 {
     trace.log("=== mach-lsp started ===\n");
 
-    for (srv.status != lsp_types.STATUS_EXITED) {
+    for (srv.status != STATUS_EXITED) {
         var msg: transport.Message;
-        val read_ok: bool = transport.read_message(?msg, srv.alloc);
-
-        if (!read_ok) {
-            if (srv.status == lsp_types.STATUS_SHUTTING_DOWN) {
-                trace.log("stdin closed (shutting down)\n");
-                srv.status = lsp_types.STATUS_EXITED;
+        val ok: bool = transport.read_message(?msg, srv.alloc);
+        if (!ok) {
+            if (srv.status == STATUS_SHUTTING_DOWN) {
+                srv.status = STATUS_EXITED;
                 brk;
             }
-
-            trace.log("stdin read failed\n");
-            print.eprintln("mach-lsp: error: failed to read message");
+            trace.log("transport: read failed\n");
             srv.exit_code = 1;
-            srv.status = lsp_types.STATUS_EXITED;
+            srv.status = STATUS_EXITED;
             brk;
         }
 
@@ -56,136 +114,217 @@ pub fun run(srv: *lsp_types.Server) i64 {
         trace.log("\n");
 
         dispatch(srv, ?msg);
-        transport.message_free(?msg);
+        transport.message_free(?msg, srv.alloc);
     }
 
     trace.log("=== mach-lsp exiting ===\n");
     ret srv.exit_code;
 }
 
-fun dispatch(srv: *lsp_types.Server, msg: *transport.Message) {
+# dispatch: route one message body by its `method` field.
+fun dispatch(srv: *Server, msg: *transport.Message) {
     val body: str = msg.body;
     val method: str = json.extract_string(body, "\"method\"", srv.alloc);
+    if (method == nil) { ret; }
 
-    if (method == nil) {
-        ret;
-    }
-
-    print.eprint("mach-lsp: dispatch: ");
-    print.eprintln(method);
-
-    # lifecycle
     if (str_equals(method, "initialize")) {
         json.free_str(method, srv.alloc);
-        handler.handle_initialize(srv, body);
+        handle_initialize(srv, body);
         ret;
     }
-
     if (str_equals(method, "initialized")) {
         json.free_str(method, srv.alloc);
         ret;
     }
-
     if (str_equals(method, "shutdown")) {
         json.free_str(method, srv.alloc);
-        handler.handle_shutdown(srv, body);
+        handle_shutdown(srv, body);
         ret;
     }
-
     if (str_equals(method, "exit")) {
         json.free_str(method, srv.alloc);
-        handler.handle_exit(srv);
+        handle_exit(srv);
         ret;
     }
 
-    # reject before initialize
-    if (srv.status != lsp_types.STATUS_RUNNING) {
+    if (srv.status != STATUS_RUNNING) {
         json.free_str(method, srv.alloc);
-        val id: str = json.extract_raw(body, "\"id\"", srv.alloc);
-        if (id != nil) {
-            handler.send_error(srv, id, -32002, "server not initialized");
-            json.free_str(id, srv.alloc);
-        }
+        reply_error(srv, body, -32002, "server not initialized");
         ret;
     }
 
-    # document synchronization
     if (str_equals(method, "textDocument/didOpen")) {
         json.free_str(method, srv.alloc);
-        handler.handle_did_open(srv, body);
+        handle_did_open(srv, body);
         ret;
     }
-
     if (str_equals(method, "textDocument/didChange")) {
         json.free_str(method, srv.alloc);
-        handler.handle_did_change(srv, body);
+        handle_did_change(srv, body);
         ret;
     }
-
     if (str_equals(method, "textDocument/didClose")) {
         json.free_str(method, srv.alloc);
-        handler.handle_did_close(srv, body);
+        handle_did_close(srv, body);
         ret;
     }
-
     if (str_equals(method, "textDocument/didSave")) {
         json.free_str(method, srv.alloc);
         ret;
     }
 
-    # language features
-    if (str_equals(method, "textDocument/hover")) {
-        json.free_str(method, srv.alloc);
-        handler.handle_hover(srv, body);
-        ret;
-    }
-
-    if (str_equals(method, "textDocument/definition")) {
-        json.free_str(method, srv.alloc);
-        handler.handle_definition(srv, body);
-        ret;
-    }
-
-    if (str_equals(method, "textDocument/references")) {
-        json.free_str(method, srv.alloc);
-        handler.handle_references(srv, body);
-        ret;
-    }
-
-    if (str_equals(method, "textDocument/prepareRename")) {
-        json.free_str(method, srv.alloc);
-        handler.handle_prepare_rename(srv, body);
-        ret;
-    }
-
-    if (str_equals(method, "textDocument/rename")) {
-        json.free_str(method, srv.alloc);
-        handler.handle_rename(srv, body);
-        ret;
-    }
-
-    if (str_equals(method, "textDocument/completion")) {
-        json.free_str(method, srv.alloc);
-        handler.handle_completion(srv, body);
-        ret;
-    }
-
-    if (str_equals(method, "textDocument/documentSymbol")) {
-        json.free_str(method, srv.alloc);
-        handler.handle_document_symbol(srv, body);
-        ret;
-    }
-
-    # fallback
     trace.log("unhandled method: ");
     trace.log(method);
     trace.log("\n");
     json.free_str(method, srv.alloc);
-
-    val id: str = json.extract_raw(body, "\"id\"", srv.alloc);
-    if (id != nil) {
-        handler.send_error(srv, id, -32601, "method not found");
-        json.free_str(id, srv.alloc);
-    }
+    reply_error(srv, body, -32601, "method not found");
 }
 
+# handle_initialize: answer the initialize request with the server's
+# capabilities (full-text document sync) and mark the server running.
+fun handle_initialize(srv: *Server, body: str) {
+    val id: str = json.extract_raw(body, "\"id\"", srv.alloc);
+    if (id == nil) { ret; }
+
+    val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
+    val result: str = ",\"result\":{\"capabilities\":{\"textDocumentSync\":1},\"serverInfo\":{\"name\":\"mach-lsp\"}}}";
+    send_concat2(srv, prefix, id, result);
+    json.free_str(id, srv.alloc);
+
+    srv.status = STATUS_RUNNING;
+    trace.log("initialized\n");
+}
+
+# handle_shutdown: acknowledge a shutdown request and enter the shutting-down phase.
+fun handle_shutdown(srv: *Server, body: str) {
+    val id: str = json.extract_raw(body, "\"id\"", srv.alloc);
+    if (id != nil) {
+        val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
+        val result: str = ",\"result\":null}";
+        send_concat2(srv, prefix, id, result);
+        json.free_str(id, srv.alloc);
+    }
+    srv.status = STATUS_SHUTTING_DOWN;
+}
+
+# handle_exit: exit the process, with code 0 only after a clean shutdown.
+fun handle_exit(srv: *Server) {
+    if (srv.status == STATUS_SHUTTING_DOWN) { srv.exit_code = 0; }
+    or { srv.exit_code = 1; }
+    srv.status = STATUS_EXITED;
+}
+
+# handle_did_open: register the opened document and publish its diagnostics.
+fun handle_did_open(srv: *Server, body: str) {
+    val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
+    if (uri == nil) { ret; }
+    val text: str = json.extract_after(body, "\"textDocument\"", "\"text\"", srv.alloc);
+    if (text == nil) { json.free_str(uri, srv.alloc); ret; }
+
+    publish_for(srv, uri, text, true);
+
+    json.free_str(text, srv.alloc);
+    json.free_str(uri, srv.alloc);
+}
+
+# handle_did_change: apply the document's new full text and republish diagnostics.
+# only full-document sync (textDocumentSync = 1) is advertised, so the change is
+# the entire new text.
+fun handle_did_change(srv: *Server, body: str) {
+    val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
+    if (uri == nil) { ret; }
+    val text: str = json.extract_after(body, "\"contentChanges\"", "\"text\"", srv.alloc);
+    if (text == nil) { json.free_str(uri, srv.alloc); ret; }
+
+    publish_for(srv, uri, text, false);
+
+    json.free_str(text, srv.alloc);
+    json.free_str(uri, srv.alloc);
+}
+
+# handle_did_close: retire the document and clear its diagnostics.
+fun handle_did_close(srv: *Server, body: str) {
+    val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
+    if (uri == nil) { ret; }
+    documents.close(?srv.docs, uri);
+    diagnostics.clear(srv.alloc, uri);
+    json.free_str(uri, srv.alloc);
+}
+
+# publish_for: register/update `uri`'s buffer and publish its diagnostics.
+# `is_open` selects open vs change registration; both end in a publish.
+fun publish_for(srv: *Server, uri: str, text: str, is_open: bool) {
+    var dr: Result[*documents.Document, str];
+    if (is_open) { dr = documents.open(?srv.docs, uri, text); }
+    or { dr = documents.change(?srv.docs, uri, text); }
+
+    if (is_err[*documents.Document, str](dr)) {
+        trace.log("documents: ");
+        trace.log(unwrap_err[*documents.Document, str](dr));
+        trace.log("\n");
+        ret;
+    }
+    val doc: *documents.Document = unwrap_ok[*documents.Document, str](dr);
+    diagnostics.publish(?srv.es, ?srv.s, srv.alloc, uri, doc.file_id);
+}
+
+# reply_error: send a JSON-RPC error response for a request that carries an id;
+# a no-op for a notification (no id).
+fun reply_error(srv: *Server, body: str, code: i64, message: str) {
+    val id: str = json.extract_raw(body, "\"id\"", srv.alloc);
+    if (id == nil) { ret; }
+
+    val code_str: str = json.format_i64(code, srv.alloc);
+    val qmsg: str = json.quote(message, srv.alloc);
+    val p1: str = "{\"jsonrpc\":\"2.0\",\"id\":";
+    val p2: str = ",\"error\":{\"code\":";
+    val p3: str = ",\"message\":";
+    val p4: str = "}}";
+
+    send_concat(srv, p1, id, p2, code_str, p3, qmsg, p4);
+
+    json.free_str(qmsg, srv.alloc);
+    json.free_str(code_str, srv.alloc);
+    json.free_str(id, srv.alloc);
+}
+
+# send_concat2: frame and send `a + b + c`.
+fun send_concat2(srv: *Server, a: str, b: str, c: str) {
+    send_concat(srv, a, b, c, nil, nil, nil, nil);
+}
+
+# send_concat: frame and send the concatenation of up to seven fragments,
+# skipping nil fragments.
+fun send_concat(srv: *Server, a: str, b: str, c: str, d: str, e: str, f: str, g: str) {
+    val total: usize = flen(a) + flen(b) + flen(c) + flen(d) + flen(e) + flen(f) + flen(g);
+    val r: Result[*u8, str] = allocate[u8](srv.alloc, total + 1);
+    if (is_err[*u8, str](r)) { ret; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+
+    var off: usize = 0;
+    off = fappend(buf, off, a);
+    off = fappend(buf, off, b);
+    off = fappend(buf, off, c);
+    off = fappend(buf, off, d);
+    off = fappend(buf, off, e);
+    off = fappend(buf, off, f);
+    off = fappend(buf, off, g);
+    buf[off] = 0;
+
+    transport.send_message(buf::str, srv.alloc);
+    deallocate[u8](srv.alloc, buf, total + 1);
+}
+
+# flen: length of `s`, treating nil as 0.
+fun flen(s: str) usize {
+    if (s == nil) { ret 0; }
+    ret str_len(s);
+}
+
+# fappend: copy `s` into `buf` at `offset`, returning the new offset.
+fun fappend(buf: *u8, offset: usize, s: str) usize {
+    if (s == nil) { ret offset; }
+    val n: usize = str_len(s);
+    if (n > 0) { mem.raw_copy((buf::usize + offset)::ptr, s::ptr, n); }
+    ret offset + n;
+}
