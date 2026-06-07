@@ -72,6 +72,10 @@ requests = b"".join([
     # rename `x` -> `y`
     frame({"jsonrpc": "2.0", "id": 41, "method": "textDocument/rename",
            "params": {"textDocument": {"uri": URI}, "position": pos(2, 8), "newName": "y"}}),
+    # rename parameter `a` from its binding site (line 0, char 11) -> `arg`;
+    # must rewrite the binding plus the `ret a` use (a correct, compiling rename)
+    frame({"jsonrpc": "2.0", "id": 42, "method": "textDocument/rename",
+           "params": {"textDocument": {"uri": URI}, "position": pos(0, 11), "newName": "arg"}}),
     # documentSymbol
     frame({"jsonrpc": "2.0", "id": 50, "method": "textDocument/documentSymbol",
            "params": {"textDocument": {"uri": URI}}}),
@@ -93,7 +97,7 @@ def by_id(i):
 print("=== server exit code:", proc.returncode)
 print("=== messages received:", len(msgs))
 for m in msgs:
-    if m.get("id") in (10, 11, 20, 30, 40, 41, 50, 60):
+    if m.get("id") in (10, 11, 20, 30, 40, 41, 42, 50, 60):
         print(json.dumps(m))
 
 failures = []
@@ -155,6 +159,24 @@ else:
         failures.append(f"rename(x) produced {len(edits)} edits, expected >= 2")
     elif any(e.get("newText") != "y" for e in edits):
         failures.append("rename(x) edit newText is not 'y'")
+
+# rename of parameter `a` -> `arg`: binding site + the `ret a` use (>= 2 edits)
+rp2 = by_id(42)
+rp2v = (rp2 or {}).get("result")
+if not rp2v or "changes" not in rp2v:
+    failures.append("rename(param a) returned no WorkspaceEdit")
+else:
+    pedits = rp2v["changes"].get(URI, [])
+    if len(pedits) < 2:
+        failures.append(f"rename(param a) produced {len(pedits)} edits, expected >= 2 (binding + use)")
+    elif any(e.get("newText") != "arg" for e in pedits):
+        failures.append("rename(param a) edit newText is not 'arg'")
+    else:
+        # the binding site is on line 0 (the signature); a use is on line 0 too,
+        # but there must be an edit at the binding column (char 11)
+        cols = {e["range"]["start"]["character"] for e in pedits if e["range"]["start"]["line"] == 0}
+        if 11 not in cols:
+            failures.append(f"rename(param a) did not rewrite the binding at col 11 (cols {sorted(cols)})")
 
 # documentSymbol -> helper and main present
 ds = by_id(50)

@@ -179,7 +179,7 @@ pub fun definition(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocato
     if (!is_some[*res.Symbol](so)) { reply_null(alloc, id_raw); ret; }
     val sym: *res.Symbol = unwrap[*res.Symbol](so);
 
-    val spo: Option[token.Span] = features.decl_name_span_of(an.a, sym);
+    val spo: Option[token.Span] = features.definition_name_span(an.a, sym);
     if (!is_some[token.Span](spo)) { reply_null(alloc, id_raw); ret; }
     val span: token.Span = unwrap[token.Span](spo);
 
@@ -212,7 +212,9 @@ pub fun references(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocato
     val sr: features.SymbolRef = unwrap[features.SymbolRef](ro);
     if (!sr.local) { reply_empty_array(alloc, id_raw); ret; }
 
-    emit_locations(an, alloc, id_raw, uri, sr.sym_id, true);
+    var bind: token.Span;
+    val has_bind: bool = binding_span(an, sr.sym_id, ?bind);
+    emit_locations(an, alloc, id_raw, uri, sr.sym_id, bind, has_bind);
     json.free_str(id_raw, alloc);
 }
 
@@ -236,7 +238,9 @@ pub fun rename(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, d
     val sr: features.SymbolRef = unwrap[features.SymbolRef](ro);
     if (!sr.local) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
 
-    emit_rename(an, alloc, id_raw, uri, sr.sym_id, new_name);
+    var bind: token.Span;
+    val has_bind: bool = binding_span(an, sr.sym_id, ?bind);
+    emit_rename(an, alloc, id_raw, uri, sr.sym_id, new_name, bind, has_bind);
     json.free_str(new_name, alloc);
     json.free_str(id_raw, alloc);
 }
@@ -298,6 +302,19 @@ pub fun completion(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocato
     json.free_str(id_raw, alloc);
 }
 
+# binding_span: write the binding name span of a param / generic symbol into
+# `out` and return true, or false when the symbol binds at a Decl node (whose
+# site the decl walk already covers). lets references / rename include the one
+# binding site a param / generic has, which no side table records.
+fun binding_span(an: Analyzed, sid: res.SymbolId, out: *token.Span) bool {
+    val so: Option[*res.Symbol] = features.symbol(an.rr, sid);
+    if (!is_some[*res.Symbol](so)) { ret false; }
+    val bo: Option[token.Span] = features.binding_name_span(an.a, unwrap[*res.Symbol](so));
+    if (!is_some[token.Span](bo)) { ret false; }
+    @out = unwrap[token.Span](bo);
+    ret true;
+}
+
 # analyze: resolve the document named by `uri` and populate `out` with its
 # session, file, Ast, ResolveResult, and module id. false when the document is
 # unknown or resolution fails.
@@ -336,14 +353,17 @@ fun locate(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs:
 }
 
 # emit_locations: send a Location[] result of every in-file reference to
-# `target`. when `include_decl` is set, the decl name span is included too.
-fun emit_locations(an: Analyzed, alloc: *Allocator, id_raw: str, uri: str, target: res.SymbolId, include_decl: bool) {
+# `target`. the decl name span is included via decl_ref_span; a param / generic
+# binding site, which has no Decl node, is passed in `bind` when `has_bind`.
+fun emit_locations(an: Analyzed, alloc: *Allocator, id_raw: str, uri: str, target: res.SymbolId, bind: token.Span, has_bind: bool) {
     val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
     val mid:    str = ",\"result\":[";
     val suffix: str = "]}";
 
     var total: usize = str_len(prefix) + str_len(id_raw) + str_len(mid) + str_len(suffix);
     var count: usize = 0;
+
+    if (has_bind) { total = total + loc_len(an.file, uri, bind, alloc, count); count = count + 1; }
 
     # first pass: size
     var ei: usize = 0;
@@ -358,13 +378,11 @@ fun emit_locations(an: Analyzed, alloc: *Allocator, id_raw: str, uri: str, targe
         if (is_some[token.Span](so)) { total = total + loc_len(an.file, uri, unwrap[token.Span](so), alloc, count); count = count + 1; }
         ti = ti + 1;
     }
-    if (include_decl) {
-        var di: usize = 0;
-        for (di < an.a.decl_len) {
-            val so: Option[token.Span] = features.decl_ref_span(an.a, an.rr, di::id.DeclId, target);
-            if (is_some[token.Span](so)) { total = total + loc_len(an.file, uri, unwrap[token.Span](so), alloc, count); count = count + 1; }
-            di = di + 1;
-        }
+    var di: usize = 0;
+    for (di < an.a.decl_len) {
+        val so: Option[token.Span] = features.decl_ref_span(an.a, an.rr, di::id.DeclId, target);
+        if (is_some[token.Span](so)) { total = total + loc_len(an.file, uri, unwrap[token.Span](so), alloc, count); count = count + 1; }
+        di = di + 1;
     }
 
     val br: Result[*u8, str] = allocate[u8](alloc, total + 1);
@@ -377,6 +395,7 @@ fun emit_locations(an: Analyzed, alloc: *Allocator, id_raw: str, uri: str, targe
     off = append(buf, off, mid);
 
     var emitted: usize = 0;
+    if (has_bind) { off = put_loc(buf, off, an.file, uri, bind, alloc, emitted); emitted = emitted + 1; }
     var e2: usize = 0;
     for (e2 < an.a.expr_len) {
         val so: Option[token.Span] = features.expr_ref_span(an.a, an.rr, e2::id.ExprId, target);
@@ -389,13 +408,11 @@ fun emit_locations(an: Analyzed, alloc: *Allocator, id_raw: str, uri: str, targe
         if (is_some[token.Span](so)) { off = put_loc(buf, off, an.file, uri, unwrap[token.Span](so), alloc, emitted); emitted = emitted + 1; }
         t2 = t2 + 1;
     }
-    if (include_decl) {
-        var d2: usize = 0;
-        for (d2 < an.a.decl_len) {
-            val so: Option[token.Span] = features.decl_ref_span(an.a, an.rr, d2::id.DeclId, target);
-            if (is_some[token.Span](so)) { off = put_loc(buf, off, an.file, uri, unwrap[token.Span](so), alloc, emitted); emitted = emitted + 1; }
-            d2 = d2 + 1;
-        }
+    var d2: usize = 0;
+    for (d2 < an.a.decl_len) {
+        val so: Option[token.Span] = features.decl_ref_span(an.a, an.rr, d2::id.DeclId, target);
+        if (is_some[token.Span](so)) { off = put_loc(buf, off, an.file, uri, unwrap[token.Span](so), alloc, emitted); emitted = emitted + 1; }
+        d2 = d2 + 1;
     }
 
     off = append(buf, off, suffix);
@@ -405,8 +422,9 @@ fun emit_locations(an: Analyzed, alloc: *Allocator, id_raw: str, uri: str, targe
 }
 
 # emit_rename: send a WorkspaceEdit with one TextEdit per in-file reference to
-# `target`, each replacing the reference's range with `new_name`.
-fun emit_rename(an: Analyzed, alloc: *Allocator, id_raw: str, uri: str, target: res.SymbolId, new_name: str) {
+# `target`, each replacing the reference's range with `new_name`. a param /
+# generic binding site is passed in `bind` when `has_bind`.
+fun emit_rename(an: Analyzed, alloc: *Allocator, id_raw: str, uri: str, target: res.SymbolId, new_name: str, bind: token.Span, has_bind: bool) {
     val quri: str = json.quote(uri, alloc);
     val qname: str = json.quote(new_name, alloc);
     if (quri == nil || qname == nil) {
@@ -421,6 +439,8 @@ fun emit_rename(an: Analyzed, alloc: *Allocator, id_raw: str, uri: str, target: 
 
     var total: usize = str_len(prefix) + str_len(id_raw) + str_len(mid1) + str_len(quri) + str_len(mid2) + str_len(suffix);
     var count: usize = 0;
+
+    if (has_bind) { total = total + edit_len(an.file, bind, qname, alloc, count); count = count + 1; }
 
     var e1: usize = 0;
     for (e1 < an.a.expr_len) {
@@ -456,6 +476,7 @@ fun emit_rename(an: Analyzed, alloc: *Allocator, id_raw: str, uri: str, target: 
     off = append(buf, off, mid2);
 
     var emitted: usize = 0;
+    if (has_bind) { off = put_edit(buf, off, an.file, bind, qname, alloc, emitted); emitted = emitted + 1; }
     var e2: usize = 0;
     for (e2 < an.a.expr_len) {
         val so: Option[token.Span] = features.expr_ref_span(an.a, an.rr, e2::id.ExprId, target);
