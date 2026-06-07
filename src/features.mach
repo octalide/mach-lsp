@@ -1,0 +1,525 @@
+# mls.features: offset -> id -> symbol queries over the editor resolve tables.
+#
+# the shared core of the language features (hover, definition, references,
+# rename, documentSymbol, completion). each starts from an `editor` buffer's
+# parsed `ast.Ast` and resolved `res.ResolveResult`, pivots on a byte offset
+# through `ast.offset_to_{expr,type}`, and reads the parallel side tables
+# (`expr_resolved` / `type_resolved` / `decl_symbol`) to recover the
+# `res.Symbol` a position references. this module owns that pivot and the
+# symbol-shaped helpers the per-feature renderers build on; the JSON shaping
+# lives in `server`.
+#
+# scope: resolution is single-file (the editor resolves a buffer in isolation
+# with an empty dep set), so a reference to a locally declared symbol binds
+# fully — its decl is in this same Ast — while a reference imported through a
+# `use` resolves to a symbol whose `decl` lives in a dependency Ast this server
+# never loaded. those are reported as cross-module: hover still renders the
+# name and kind, but definition / references that need the decl span are
+# confined to symbols whose `origin` is this buffer's module.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_some;
+use std.types.option.unwrap;
+
+use sess:   mach.lang.session;
+use intern: mach.lang.intern;
+use token:  mach.lang.fe.token;
+use ast:    mach.lang.fe.ast;
+use id:     mach.lang.fe.ast.id;
+use module: mach.lang.fe.ast.module;
+use decl:   mach.lang.fe.ast.decl;
+use stmt:   mach.lang.fe.ast.stmt;
+use expr:   mach.lang.fe.ast.expr;
+use atype:  mach.lang.fe.ast.type;
+use res:    mach.lang.fe.resolve;
+
+# SymbolRef: a symbol a position references, joined with the location of the
+# name token that referenced it.
+# ---
+# sym_id:    SymbolId into the ResolveResult symbol table
+# name_span: byte span of the referencing name token (the IDENT / type name)
+# local:     true when the symbol's decl lives in this buffer's Ast (origin is
+#            this module), false for a cross-module `use`d / imported symbol
+pub rec SymbolRef {
+    sym_id:    res.SymbolId;
+    name_span: token.Span;
+    local:     bool;
+}
+
+# ref_at: the symbol referenced at a byte offset, or none when no resolved
+# expression or type name covers it. prefers the tightest expression; falls
+# back to a type-name position (a type annotation, return type, field type).
+# ---
+# a:      the buffer's parsed Ast
+# rr:     the buffer's ResolveResult side tables
+# own:    this buffer's module id (Symbol.origin equals it for local symbols)
+# offset: byte offset into the buffer
+# ret:    some(SymbolRef) for a resolved position, or none
+pub fun ref_at(a: *ast.Ast, rr: *res.ResolveResult, own: sess.ModuleId, offset: usize) Option[SymbolRef] {
+    val eid: id.ExprId = ast.offset_to_expr(a, offset);
+    if (eid != id.EXPR_NIL && rr.expr_resolved != nil && eid::u32 < rr.expr_count) {
+        val sid: res.SymbolId = rr.expr_resolved[eid];
+        if (sid != res.SYMBOL_NIL && sid < rr.symbol_count) {
+            val eo: Option[*expr.Expr] = ast.get_expr(a, eid);
+            if (is_some[*expr.Expr](eo)) {
+                ret some[SymbolRef](make_ref(rr, own, sid, name_span_of_expr(unwrap[*expr.Expr](eo))));
+            }
+        }
+    }
+
+    val tid: id.TypeId = ast.offset_to_type(a, offset);
+    if (tid != id.TYPE_NIL && rr.type_resolved != nil && tid::u32 < rr.type_count) {
+        val sid: res.SymbolId = rr.type_resolved[tid];
+        if (sid != res.SYMBOL_NIL && sid < rr.symbol_count) {
+            val tno: Option[token.Span] = type_name_span(a, tid);
+            if (is_some[token.Span](tno)) {
+                ret some[SymbolRef](make_ref(rr, own, sid, unwrap[token.Span](tno)));
+            }
+        }
+    }
+
+    # the cursor may sit on a declaration's own name (the binding site), which
+    # is not an expr or type node — resolve it through the decl_symbol table
+    # when the offset falls inside the decl's name span.
+    val did: id.DeclId = ast.offset_to_decl(a, offset);
+    if (did != id.DECL_NIL) {
+        if (rr.decl_symbol != nil && did::u32 < rr.decl_count) {
+            val sid: res.SymbolId = rr.decl_symbol[did];
+            if (sid != res.SYMBOL_NIL && sid < rr.symbol_count) {
+                val d_opt: Option[*decl.Decl] = ast.get_decl(a, did);
+                if (is_some[*decl.Decl](d_opt)) {
+                    val nso: Option[token.Span] = decl_name_span(unwrap[*decl.Decl](d_opt));
+                    if (is_some[token.Span](nso)) {
+                        val nspan: token.Span = unwrap[token.Span](nso);
+                        if (ast.span_contains(nspan, offset)) {
+                            ret some[SymbolRef](make_ref(rr, own, sid, nspan));
+                        }
+                    }
+                }
+            }
+        }
+
+        # a function's parameter and generic binding names are not decls — they
+        # bind SYM_PARAM / SYM_GENERIC symbols carrying (decl, slot). resolve a
+        # cursor on one of those binding names through the symbol table.
+        val bo: Option[SymbolRef] = binding_ref_in_decl(a, rr, own, did, offset);
+        if (is_some[SymbolRef](bo)) { ret bo; }
+    }
+
+    ret none[SymbolRef]();
+}
+
+# binding_ref_in_decl: a SymbolRef when `offset` falls on a function
+# parameter or generic binding name within decl `did`, or none. params and
+# generics carry no Decl node — their symbol is found by matching (decl, slot)
+# in the symbol table.
+fun binding_ref_in_decl(a: *ast.Ast, rr: *res.ResolveResult, own: sess.ModuleId, did: id.DeclId, offset: usize) Option[SymbolRef] {
+    val d_opt: Option[*decl.Decl] = ast.get_decl(a, did);
+    if (!is_some[*decl.Decl](d_opt)) { ret none[SymbolRef](); }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+
+    val gstart: u32 = generics_start_of(d);
+    val glen:   u32 = generics_len_of(d);
+    var gi: u32 = 0;
+    for (gi < glen) {
+        val gname: token.Span = a.generic_names[gstart + gi];
+        if (ast.span_contains(gname, offset)) {
+            val sid: res.SymbolId = find_binding_symbol(rr, res.SYM_GENERIC, did, gi);
+            if (sid != res.SYMBOL_NIL) { ret some[SymbolRef](make_ref(rr, own, sid, gname)); }
+        }
+        gi = gi + 1;
+    }
+
+    # only functions bind value parameters; rec / uni generics are handled above.
+    if (d.kind == decl.DECL_KIND_FUN) {
+        var pi: u32 = 0;
+        for (pi < d.data.fun_.params_len) {
+            val tn: *decl.TypedName = ?a.typed_names[d.data.fun_.params_start + pi];
+            if (ast.span_contains(tn.name, offset)) {
+                val sid: res.SymbolId = find_binding_symbol(rr, res.SYM_PARAM, did, pi);
+                if (sid != res.SYMBOL_NIL) { ret some[SymbolRef](make_ref(rr, own, sid, tn.name)); }
+            }
+            pi = pi + 1;
+        }
+    }
+
+    ret none[SymbolRef]();
+}
+
+# generics_start_of / generics_len_of: the generic-name pool slice of a decl
+# that may declare generics (fun / rec / uni), or 0 otherwise.
+fun generics_start_of(d: *decl.Decl) u32 {
+    if (d.kind == decl.DECL_KIND_FUN) { ret d.data.fun_.generics_start; }
+    if (d.kind == decl.DECL_KIND_REC) { ret d.data.rec_.generics_start; }
+    if (d.kind == decl.DECL_KIND_UNI) { ret d.data.uni_.generics_start; }
+    ret 0;
+}
+fun generics_len_of(d: *decl.Decl) u32 {
+    if (d.kind == decl.DECL_KIND_FUN) { ret d.data.fun_.generics_len; }
+    if (d.kind == decl.DECL_KIND_REC) { ret d.data.rec_.generics_len; }
+    if (d.kind == decl.DECL_KIND_UNI) { ret d.data.uni_.generics_len; }
+    ret 0;
+}
+
+# find_binding_symbol: the SymbolId of the `kind` symbol declared by decl
+# `did` at `slot` (the param / generic index), or SYMBOL_NIL.
+fun find_binding_symbol(rr: *res.ResolveResult, kind: res.SymKind, did: id.DeclId, slot: u32) res.SymbolId {
+    var i: u32 = 0;
+    for (i < rr.symbol_count) {
+        val sym: *res.Symbol = ?rr.symbols[i];
+        if (sym.kind == kind && sym.decl == did && sym.slot == slot) { ret i::res.SymbolId; }
+        i = i + 1;
+    }
+    ret res.SYMBOL_NIL;
+}
+
+# binding_name_span: the binding name span of a SYM_PARAM / SYM_GENERIC symbol
+# (looked up by its (decl, slot) in the owning decl), or none. lets the
+# references / rename walk include a param / generic's binding site, which the
+# expr / type / decl side tables never record. value parameters belong to a
+# function; generics may belong to a function, record, or union.
+# ---
+# a:   the Ast holding the declaration
+# sym: the param / generic symbol whose binding span is wanted
+# ret: some(name span) of the binding, or none
+pub fun binding_name_span(a: *ast.Ast, sym: *res.Symbol) Option[token.Span] {
+    if (sym.kind != res.SYM_PARAM && sym.kind != res.SYM_GENERIC) { ret none[token.Span](); }
+    if (sym.decl == id.DECL_NIL) { ret none[token.Span](); }
+    val d_opt: Option[*decl.Decl] = ast.get_decl(a, sym.decl);
+    if (!is_some[*decl.Decl](d_opt)) { ret none[token.Span](); }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+
+    if (sym.kind == res.SYM_GENERIC) {
+        if (sym.slot >= generics_len_of(d)) { ret none[token.Span](); }
+        ret some[token.Span](a.generic_names[generics_start_of(d) + sym.slot]);
+    }
+    if (d.kind != decl.DECL_KIND_FUN || sym.slot >= d.data.fun_.params_len) { ret none[token.Span](); }
+    ret some[token.Span]((?a.typed_names[d.data.fun_.params_start + sym.slot]).name);
+}
+
+# make_ref: build a SymbolRef, flagging whether the symbol is local to this
+# buffer's module.
+fun make_ref(rr: *res.ResolveResult, own: sess.ModuleId, sid: res.SymbolId, name_span: token.Span) SymbolRef {
+    var sr: SymbolRef;
+    sr.sym_id    = sid;
+    sr.name_span = name_span;
+    sr.local     = symbol_is_local(rr, own, sid);
+    ret sr;
+}
+
+# symbol_is_local: whether `sid`'s decl is owned by `own` (this buffer's
+# module) and so addressable in this Ast. primitives and imported / used
+# symbols originate elsewhere.
+pub fun symbol_is_local(rr: *res.ResolveResult, own: sess.ModuleId, sid: res.SymbolId) bool {
+    if (sid >= rr.symbol_count) { ret false; }
+    val sym: *res.Symbol = ?rr.symbols[sid];
+    if (sym.kind == res.SYM_PRIM) { ret false; }
+    if (sym.decl == id.DECL_NIL) { ret false; }
+    ret sym.origin == own;
+}
+
+# top_level_count: the number of declarations at the buffer's module scope —
+# the count documentSymbol enumerates. zero when the Ast has no root module.
+# ---
+# a:   the buffer's parsed Ast
+# ret: the module-scope decl count
+pub fun top_level_count(a: *ast.Ast) u32 {
+    val mo: Option[*module.Module] = ast.get_module(a, a.root_module);
+    if (!is_some[*module.Module](mo)) { ret 0; }
+    ret unwrap[*module.Module](mo).decls_len;
+}
+
+# top_level_decl: the DeclId of the `i`-th module-scope declaration, or DECL_NIL
+# when out of range. resolves through the module's decl-id list rather than the
+# flat `Ast.decls` array, so nested declarations (a `val` inside a function
+# body) are excluded.
+# ---
+# a: the buffer's parsed Ast
+# i: index into the module's top-level decl list
+# ret: the DeclId, or DECL_NIL
+pub fun top_level_decl(a: *ast.Ast, i: u32) id.DeclId {
+    val mo: Option[*module.Module] = ast.get_module(a, a.root_module);
+    if (!is_some[*module.Module](mo)) { ret id.DECL_NIL; }
+    val m: *module.Module = unwrap[*module.Module](mo);
+    if (i >= m.decls_len) { ret id.DECL_NIL; }
+    ret a.decl_ids[m.decls_start + i];
+}
+
+# symbol: the Symbol for a SymbolId, or none when out of range.
+# ---
+# rr:  the ResolveResult holding the symbol table
+# sid: symbol id to look up
+# ret: some(*Symbol) into rr.symbols, or none
+pub fun symbol(rr: *res.ResolveResult, sid: res.SymbolId) Option[*res.Symbol] {
+    if (sid >= rr.symbol_count) { ret none[*res.Symbol](); }
+    ret some[*res.Symbol](?rr.symbols[sid]);
+}
+
+# decl_span_of: the full declaration span of a local symbol's decl, or none
+# when the decl id is absent / out of range. drives go-to-definition.
+# ---
+# a:   the Ast owning the decl
+# sym: the symbol whose decl span is wanted
+# ret: some(span) of the decl, or none
+pub fun decl_span_of(a: *ast.Ast, sym: *res.Symbol) Option[token.Span] {
+    if (sym.decl == id.DECL_NIL) { ret none[token.Span](); }
+    val d_opt: Option[*decl.Decl] = ast.get_decl(a, sym.decl);
+    if (!is_some[*decl.Decl](d_opt)) { ret none[token.Span](); }
+    ret some[token.Span](unwrap[*decl.Decl](d_opt).span);
+}
+
+# decl_name_span_of: the span of a local symbol's declared name identifier (the
+# selection range for go-to-definition / documentSymbol), or none. for a decl
+# the resolver attached the symbol to, the symbol's name lives at a known span
+# within the decl node.
+# ---
+# a:   the Ast owning the decl
+# sym: the symbol whose name span is wanted
+# ret: some(span) of the name identifier, or none
+pub fun decl_name_span_of(a: *ast.Ast, sym: *res.Symbol) Option[token.Span] {
+    if (sym.decl == id.DECL_NIL) { ret none[token.Span](); }
+    val d_opt: Option[*decl.Decl] = ast.get_decl(a, sym.decl);
+    if (!is_some[*decl.Decl](d_opt)) { ret none[token.Span](); }
+    ret decl_name_span(unwrap[*decl.Decl](d_opt));
+}
+
+# definition_name_span: the span go-to-definition should land on for a local
+# symbol — the binding name. for a param / generic this is its binding site in
+# the function signature; for every other symbol it is the decl's name. none
+# when the symbol has no addressable binding in this Ast.
+# ---
+# a:   the Ast owning the symbol's declaration
+# sym: the symbol whose definition span is wanted
+# ret: some(span) of the binding name, or none
+pub fun definition_name_span(a: *ast.Ast, sym: *res.Symbol) Option[token.Span] {
+    if (sym.kind == res.SYM_PARAM || sym.kind == res.SYM_GENERIC) {
+        ret binding_name_span(a, sym);
+    }
+    ret decl_name_span_of(a, sym);
+}
+
+# decl_name_span: the name identifier span of a decl node, or none for a decl
+# without a single name (use / fwd / test / comptime / error).
+pub fun decl_name_span(d: *decl.Decl) Option[token.Span] {
+    if (d.kind == decl.DECL_KIND_FUN) { ret some[token.Span](d.data.fun_.name); }
+    if (d.kind == decl.DECL_KIND_REC) { ret some[token.Span](d.data.rec_.name); }
+    if (d.kind == decl.DECL_KIND_UNI) { ret some[token.Span](d.data.uni_.name); }
+    if (d.kind == decl.DECL_KIND_DEF) { ret some[token.Span](d.data.def_.name); }
+    if (d.kind == decl.DECL_KIND_VAL) { ret some[token.Span](d.data.bind.name); }
+    if (d.kind == decl.DECL_KIND_VAR) { ret some[token.Span](d.data.bind.name); }
+    ret none[token.Span]();
+}
+
+# signature_span: the byte span of a local symbol's declaration header — the
+# text to render on hover. for a function with a body it runs from the decl
+# start up to (not into) the body block, so the parameter list and return type
+# show without the body; for every other decl it is the whole decl span. none
+# when the decl id is absent / out of range.
+# ---
+# a:   the Ast owning the decl
+# sym: the symbol whose signature span is wanted
+# ret: some(span) of the header text, or none
+pub fun signature_span(a: *ast.Ast, sym: *res.Symbol) Option[token.Span] {
+    if (sym.kind == res.SYM_GENERIC) { ret binding_name_span(a, sym); }
+    if (sym.kind == res.SYM_PARAM)   { ret param_signature_span(a, sym); }
+
+    if (sym.decl == id.DECL_NIL) { ret none[token.Span](); }
+    val d_opt: Option[*decl.Decl] = ast.get_decl(a, sym.decl);
+    if (!is_some[*decl.Decl](d_opt)) { ret none[token.Span](); }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+
+    if (d.kind == decl.DECL_KIND_FUN && d.data.fun_.body != id.STMT_NIL) {
+        val so: Option[*stmt.Stmt] = ast.get_stmt(a, d.data.fun_.body);
+        if (is_some[*stmt.Stmt](so)) {
+            val body_off: usize = unwrap[*stmt.Stmt](so).span.offset;
+            if (body_off > d.span.offset) {
+                var sp: token.Span;
+                sp.offset = d.span.offset;
+                sp.len    = body_off - d.span.offset;
+                ret some[token.Span](sp);
+            }
+        }
+    }
+    ret some[token.Span](d.span);
+}
+
+# param_signature_span: the `name: type` span of a parameter symbol — from its
+# binding name through the end of its type annotation — for hover. falls back
+# to just the name span when the type node is unavailable. none for a non-param.
+fun param_signature_span(a: *ast.Ast, sym: *res.Symbol) Option[token.Span] {
+    val no: Option[token.Span] = binding_name_span(a, sym);
+    if (!is_some[token.Span](no)) { ret none[token.Span](); }
+    val name: token.Span = unwrap[token.Span](no);
+
+    val d_opt: Option[*decl.Decl] = ast.get_decl(a, sym.decl);
+    if (!is_some[*decl.Decl](d_opt)) { ret some[token.Span](name); }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+    if (d.kind != decl.DECL_KIND_FUN || sym.slot >= d.data.fun_.params_len) { ret some[token.Span](name); }
+
+    val tn: *decl.TypedName = ?a.typed_names[d.data.fun_.params_start + sym.slot];
+    if (tn.ty == id.TYPE_NIL) { ret some[token.Span](name); }
+    val to: Option[*atype.Type] = ast.get_type(a, tn.ty);
+    if (!is_some[*atype.Type](to)) { ret some[token.Span](name); }
+    val tspan: token.Span = unwrap[*atype.Type](to).span;
+
+    val end: usize = tspan.offset + tspan.len;
+    if (end <= name.offset) { ret some[token.Span](name); }
+    var sp: token.Span;
+    sp.offset = name.offset;
+    sp.len    = end - name.offset;
+    ret some[token.Span](sp);
+}
+
+# kind_label: a human-readable label for a symbol kind, for hover rendering.
+# ---
+# kind: a res.SYM_* value
+# ret:  a short lowercase keyword-like label
+pub fun kind_label(kind: res.SymKind) str {
+    if (kind == res.SYM_FUN)      { ret "fun"; }
+    if (kind == res.SYM_REC)      { ret "rec"; }
+    if (kind == res.SYM_UNI)      { ret "uni"; }
+    if (kind == res.SYM_DEF)      { ret "def"; }
+    if (kind == res.SYM_VAL)      { ret "val"; }
+    if (kind == res.SYM_VAR)      { ret "var"; }
+    if (kind == res.SYM_PARAM)    { ret "param"; }
+    if (kind == res.SYM_GENERIC)  { ret "generic"; }
+    if (kind == res.SYM_USE)      { ret "module"; }
+    if (kind == res.SYM_IMPORTED) { ret "import"; }
+    if (kind == res.SYM_TEST)     { ret "test"; }
+    if (kind == res.SYM_PRIM)     { ret "type"; }
+    ret "symbol";
+}
+
+# lsp_symbol_kind: the LSP SymbolKind number for a symbol kind (documentSymbol).
+# 12 = Function, 23 = Struct, 10 = Enum, 13 = Variable, 14 = Constant,
+# 26 = TypeParameter, 5 = Method, 8 = Field, 2 = Module, 6 = Property.
+# ---
+# kind: a res.SYM_* value
+# ret:  the LSP SymbolKind code
+pub fun lsp_symbol_kind(kind: res.SymKind) i64 {
+    if (kind == res.SYM_FUN)      { ret 12; }
+    if (kind == res.SYM_REC)      { ret 23; }
+    if (kind == res.SYM_UNI)      { ret 10; }
+    if (kind == res.SYM_DEF)      { ret 26; }
+    if (kind == res.SYM_VAL)      { ret 14; }
+    if (kind == res.SYM_VAR)      { ret 13; }
+    if (kind == res.SYM_PARAM)    { ret 13; }
+    if (kind == res.SYM_GENERIC)  { ret 26; }
+    if (kind == res.SYM_TEST)     { ret 12; }
+    ret 13;
+}
+
+# lsp_completion_kind: the LSP CompletionItemKind number for a symbol kind.
+# 3 = Function, 22 = Struct, 13 = Enum, 6 = Variable, 21 = Constant,
+# 25 = TypeParameter, 9 = Module, 5 = Field.
+# ---
+# kind: a res.SYM_* value
+# ret:  the LSP CompletionItemKind code
+pub fun lsp_completion_kind(kind: res.SymKind) i64 {
+    if (kind == res.SYM_FUN)      { ret 3; }
+    if (kind == res.SYM_REC)      { ret 22; }
+    if (kind == res.SYM_UNI)      { ret 13; }
+    if (kind == res.SYM_DEF)      { ret 25; }
+    if (kind == res.SYM_VAL)      { ret 21; }
+    if (kind == res.SYM_VAR)      { ret 6; }
+    if (kind == res.SYM_PARAM)    { ret 6; }
+    if (kind == res.SYM_GENERIC)  { ret 25; }
+    if (kind == res.SYM_USE)      { ret 9; }
+    if (kind == res.SYM_IMPORTED) { ret 3; }
+    if (kind == res.SYM_PRIM)     { ret 25; }
+    ret 6;
+}
+
+# expr_ref_span: the name span of expr `eid` when it resolves to `target`, or
+# none. used to enumerate every reference to a symbol (references / rename):
+# the server walks all expr ids and collects the spans this returns.
+# ---
+# a:      the Ast holding the expr
+# rr:     the ResolveResult side tables
+# eid:    expr id to test
+# target: the symbol every reference must resolve to
+# ret:    some(name span) when eid references target, or none
+pub fun expr_ref_span(a: *ast.Ast, rr: *res.ResolveResult, eid: id.ExprId, target: res.SymbolId) Option[token.Span] {
+    if (rr.expr_resolved == nil || eid::u32 >= rr.expr_count) { ret none[token.Span](); }
+    if (rr.expr_resolved[eid] != target) { ret none[token.Span](); }
+    val eo: Option[*expr.Expr] = ast.get_expr(a, eid);
+    if (!is_some[*expr.Expr](eo)) { ret none[token.Span](); }
+    ret some[token.Span](name_span_of_expr(unwrap[*expr.Expr](eo)));
+}
+
+# type_ref_span: the name span of type `tid` when it resolves to `target`, or
+# none. the type-position analogue of expr_ref_span.
+# ---
+# a:      the Ast holding the type
+# rr:     the ResolveResult side tables
+# tid:    type id to test
+# target: the symbol every reference must resolve to
+# ret:    some(name span) when tid references target, or none
+pub fun type_ref_span(a: *ast.Ast, rr: *res.ResolveResult, tid: id.TypeId, target: res.SymbolId) Option[token.Span] {
+    if (rr.type_resolved == nil || tid::u32 >= rr.type_count) { ret none[token.Span](); }
+    if (rr.type_resolved[tid] != target) { ret none[token.Span](); }
+    ret type_name_span(a, tid);
+}
+
+# completion_candidate: whether symbol `sid` should be offered as a top-level
+# completion, i.e. a name a statement/expression position could reference. the
+# editor resolves a single file with no exposed scope chain, so completion
+# offers the file's module-level declarations, its `use` aliases and imports,
+# and the primitive type names — not lexically scoped locals, which need the
+# resolver's scope stack. duplicate-name symbols are deduped by the caller.
+# ---
+# rr:  the ResolveResult holding the symbol table
+# sid: symbol id to test
+# ret: true when the symbol is a top-level completion candidate
+pub fun completion_candidate(rr: *res.ResolveResult, sid: res.SymbolId) bool {
+    if (sid >= rr.symbol_count) { ret false; }
+    val sym: *res.Symbol = ?rr.symbols[sid];
+    if (sym.name == intern.STR_NIL) { ret false; }
+    if (sym.kind == res.SYM_PARAM)   { ret false; }
+    if (sym.kind == res.SYM_GENERIC) { ret false; }
+    if (sym.kind == res.SYM_TEST)    { ret false; }
+    ret true;
+}
+
+# decl_ref_span: the name span of decl `did` when its declared symbol is
+# `target`, or none. lets the references / rename walk include the declaration
+# site itself, which the expr / type side tables never record (a decl binds its
+# name through `decl_symbol`, not `expr_resolved`).
+# ---
+# a:      the Ast holding the decl
+# rr:     the ResolveResult side tables
+# did:    decl id to test
+# target: the symbol the decl must declare
+# ret:    some(name span) when did declares target, or none
+pub fun decl_ref_span(a: *ast.Ast, rr: *res.ResolveResult, did: id.DeclId, target: res.SymbolId) Option[token.Span] {
+    if (rr.decl_symbol == nil || did::u32 >= rr.decl_count) { ret none[token.Span](); }
+    if (rr.decl_symbol[did] != target) { ret none[token.Span](); }
+    val d_opt: Option[*decl.Decl] = ast.get_decl(a, did);
+    if (!is_some[*decl.Decl](d_opt)) { ret none[token.Span](); }
+    ret decl_name_span(unwrap[*decl.Decl](d_opt));
+}
+
+# name_span_of_expr: the span identifying an expression's referenced name. for
+# an IDENT the whole expr span is the name; for a member access the name is the
+# leaf after the dot. other expressions fall back to their own span.
+fun name_span_of_expr(e: *expr.Expr) token.Span {
+    if (e.kind == expr.EXPR_KIND_MEMBER) { ret e.data.member.name; }
+    ret e.span;
+}
+
+# type_name_span: the name span of a named type node, or none when the type at
+# `tid` is not a named reference (a pointer / array / fun type wrapping it).
+fun type_name_span(a: *ast.Ast, tid: id.TypeId) Option[token.Span] {
+    val t_opt: Option[*atype.Type] = ast.get_type(a, tid);
+    if (!is_some[*atype.Type](t_opt)) { ret none[token.Span](); }
+    val t: *atype.Type = unwrap[*atype.Type](t_opt);
+    if (t.kind == atype.TYPE_KIND_NAMED) { ret some[token.Span](t.data.named.name); }
+    ret none[token.Span]();
+}

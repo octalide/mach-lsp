@@ -1,0 +1,115 @@
+# mls.positions: byte-offset <-> LSP position conversions and span helpers.
+#
+# the LSP addresses text by 0-based (line, character); the compiler addresses
+# it by byte offset (and reports 1-based line/col via `source.position`). the
+# language features pivot on byte offset — `ast.offset_to_*` takes an offset
+# and the resolve side tables index by node id — so every request first maps
+# the incoming LSP position to an offset, and every response maps a `token.Span`
+# back to an LSP range. these helpers are the single conversion point.
+#
+# columns are treated as byte columns, matching the diagnostics slice: the
+# editor protocol nominally measures characters in UTF-16 code units, but the
+# whole server (parser spans, `source.position`) is byte-oriented, so a
+# consistent byte interpretation keeps offsets and ranges aligned for ASCII
+# source. multi-byte handling lands with a column-encoding negotiation.
+
+use std.types.bool.bool;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_some;
+use std.types.option.unwrap;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+
+use mem: std.memory;
+
+use src:   mach.lang.source;
+use token: mach.lang.fe.token;
+
+# LspRange: a 0-based LSP range, the form a `Location` / hover range needs.
+# ---
+# start_line: 0-based start line
+# start_char: 0-based start character (byte column)
+# end_line:   0-based end line
+# end_char:   0-based end character (byte column)
+pub rec LspRange {
+    start_line: usize;
+    start_char: usize;
+    end_line:   usize;
+    end_char:   usize;
+}
+
+# offset_at: the byte offset of a 0-based LSP (line, character) in `file`, or
+# none when the line is out of range. the character is added to the line's
+# start offset and clamped to the file length.
+# ---
+# file: the source file the position addresses
+# line: 0-based LSP line
+# ch:   0-based LSP character (byte column)
+# ret:  some(offset) within the file, or none for an out-of-range line
+pub fun offset_at(file: *src.SourceFile, line: usize, ch: usize) Option[usize] {
+    val ls: Option[usize] = src.line_start(file, line + 1);
+    if (!is_some[usize](ls)) { ret none[usize](); }
+    var off: usize = unwrap[usize](ls) + ch;
+    val text_len: usize = str_len(file.text);
+    if (off > text_len) { off = text_len; }
+    ret some[usize](off);
+}
+
+# range_of: the LSP range covering a byte span in `file`. a zero-length span
+# yields an empty range at its offset.
+# ---
+# file: the source file the span addresses
+# span: the byte range to convert
+# ret:  the equivalent 0-based LSP range
+pub fun range_of(file: *src.SourceFile, span: token.Span) LspRange {
+    var r: LspRange;
+    val sp: src.Position = src.position(file, span.offset);
+    r.start_line = dec(sp.line);
+    r.start_char = dec(sp.col);
+
+    var end_off: usize = span.offset + span.len;
+    if (span.len == 0) { end_off = span.offset; }
+    val ep: src.Position = src.position(file, end_off);
+    r.end_line = dec(ep.line);
+    r.end_char = dec(ep.col);
+    if (r.end_line == r.start_line && r.end_char < r.start_char) { r.end_char = r.start_char; }
+    ret r;
+}
+
+# span_text: an owned copy of the source text a span covers, nil-terminated, or
+# nil on an empty span / allocation failure. used to render the spelling of a
+# decl name or type as written.
+# ---
+# file:  the source file the span addresses
+# span:  the byte range to copy
+# alloc: allocator backing the returned string
+# ret:   owned copy of the span text, or nil
+pub fun span_text(file: *src.SourceFile, span: token.Span, alloc: *Allocator) str {
+    if (span.len == 0) { ret nil; }
+    val text_len: usize = str_len(file.text);
+    if (span.offset >= text_len) { ret nil; }
+    var len: usize = span.len;
+    if (span.offset + len > text_len) { len = text_len - span.offset; }
+
+    val r: Result[*u8, str] = allocate[u8](alloc, len + 1);
+    if (is_err[*u8, str](r)) { ret nil; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+    mem.raw_copy(buf::ptr, (file.text::usize + span.offset)::ptr, len);
+    buf[len] = 0;
+    ret buf::str;
+}
+
+# dec: clamp `n - 1` at 0 (1-based compiler position -> 0-based LSP position).
+fun dec(n: usize) usize {
+    if (n == 0) { ret 0; }
+    ret n - 1;
+}
