@@ -124,11 +124,12 @@ fun binding_ref_in_decl(a: *ast.Ast, rr: *res.ResolveResult, own: sess.ModuleId,
     val d_opt: Option[*decl.Decl] = ast.get_decl(a, did);
     if (!is_some[*decl.Decl](d_opt)) { ret none[SymbolRef](); }
     val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
-    if (d.kind != decl.DECL_KIND_FUN) { ret none[SymbolRef](); }
 
+    val gstart: u32 = generics_start_of(d);
+    val glen:   u32 = generics_len_of(d);
     var gi: u32 = 0;
-    for (gi < d.data.fun_.generics_len) {
-        val gname: token.Span = a.generic_names[d.data.fun_.generics_start + gi];
+    for (gi < glen) {
+        val gname: token.Span = a.generic_names[gstart + gi];
         if (ast.span_contains(gname, offset)) {
             val sid: res.SymbolId = find_binding_symbol(rr, res.SYM_GENERIC, did, gi);
             if (sid != res.SYMBOL_NIL) { ret some[SymbolRef](make_ref(rr, own, sid, gname)); }
@@ -136,17 +137,35 @@ fun binding_ref_in_decl(a: *ast.Ast, rr: *res.ResolveResult, own: sess.ModuleId,
         gi = gi + 1;
     }
 
-    var pi: u32 = 0;
-    for (pi < d.data.fun_.params_len) {
-        val tn: *decl.TypedName = ?a.typed_names[d.data.fun_.params_start + pi];
-        if (ast.span_contains(tn.name, offset)) {
-            val sid: res.SymbolId = find_binding_symbol(rr, res.SYM_PARAM, did, pi);
-            if (sid != res.SYMBOL_NIL) { ret some[SymbolRef](make_ref(rr, own, sid, tn.name)); }
+    # only functions bind value parameters; rec / uni generics are handled above.
+    if (d.kind == decl.DECL_KIND_FUN) {
+        var pi: u32 = 0;
+        for (pi < d.data.fun_.params_len) {
+            val tn: *decl.TypedName = ?a.typed_names[d.data.fun_.params_start + pi];
+            if (ast.span_contains(tn.name, offset)) {
+                val sid: res.SymbolId = find_binding_symbol(rr, res.SYM_PARAM, did, pi);
+                if (sid != res.SYMBOL_NIL) { ret some[SymbolRef](make_ref(rr, own, sid, tn.name)); }
+            }
+            pi = pi + 1;
         }
-        pi = pi + 1;
     }
 
     ret none[SymbolRef]();
+}
+
+# generics_start_of / generics_len_of: the generic-name pool slice of a decl
+# that may declare generics (fun / rec / uni), or 0 otherwise.
+fun generics_start_of(d: *decl.Decl) u32 {
+    if (d.kind == decl.DECL_KIND_FUN) { ret d.data.fun_.generics_start; }
+    if (d.kind == decl.DECL_KIND_REC) { ret d.data.rec_.generics_start; }
+    if (d.kind == decl.DECL_KIND_UNI) { ret d.data.uni_.generics_start; }
+    ret 0;
+}
+fun generics_len_of(d: *decl.Decl) u32 {
+    if (d.kind == decl.DECL_KIND_FUN) { ret d.data.fun_.generics_len; }
+    if (d.kind == decl.DECL_KIND_REC) { ret d.data.rec_.generics_len; }
+    if (d.kind == decl.DECL_KIND_UNI) { ret d.data.uni_.generics_len; }
+    ret 0;
 }
 
 # find_binding_symbol: the SymbolId of the `kind` symbol declared by decl
@@ -162,11 +181,12 @@ fun find_binding_symbol(rr: *res.ResolveResult, kind: res.SymKind, did: id.DeclI
 }
 
 # binding_name_span: the binding name span of a SYM_PARAM / SYM_GENERIC symbol
-# (looked up by its (decl, slot) in the function decl), or none. lets the
+# (looked up by its (decl, slot) in the owning decl), or none. lets the
 # references / rename walk include a param / generic's binding site, which the
-# expr / type / decl side tables never record.
+# expr / type / decl side tables never record. value parameters belong to a
+# function; generics may belong to a function, record, or union.
 # ---
-# a:   the Ast holding the function decl
+# a:   the Ast holding the declaration
 # sym: the param / generic symbol whose binding span is wanted
 # ret: some(name span) of the binding, or none
 pub fun binding_name_span(a: *ast.Ast, sym: *res.Symbol) Option[token.Span] {
@@ -175,13 +195,12 @@ pub fun binding_name_span(a: *ast.Ast, sym: *res.Symbol) Option[token.Span] {
     val d_opt: Option[*decl.Decl] = ast.get_decl(a, sym.decl);
     if (!is_some[*decl.Decl](d_opt)) { ret none[token.Span](); }
     val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
-    if (d.kind != decl.DECL_KIND_FUN) { ret none[token.Span](); }
 
     if (sym.kind == res.SYM_GENERIC) {
-        if (sym.slot >= d.data.fun_.generics_len) { ret none[token.Span](); }
-        ret some[token.Span](a.generic_names[d.data.fun_.generics_start + sym.slot]);
+        if (sym.slot >= generics_len_of(d)) { ret none[token.Span](); }
+        ret some[token.Span](a.generic_names[generics_start_of(d) + sym.slot]);
     }
-    if (sym.slot >= d.data.fun_.params_len) { ret none[token.Span](); }
+    if (d.kind != decl.DECL_KIND_FUN || sym.slot >= d.data.fun_.params_len) { ret none[token.Span](); }
     ret some[token.Span]((?a.typed_names[d.data.fun_.params_start + sym.slot]).name);
 }
 
