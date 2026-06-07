@@ -34,6 +34,7 @@ use transport: mls.transport;
 use json:      mls.json;
 use documents: mls.documents;
 use diagnostics: mls.diagnostics;
+use language:  mls.language;
 use trace:     mls.trace;
 
 # lifecycle statuses.
@@ -173,6 +174,42 @@ fun dispatch(srv: *Server, msg: *transport.Message) {
         ret;
     }
 
+    if (str_equals(method, "textDocument/hover")) {
+        json.free_str(method, srv.alloc);
+        handle_feature(srv, body, 0);
+        ret;
+    }
+    if (str_equals(method, "textDocument/definition")) {
+        json.free_str(method, srv.alloc);
+        handle_feature(srv, body, 1);
+        ret;
+    }
+    if (str_equals(method, "textDocument/references")) {
+        json.free_str(method, srv.alloc);
+        handle_feature(srv, body, 2);
+        ret;
+    }
+    if (str_equals(method, "textDocument/rename")) {
+        json.free_str(method, srv.alloc);
+        handle_feature(srv, body, 3);
+        ret;
+    }
+    if (str_equals(method, "textDocument/prepareRename")) {
+        json.free_str(method, srv.alloc);
+        handle_feature(srv, body, 4);
+        ret;
+    }
+    if (str_equals(method, "textDocument/documentSymbol")) {
+        json.free_str(method, srv.alloc);
+        handle_feature(srv, body, 5);
+        ret;
+    }
+    if (str_equals(method, "textDocument/completion")) {
+        json.free_str(method, srv.alloc);
+        handle_feature(srv, body, 6);
+        ret;
+    }
+
     trace.log("unhandled method: ");
     trace.log(method);
     trace.log("\n");
@@ -187,7 +224,7 @@ fun handle_initialize(srv: *Server, body: str) {
     if (id == nil) { ret; }
 
     val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
-    val result: str = ",\"result\":{\"capabilities\":{\"textDocumentSync\":1},\"serverInfo\":{\"name\":\"mach-lsp\"}}}";
+    val result: str = ",\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\"}}}";
     send_concat2(srv, prefix, id, result);
     json.free_str(id, srv.alloc);
 
@@ -249,6 +286,26 @@ fun handle_did_close(srv: *Server, body: str) {
     documents.close(?srv.docs, uri);
     diagnostics.clear(srv.alloc, uri);
     json.free_str(uri, srv.alloc);
+}
+
+# handle_feature: route a language-feature request to its handler in `language`.
+# the document uri is extracted once here and passed through; the feature code
+# resolves the buffer, pivots the cursor, and replies. `which` selects the
+# feature: 0 hover, 1 definition, 2 references, 3 rename, 4 prepareRename,
+# 5 documentSymbol, 6 completion. an unknown / unopened uri still gets a
+# null / empty reply from the feature so the client is never left waiting.
+fun handle_feature(srv: *Server, body: str, which: i64) {
+    val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
+
+    if (which == 0) { language.hover(?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 1) { language.definition(?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 2) { language.references(?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 3) { language.rename(?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 4) { language.prepare_rename(?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 5) { language.document_symbol(?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 6) { language.completion(?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
+
+    if (uri != nil) { json.free_str(uri, srv.alloc); }
 }
 
 # publish_for: register/update `uri`'s buffer and publish its diagnostics.
