@@ -1,7 +1,7 @@
 [project]
 id = "mls"
 name = "Mach Language Server"
-version = "0.4.0"
+version = "0.5.0"
 dir_src = "src"
 dir_dep = "dep"
 dir_out = "out"
