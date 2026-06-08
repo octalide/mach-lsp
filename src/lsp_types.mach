@@ -1,0 +1,33 @@
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+
+use allocator: std.allocator;
+
+use workspace: mach_lsp.workspace;
+
+# mach_lsp.lsp_types: shared type definitions for the LSP server.
+# ---
+# this module exists to break the circular dependency between server.mach
+# and handler.mach. both modules import types from here instead of from
+# each other.
+
+# ServerStatus: tracks the current phase of the LSP lifecycle.
+pub val STATUS_UNINITIALIZED: u8 = 0;
+pub val STATUS_INITIALIZING:  u8 = 1;
+pub val STATUS_RUNNING:       u8 = 2;
+pub val STATUS_SHUTTING_DOWN: u8 = 3;
+pub val STATUS_EXITED:        u8 = 4;
+
+# Server: the top-level language server state.
+# ---
+# status:     current lifecycle phase
+# exit_code:  exit code to return from the process
+# alloc:      allocator used for all server-owned memory
+# ws:         workspace state (open documents, project info)
+pub rec Server {
+    status:    u8;
+    exit_code: i64;
+    alloc:     allocator.Allocator;
+    ws:        workspace.Workspace;
+}
