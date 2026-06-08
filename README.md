@@ -1,137 +1,113 @@
 # mach-lsp
 
-Language server for the [Mach](https://github.com/octalide/mach) programming language, implementing the [Language Server Protocol](https://microsoft.github.io/language-server-protocol/).
+A language server for the [Mach](https://github.com/octalide/mach) programming
+language, built directly on the compiler-as-library editor surface
+(`mach.lang.editor`).
 
-Written in Mach. Uses the Mach compiler as a dependency for real semantic analysis — no reimplemented parsers, no semantic drift.
+## Status
+
+This server implements the **diagnostics** vertical slice plus the
+**language features** end-to-end, all on the `mach.lang.editor` surface:
+
+- LSP lifecycle: `initialize`, `initialized`, `shutdown`, `exit`.
+- Document synchronization (full-text): `textDocument/didOpen`,
+  `didChange`, `didClose`.
+- Diagnostics: on open/change the buffer text is fed to `mach.lang.editor`
+  (`open` / `update` / `diagnostics`); every reported `diagnostic.Diagnostic`
+  is mapped — its byte span through `source.position` to a 0-based LSP range,
+  its severity to the LSP scale — and published via
+  `textDocument/publishDiagnostics`.
+- Language features over the buffer's resolved analysis (`editor.resolve` +
+  `ast.offset_to_*` + the `resolve.ResolveResult` side tables):
+  - `textDocument/hover` — the declaration header (or kind + name) of the
+    symbol at the cursor, as a fenced `mach` code block.
+  - `textDocument/definition` — the resolved symbol's declaration `Location`.
+  - `textDocument/references` — every in-file position resolving to the same
+    symbol (declaration plus use-sites).
+  - `textDocument/rename` / `prepareRename` — a `WorkspaceEdit` renaming every
+    in-file reference; `prepareRename` returns the name range.
+  - `textDocument/documentSymbol` — the module's top-level declarations as a
+    `DocumentSymbol` list.
+  - `textDocument/completion` — the file's named declarations, `use` aliases,
+    and the primitive type names.
+
+### Single-file scope
+
+The editor resolves one buffer in isolation with an empty dependency set, so
+resolution is **single-file**. A reference to a locally declared symbol binds
+fully (its declaration is in the same buffer); a symbol imported through a
+`use` resolves against dependency modules this server never loaded, so:
+
+- hover/definition/references/rename are complete for **local** symbols;
+- a cross-module `use`d symbol does not resolve, so those features return
+  `null`/empty for it rather than a wrong answer — never a faked result;
+- completion is a flat list of the file's named symbols and the primitives,
+  not a lexically scoped view (the resolver's scope chain is not exposed by
+  the side tables).
+
+Full-project resolution (cross-module go-to-def, workspace symbols,
+scope-aware completion) needs the driver's dependency loading wired into the
+editor surface, tracked upstream.
+
+## Building
+
+The compiler and standard library are vendored as git submodules under `dep/`.
+Build with a Mach compiler binary (v1.0.0 or newer):
+
+```sh
+git submodule update --init
+mach build
+```
+
+The server binary is produced at `out/linux/bin/mach-lsp`.
+
+## How the compiler dependency is wired
+
+`dep/mach` (id `mach`) provides the `mach.lang.*` namespace, including the
+`mach.lang.editor` query surface this server binds to; `dep/mach-std` (id
+`std`) provides `std.*`. Both are git submodules pinned to the `dev` branch of
+their upstream repositories. The `mach.toml` `[deps.*]` entries declare them as
+remote dependencies tracking `branch/dev`.
 
 ## Architecture
 
-`mach-lsp` is a standalone project that imports the Mach compiler (`mach`) as a dependency via Mach's own module system. This means the LSP uses the **exact same** lexer, parser, semantic analyzer, symbol table, and type system as the compiler itself.
-
-```
-mach-lsp/
-├── mach.toml               # project config; declares mach + mach-std as deps
-├── src/
-│   ├── main.mach            # entry point — initializes server and enters loop
-│   ├── server.mach          # lifecycle management and message dispatch
-│   ├── transport.mach       # JSON-RPC framing over stdin/stdout (LSP base protocol)
-│   ├── handler.mach         # request/notification handler implementations
-│   ├── workspace.mach       # open document tracking, line offset tables
-│   └── json.mach            # minimal JSON extraction and construction utilities
-└── dep/
-    ├── mach/                # vendored compiler (provides mach.compiler.*)
-    └── mach-std/            # vendored standard library
-```
-
-### Why a separate repo?
-
-The compiler's internals (`mach.compiler.lexer`, `mach.compiler.parser`, `mach.compiler.sema`, etc.) are imported directly as library code — zero duplication. But LSP infrastructure (JSON-RPC transport, long-lived workspace state, incremental document tracking) is fundamentally different from batch compilation, so it lives in its own project. This keeps the compiler binary lean and lets the LSP version independently.
-
-## Current Status
-
-The LSP is functional with the following capabilities:
-
-| Feature | Status |
+| Module | Responsibility |
 |---|---|
-| `initialize` / `shutdown` / `exit` lifecycle | ✅ |
-| `textDocument/didOpen`, `didChange`, `didClose` | ✅ |
-| `textDocument/hover` | 🔨 Stub (shows document info) |
-| `textDocument/definition` | 🔨 Stub (returns null) |
-| `textDocument/completion` | 🔨 Stub (returns empty list) |
-| `textDocument/documentSymbol` | 🔨 Stub (returns empty list) |
-| Diagnostics (publish on change) | ⬚ Not yet implemented |
-| Semantic tokens | ⬚ Not yet implemented |
+| `main` | entry point; page allocator + server loop |
+| `server` | lifecycle state, message loop, method dispatch |
+| `transport` | LSP base-protocol framing over stdin/stdout |
+| `json` | minimal JSON field extraction and response assembly |
+| `documents` | URI ⇄ editor `FileId` registry |
+| `diagnostics` | run `editor.diagnostics`, map spans, publish |
+| `positions` | byte offset ⇄ LSP `(line, character)` and span text |
+| `features` | offset → id → symbol query core over the resolve side tables |
+| `language` | hover / definition / references / rename / documentSymbol / completion request bodies |
+| `trace` | append-only debug trace log (`/tmp/mach-lsp.log`) |
 
-The transport, protocol handling, workspace management, and JSON utilities are fully implemented. The stubs are where the compiler dependency comes in — each one is a hook point for wiring in `mach.compiler.*` modules.
+## Testing
 
-### Roadmap
+Two stdio smoke tests drive the server with framed JSON-RPC:
 
-1. **Diagnostics** — Run the lexer + parser on document changes, map `ParserError` and `SemaError` to LSP diagnostics, push via `textDocument/publishDiagnostics`.
-2. **Document symbols** — Walk the AST from the parser to extract top-level declarations.
-3. **Hover** — Look up the symbol under the cursor via sema, display its type.
-4. **Go-to-definition** — Query the symbol table for definition locations.
-5. **Completion** — Enumerate visible symbols from the current scope.
+- `smoke.py` asserts diagnostics (broken buffer → diagnostics with ranges;
+  clean buffer → empty; `didChange`/`didClose` clear).
+- `smoke_features.py` asserts the language features against a small typed
+  source: hover renders signatures/types, definition lands on the decl,
+  references finds decl + use-sites, rename emits a `WorkspaceEdit`,
+  documentSymbol lists the top-level decls, completion includes the file's
+  functions and the primitives.
 
-## Prerequisites
-
-- The Mach compiler (`cmach` bootstrap or self-hosted `mach`), built from the [mach](https://github.com/octalide/mach) repository.
-- The [mach-std](https://github.com/octalide/mach-std) standard library.
-
-## Build
-
-```bash
-git clone https://github.com/octalide/mach-lsp.git
-cd mach-lsp
-mach dep pull
-mach build .
+```sh
+mach build && python3 smoke.py && python3 smoke_features.py
 ```
 
-The compiled binary is written to `out/linux/bin/mach-lsp` (or the equivalent path for your target).
+## Deferred
 
-## Usage
+These need full-project resolution (the driver's dependency loading wired into
+the editor surface), which is out of scope for the single-file query layer:
 
-The language server communicates over stdin/stdout using the LSP base protocol. Point your editor to the `mach-lsp` binary:
-
-### Zed
-
-Install the [mach-zed](https://github.com/octalide/mach-zed) extension. It declares `mach-lsp` as the language server — just make sure the binary is on your `$PATH`.
-
-### Neovim (nvim-lspconfig)
-
-```lua
-local lspconfig = require("lspconfig")
-local configs = require("lspconfig.configs")
-
-configs.mach_lsp = {
-  default_config = {
-    cmd = { "mach-lsp" },
-    filetypes = { "mach" },
-    root_dir = lspconfig.util.root_pattern("mach.toml"),
-  },
-}
-
-lspconfig.mach_lsp.setup({})
-```
-
-### Manual testing
-
-You can pipe JSON-RPC messages directly for debugging:
-
-```bash
-echo -ne 'Content-Length: 60\r\n\r\n{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | ./out/linux/bin/mach-lsp
-```
-
-## Memory Management
-
-The LSP uses `std.allocator.heap_allocator()` — the brk-based bump allocator from the standard library. All server-owned memory (documents, line tables, response buffers) flows through the `Allocator` interface, keeping allocation strategy decoupled from business logic. Temporary buffers used for JSON construction are allocated and freed per-response.
-
-## Dependencies
-
-Declared in `mach.toml`:
-
-```toml
-[deps.mach-std]
-type = "remote"
-path = "https://github.com/octalide/mach-std"
-version = "branch/dev"
-
-[deps.mach]
-type = "remote"
-path = "https://github.com/octalide/mach"
-version = "branch/dev"
-```
-
-The compiler dependency is what makes this project unique among language servers — `mach-lsp` doesn't reimplement the frontend. It `use`s it:
-
-```mach
-use lexer:  mach.compiler.lexer;
-use parser: mach.compiler.parser;
-use sema:   mach.compiler.sema;
-use ast:    mach.compiler.ast;
-use token:  mach.compiler.token;
-use ty:     mach.compiler.type;
-```
-
-## License
-
-[MIT](../mach/LICENSE)
+- cross-module go-to-definition / hover / references (symbols imported via
+  `use` resolve against dependency modules the editor does not load);
+- workspace symbol search;
+- scope-aware completion (member access after `.`, lexically scoped locals)
+  — the resolver's scope chain is internal to the resolve pass and not
+  exposed by the side tables.

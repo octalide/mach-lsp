@@ -1,27 +1,33 @@
+# mls.main: mach language server entry point.
+#
+# initializes the server over a page-backed allocator and runs the JSON-RPC
+# message loop over stdin/stdout until the client shuts the server down. all
+# protocol diagnostics go to the trace log, never stdout, so the protocol
+# stream stays clean.
+
 use std.runtime;
-use std.types.bool;
 
-use print: std.print;
+use std.types.bool.bool;
+use std.types.string.str;
+use std.types.option.Option;
+use std.types.option.is_some;
 
-use server:    mach_lsp.server;
-use lsp_types: mach_lsp.lsp_types;
+use std.allocator.Allocator;
+use page: std.allocator.page;
 
-# mach-lsp: language server entry point.
-# ---
-# initializes the server state and enters the main message loop.
-# communicates via JSON-RPC over stdin/stdout per the LSP specification.
+use server: mls.server;
 
 $main.symbol = "main";
-fun main(argc: i64, argv: &&u8) i64 {
-    print.eprintln("mach-lsp: starting");
+fun main(argc: i64, argv: **u8) i64 {
+    var alloc: Allocator;
+    val pe: Option[str] = page.make(?alloc);
+    if (is_some[str](pe)) { ret 1; }
 
-    var srv: lsp_types.Server;
-    server.init(?srv);
+    var srv: server.Server;
+    if (!server.init(?srv, ?alloc)) { ret 1; }
 
-    val exit_code: i64 = server.run(?srv);
+    val code: i64 = server.run(?srv);
 
-    server.deinit(?srv);
-
-    print.eprintln("mach-lsp: exiting");
-    ret exit_code;
+    server.dnit(?srv);
+    ret code;
 }

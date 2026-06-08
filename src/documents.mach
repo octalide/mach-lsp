@@ -1,0 +1,199 @@
+# mls.documents: the open-document registry bridging LSP URIs to editor buffers.
+#
+# the LSP identifies documents by URI; the editor surface identifies buffers by
+# `source.FileId`. this module owns that mapping. `didOpen` registers a URI's
+# text as an editor buffer and records the assigned FileId; `didChange`
+# replaces the buffer text in place; `didClose` retires the entry. each entry
+# keeps its own owned URI copy so it survives the request that created it.
+#
+# the editor session is borrowed from the server and reused across documents —
+# it owns the per-buffer analysis and the underlying session owns the source
+# text, so this registry stores only the URI/FileId association.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.reallocate;
+use std.allocator.deallocate;
+
+use strutil: std.text.string;
+
+use src:    mach.lang.source;
+use editor: mach.lang.editor;
+
+# Document: one tracked open document.
+# ---
+# uri:     owned document URI
+# file_id: editor FileId the buffer is registered under
+# in_use:  whether this slot holds a live document
+pub rec Document {
+    uri:     str;
+    file_id: src.FileId;
+    in_use:  bool;
+}
+
+# Store: the registry of tracked documents over a borrowed editor session.
+# ---
+# es:    borrowed editor session that owns buffer analysis
+# alloc: allocator for the entry array and owned URIs
+# docs:  contiguous array of Document slots
+# len:   number of slots in `docs`
+pub rec Store {
+    es:    *editor.EditorSession;
+    alloc: *Allocator;
+    docs:  *Document;
+    len:   usize;
+}
+
+# init: construct an empty document store over an editor session.
+# ---
+# es:    editor session the store registers buffers with
+# alloc: allocator for the store's own storage
+# ret:   an empty Store
+pub fun init(es: *editor.EditorSession, alloc: *Allocator) Store {
+    var st: Store;
+    st.es = es;
+    st.alloc = alloc;
+    st.docs = nil;
+    st.len = 0;
+    ret st;
+}
+
+# dnit: release every owned URI and the entry array. the borrowed editor
+# session is left untouched.
+# ---
+# st: the store to tear down; all owned fields are zeroed
+pub fun dnit(st: *Store) {
+    if (st.docs != nil && st.len > 0) {
+        var i: usize = 0;
+        for (i < st.len) {
+            val d: *Document = ?st.docs[i];
+            if (d.uri != nil) { strutil.str_free(st.alloc, d.uri); }
+            i = i + 1;
+        }
+        deallocate[Document](st.alloc, st.docs, st.len);
+    }
+    st.docs = nil;
+    st.len = 0;
+}
+
+# open: register a document's text as an editor buffer, returning its entry.
+# a re-open of an already-tracked URI replaces the buffer text in place.
+# ---
+# st:   the store
+# uri:  document URI
+# text: full document text
+# ret:  the tracked Document on success, or an error string
+pub fun open(st: *Store, uri: str, text: str) Result[*Document, str] {
+    val existing: *Document = find(st, uri);
+    if (existing != nil) {
+        val ur: Result[bool, str] = editor.update(st.es, existing.file_id, text);
+        if (is_err[bool, str](ur)) { ret err[*Document, str](unwrap_err[bool, str](ur)); }
+        ret ok[*Document, str](existing);
+    }
+
+    val fr: Result[src.FileId, str] = editor.open(st.es, uri, text);
+    if (is_err[src.FileId, str](fr)) { ret err[*Document, str](unwrap_err[src.FileId, str](fr)); }
+    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+
+    val slot_r: Result[*Document, str] = ensure_slot(st);
+    if (is_err[*Document, str](slot_r)) { ret slot_r; }
+    val d: *Document = unwrap_ok[*Document, str](slot_r);
+
+    val dup: Result[str, str] = strutil.str_dup(st.alloc, uri);
+    if (is_err[str, str](dup)) { ret err[*Document, str]("documents: failed to copy uri"); }
+    d.uri = unwrap_ok[str, str](dup);
+    d.file_id = fid;
+    d.in_use = true;
+    ret ok[*Document, str](d);
+}
+
+# change: replace the text of an already-open document.
+# ---
+# st:   the store
+# uri:  document URI; must already be open
+# text: replacement text
+# ret:  the tracked Document on success, or an error string
+pub fun change(st: *Store, uri: str, text: str) Result[*Document, str] {
+    val d: *Document = find(st, uri);
+    if (d == nil) { ret err[*Document, str]("documents: change of unopened document"); }
+    val ur: Result[bool, str] = editor.update(st.es, d.file_id, text);
+    if (is_err[bool, str](ur)) { ret err[*Document, str](unwrap_err[bool, str](ur)); }
+    ret ok[*Document, str](d);
+}
+
+# close: retire a tracked document, freeing its URI. the editor buffer's
+# cached analysis is dropped on the next reuse of its FileId. a no-op for an
+# untracked URI.
+# ---
+# st:  the store
+# uri: document URI to close
+pub fun close(st: *Store, uri: str) {
+    val d: *Document = find(st, uri);
+    if (d == nil) { ret; }
+    if (d.uri != nil) { strutil.str_free(st.alloc, d.uri); }
+    d.uri = nil;
+    d.in_use = false;
+}
+
+# find: the tracked Document for `uri`, or nil when not open.
+# ---
+# st:  the store
+# uri: document URI to look up
+# ret: the tracked Document, or nil
+pub fun find(st: *Store, uri: str) *Document {
+    if (st.docs == nil) { ret nil; }
+    var i: usize = 0;
+    for (i < st.len) {
+        val d: *Document = ?st.docs[i];
+        if (d.in_use && d.uri != nil && str_equals(d.uri, uri)) { ret d; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# ensure_slot: return a free Document slot, growing the array if needed.
+fun ensure_slot(st: *Store) Result[*Document, str] {
+    var i: usize = 0;
+    for (i < st.len) {
+        if (!st.docs[i].in_use) { ret ok[*Document, str](?st.docs[i]); }
+        i = i + 1;
+    }
+
+    var new_len: usize = st.len * 2;
+    if (new_len == 0) { new_len = 8; }
+    if (st.docs == nil) {
+        val r: Result[*Document, str] = allocate[Document](st.alloc, new_len);
+        if (is_err[*Document, str](r)) { ret r; }
+        st.docs = unwrap_ok[*Document, str](r);
+    }
+    or {
+        val r: Result[*Document, str] = reallocate[Document](st.alloc, st.docs, st.len, new_len);
+        if (is_err[*Document, str](r)) { ret r; }
+        st.docs = unwrap_ok[*Document, str](r);
+    }
+
+    var z: usize = st.len;
+    for (z < new_len) {
+        val nb: *Document = ?st.docs[z];
+        nb.uri = nil;
+        nb.file_id = 0::src.FileId;
+        nb.in_use = false;
+        z = z + 1;
+    }
+    val slot: *Document = ?st.docs[st.len];
+    st.len = new_len;
+    ret ok[*Document, str](slot);
+}

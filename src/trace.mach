@@ -1,0 +1,30 @@
+# mls.trace: append-only file trace log for debugging the server over stdio.
+#
+# the LSP speaks JSON-RPC on stdout, so diagnostics about the server's own
+# behaviour cannot go there. every notable event is appended to a fixed log
+# path instead. tracing is best-effort: a failed open or write is silently
+# dropped so logging never disturbs the protocol stream.
+
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.size.usize;
+
+use os: std.system.os;
+
+# LOG_PATH: fixed file the trace log is appended to.
+val LOG_PATH: str = "/tmp/mach-lsp.log";
+
+# log: append a message to the trace log, best-effort.
+# ---
+# msg: null-terminated message to append; nil / empty is a no-op
+pub fun log(msg: str) {
+    if (msg == nil) { ret; }
+    val len: usize = str_len(msg);
+    if (len == 0) { ret; }
+
+    val flags: i32 = os.O_WRONLY | os.O_CREAT | os.O_APPEND;
+    val fd: i64 = os.open(os.AT_FDCWD, LOG_PATH::*u8, flags, 420);
+    if (fd < 0) { ret; }
+    os.write(fd::i32, msg::*u8, len);
+    os.close(fd::i32);
+}
