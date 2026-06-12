@@ -103,13 +103,6 @@ lockfile touch).
 > need path-deduplicated multi-graph merging (to avoid duplicate edits for
 > modules shared between targets) and is deferred.
 
-> **Known limitation (#45):** the vendored `dep/mach` only parses the old
-> `[targets.<name>]` manifest format, so cross-module resolution is currently
-> **non-functional for v1.4.0-manifest projects — including this repo itself**
-> (its own `mach.toml` uses `[target.X]`/`[bin.X]`). Such projects resolve
-> single-file and the server reports the load failure via `window/showMessage`.
-> Fixed by bumping `dep/mach` to a version that parses the new format.
-
 ## Building
 
 The compiler and standard library are vendored under `dep/` as git dependencies.
