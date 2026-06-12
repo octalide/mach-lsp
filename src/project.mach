@@ -336,19 +336,20 @@ pub fun root_for(w: *Workspace, uri: str) *Root {
     ret load_root(w, doc_root);
 }
 
-# ancestor_root: load-and-prefer an outer project for the document at `uri`
-# whose own (fresh) root is `doc_root`. walks the chain of ancestor manifest
-# dirs strictly above `dir` (`doc_root` on the outer call), outermost first; an
-# ancestor is only considered when its manifest declares `doc_root` as one of
-# its dep vendor dirs (`vendors_dir`), so unrelated outer projects — a monorepo
-# root, this repo above its test fixtures — are never speculatively built. the
-# first considered ancestor whose loaded graph holds the document as a module
-# governs it; one that loads but does not hold it stays loaded (it is a real
-# project). ancestors already tracked are skipped: a loaded-and-containing one
-# was already returned by containing_root, and a failed one is not retried
-# here. only the document's direct vendoring project is found — a dep nested
-# inside another dep's tree routes to that dep's root, not the outermost
-# project. nil when no ancestor claims the document.
+# ancestor_root: load-and-prefer the outermost project that vendors the document
+# at `uri` (whose own fresh root is `doc_root`) and whose loaded graph holds it.
+# walks the chain of ancestor manifest dirs strictly above `dir` (`doc_root` on
+# the outer call), outermost first; an ancestor is only considered when its
+# manifest declares a dependency whose vendor dir encloses `doc_root`
+# (`vendors_enclosing`), so unrelated outer projects — a monorepo root, this repo
+# above its test fixtures — are never speculatively built. the outermost
+# considered ancestor whose loaded graph holds the document governs it; one that
+# loads but does not hold it stays loaded (it is a real project) and the walk
+# falls inward to the next vendoring ancestor — so a dependency nested inside
+# another dependency's tree reaches the outermost project that actually closes
+# over it, not merely its immediate parent. ancestors already tracked are
+# skipped: a loaded one was already offered by containing_root, and a failed one
+# is not retried here. nil when no ancestor claims the document.
 fun ancestor_root(w: *Workspace, uri: str, doc_root: str, dir: str) *Root {
     val par_r: Result[pathlib.Path, str] = pathlib.parent(w.alloc, dir);
     if (is_err[pathlib.Path, str](par_r)) { ret nil; }
@@ -361,7 +362,7 @@ fun ancestor_root(w: *Workspace, uri: str, doc_root: str, dir: str) *Root {
     val above: *Root = ancestor_root(w, uri, doc_root, anc);
     if (above != nil) { strutil.str_free(w.alloc, anc); ret above; }
 
-    if (find_root(w, anc) != nil || !vendors_dir(w, anc, doc_root)) {
+    if (find_root(w, anc) != nil || !vendors_enclosing(w, anc, doc_root)) {
         strutil.str_free(w.alloc, anc);
         ret nil;
     }
@@ -372,15 +373,21 @@ fun ancestor_root(w: *Workspace, uri: str, doc_root: str, dir: str) *Root {
     ret nil;
 }
 
-# vendors_dir: whether the project at `root_path` declares a dependency whose
-# vendor dir is `dir` — i.e. `dir` equals `<root>/<[project].dep>/<alias>` for
-# some `[deps.<alias>]`, the same layout the driver's dep resolution reads. one
-# small manifest parse answers "could this project claim that nested root?"
-# without paying a full graph build; the loaded graph remains the authority on
-# actual containment. a manifest that fails to read or parse vendors nothing.
-# the parsed table is leaked into the server's page allocator — std.data.toml
-# exposes no teardown, the same convention the driver's own manifest reads use.
-fun vendors_dir(w: *Workspace, root_path: str, dir: str) bool {
+# vendors_enclosing: whether the project at `root_path` declares a dependency
+# whose vendor dir encloses `dir` — i.e. `dir` equals or lies under
+# `<root>/<[project].dep>/<alias>` for some `[deps.<alias>]`, the same layout the
+# driver's dep resolution reads. one small manifest parse answers "could this
+# project's dependency tree contain that nested root?" without paying a full
+# graph build; the loaded graph remains the authority on actual containment.
+# enclosure rather than equality is the speculative-build gate that lets a dep
+# nested inside another dep's tree reach the outermost vendoring project, not
+# merely its immediate parent, while still never building unrelated outer
+# projects — a monorepo root, this repo above its test fixtures — whose declared
+# vendor dirs enclose nothing the document sits in. a manifest that fails to read
+# or parse vendors nothing. the parsed table is leaked into the server's page
+# allocator — std.data.toml exposes no teardown, the same convention the driver's
+# own manifest reads use.
+fun vendors_enclosing(w: *Workspace, root_path: str, dir: str) bool {
     val mp_r: Result[pathlib.Path, str] = pathlib.join(w.alloc, root_path, "mach.toml");
     if (is_err[pathlib.Path, str](mp_r)) { ret false; }
     val mp: str = unwrap_ok[pathlib.Path, str](mp_r);
@@ -416,7 +423,7 @@ fun vendors_dir(w: *Workspace, root_path: str, dir: str) bool {
                     val norm: str = normalize_path(w.alloc, cand);
                     strutil.str_free(w.alloc, cand);
                     if (norm != nil) {
-                        if (str_equals(norm, want)) { found = true; }
+                        if (is_under(want, norm)) { found = true; }
                         strutil.str_free(w.alloc, norm);
                     }
                 }
@@ -440,26 +447,33 @@ fun find_root(w: *Workspace, root_path: str) *Root {
     ret nil;
 }
 
-# containing_root: the loaded root whose graph holds the document at `uri` as a
-# module (matched on the normalized filesystem path), skipping the document's
-# own root at `doc_root` (which find_root handles, with its outside-the-closure
-# files resolving against its dep set). a candidate is reload-checked and its
-# containment re-verified before it is handed out, so a twin-routed document
-# does not bypass the staleness check. nil when no other loaded root holds the
-# document.
+# containing_root: the outermost loaded root whose graph holds the document at
+# `uri` as a module (matched on the normalized filesystem path), skipping the
+# document's own root at `doc_root` (which find_root handles, with its
+# outside-the-closure files resolving against its dep set). when several loaded
+# roots hold the document — an outer project and a dependency nested within it —
+# the outermost wins (the shortest root path, since every holder is an ancestor
+# of the document on one root-to-file chain and so they nest), so a dependency
+# module routes to the project that vendors it regardless of which root loaded
+# first. each candidate is reload-checked and its containment re-verified before
+# it is accepted, so a twin-routed document does not bypass the staleness check.
+# nil when no other loaded root holds the document.
 fun containing_root(w: *Workspace, uri: str, doc_root: str) *Root {
     if (w.roots == nil) { ret nil; }
     val norm: str = uri_to_norm(w.alloc, uri);
     if (norm == nil) { ret nil; }
     var found: *Root = nil;
     var i: u32 = 0;
-    for (i < w.root_cap && found == nil) {
+    for (i < w.root_cap) {
         val r: *Root = ?w.roots[i];
         if (r.path != nil && r.loaded
             && (doc_root == nil || !str_equals(r.path, doc_root))
             && is_some[sess.ModuleId](module_for_norm(r, norm))) {
             maybe_reload(w, r);
-            if (r.loaded && is_some[sess.ModuleId](module_for_norm(r, norm))) { found = r; }
+            if (r.loaded && is_some[sess.ModuleId](module_for_norm(r, norm))
+                && (found == nil || str_len(r.path) < str_len(found.path))) {
+                found = r;
+            }
         }
         i = i + 1;
     }

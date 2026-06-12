@@ -4,8 +4,8 @@ on the vendored mach-std. definition / references / hover on a `use`d std symbol
 must reach the canonical file:// URI of the decl inside dep/mach-std, while a
 local symbol still resolves in the buffer. also covers project-load ordering (a
 scratch file opened first must not disable the later project load; a dep source
-opened first must still refuse rename via its vendoring project) and
-percent-encoded document URIs."""
+opened first must still refuse rename via its vendoring project, at one and at
+two nesting levels) and percent-encoded document URIs."""
 import os
 
 from harness import drive, req, notify, did_open, pos, by_id, file_uri, standalone, FIXTURE, REPO
@@ -27,6 +27,12 @@ LOCAL = pos(9, 6)
 
 SCRATCH_URI = "file:///scratch.mach"
 SCRATCH_SRC = "fun lone() i64 { ret 1; }\n"
+
+# the two-level nesting fixture: project `outer` vendors `mid`, `mid` vendors
+# `leaf` (dep/mid/dep/leaf). `outer` closes over mid.api but not leaf.
+NESTED = os.path.join(REPO, "test", "fixture-nested")
+NESTED_LEAF = os.path.join(NESTED, "dep", "mid", "dep", "leaf", "src", "lib.mach")
+NESTED_MID_API = os.path.join(NESTED, "dep", "mid", "src", "api.mach")
 
 
 def check_dep_definition(failures, msg, dv):
@@ -253,6 +259,70 @@ def dep_buffer_first_scenario():
     return failures
 
 
+def _decl_pos(path, needle):
+    """(file text, position of `needle` on the first line that contains it), or
+    (None, None) when the file has no such line."""
+    text = open(path).read()
+    for i, line in enumerate(text.splitlines()):
+        if needle in line:
+            return text, pos(i, line.find(needle))
+    return None, None
+
+
+def nested_dep_first_scenario():
+    """a dependency nested two levels deep — `outer` vendors `mid`, `mid` vendors
+    `leaf` — opened cold before any project document must still refuse rename: the
+    leaf source routes read-only to the project that vendors it, and `mid`'s
+    outer-imported module then routes to `outer` rather than entrenching `mid` as
+    its own renameable project. depth- and open-order-independent refusal (#57)."""
+    if not os.path.exists(NESTED):
+        return [f"nested fixture not found at {NESTED}"]
+    leaf_text, leaf_pos = _decl_pos(NESTED_LEAF, "b_thing")
+    api_text, api_pos = _decl_pos(NESTED_MID_API, "a_thing")
+    if leaf_text is None or api_text is None:
+        return ["nested fixture declarations not found"]
+
+    leaf_uri = file_uri(NESTED_LEAF)
+    api_uri = file_uri(NESTED_MID_API)
+    frames = [
+        req(1, "initialize", {"capabilities": {}}),
+        notify("initialized"),
+        # the innermost dependency, opened cold before any project document
+        did_open(leaf_uri, leaf_text),
+        req(20, "textDocument/prepareRename",
+            {"textDocument": {"uri": leaf_uri}, "position": leaf_pos}),
+        req(21, "textDocument/rename",
+            {"textDocument": {"uri": leaf_uri}, "position": leaf_pos, "newName": "nope"}),
+        # mid's outer-imported module: must route to `outer`, not to an entrenched
+        # `mid`, so its declaration is read-only too
+        did_open(api_uri, api_text),
+        req(22, "textDocument/prepareRename",
+            {"textDocument": {"uri": api_uri}, "position": api_pos}),
+        req(23, "textDocument/rename",
+            {"textDocument": {"uri": api_uri}, "position": api_pos, "newName": "nope"}),
+        req(2, "shutdown", None),
+        notify("exit"),
+    ]
+    code, msgs = drive(frames)
+
+    failures = []
+    prv = (by_id(msgs, 20) or {}).get("result", "missing")
+    if prv is not None:
+        failures.append(f"prepareRename(cold leaf decl, depth 2) should be null, got {prv!r}")
+    rnv = (by_id(msgs, 21) or {}).get("result")
+    if not isinstance(rnv, dict) or rnv.get("changes") != {}:
+        failures.append(f"rename(cold leaf decl, depth 2) should be an empty WorkspaceEdit, got {rnv!r}")
+    prv2 = (by_id(msgs, 22) or {}).get("result", "missing")
+    if prv2 is not None:
+        failures.append(f"prepareRename(mid.api decl) should be null (routed to outer), got {prv2!r}")
+    rnv2 = (by_id(msgs, 23) or {}).get("result")
+    if not isinstance(rnv2, dict) or rnv2.get("changes") != {}:
+        failures.append(f"rename(mid.api decl) should be an empty WorkspaceEdit (routed to outer), got {rnv2!r}")
+    if code != 0:
+        failures.append("non-zero exit code after clean shutdown")
+    return failures
+
+
 def run():
     """drive the cross-module scenarios; return a list of failure strings."""
     if not os.path.exists(APP):
@@ -263,6 +333,7 @@ def run():
     failures += percent_encoding_scenario()
     failures += dep_buffer_rename_scenario()
     failures += dep_buffer_first_scenario()
+    failures += nested_dep_first_scenario()
     return failures
 
 

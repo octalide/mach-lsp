@@ -1,0 +1,15 @@
+# `leaf`: the innermost dependency, vendored inside `mid`'s tree two levels below
+# the `outer` project root.
+[project]
+id      = "leaf"
+version = "0.0.0"
+src     = "src"
+target  = "native"
+
+[target.linux]
+isa = "x86_64"
+os  = "linux"
+abi = "sysv64"
+
+[bin.leaf]
+entry = "lib.mach"
