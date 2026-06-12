@@ -66,12 +66,14 @@ use project:   mls.project;
 # a:    the buffer's parsed Ast
 # rr:   the buffer's ResolveResult side tables
 # own:  this buffer's module id (Symbol.origin equals it for local symbols)
+# root: the project root the buffer resolved against, or nil for single-file
 rec Analyzed {
     s:    *sess.Session;
     file: *src.SourceFile;
     a:    *ast.Ast;
     rr:   *res.ResolveResult;
     own:  sess.ModuleId;
+    root: *project.Root;
 }
 
 # hover: answer textDocument/hover with the type / declaration of the symbol at
@@ -123,7 +125,7 @@ pub fun hover(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Sessio
 fun hover_markdown(ws: *project.Workspace, an: Analyzed, sym: *res.Symbol, uri: str, alloc: *Allocator) str {
     var sig: str = nil;
     var doc: str = nil;
-    val site_o: Option[project.Site] = project.site_of(ws, an.own, an.a, an.file, uri, sym);
+    val site_o: Option[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.file, uri, sym);
     if (is_some[project.Site](site_o)) {
         var site: project.Site = unwrap[project.Site](site_o);
         if (sym.decl != id.DECL_NIL) {
@@ -401,7 +403,7 @@ pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.S
     if (!is_some[*res.Symbol](so)) { reply_null(alloc, id_raw); ret; }
     val sym: *res.Symbol = unwrap[*res.Symbol](so);
 
-    val site_o: Option[project.Site] = project.site_of(ws, an.own, an.a, an.file, uri, sym);
+    val site_o: Option[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.file, uri, sym);
     if (!is_some[project.Site](site_o)) { reply_null(alloc, id_raw); ret; }
     var site: project.Site = unwrap[project.Site](site_o);
 
@@ -446,7 +448,7 @@ pub fun references(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.S
     var bind: token.Span;
     val has_bind: bool = binding_span(an, sr.sym_id, ?bind);
 
-    val cap: usize = (project.module_count(ws) + 1)::usize;
+    val cap: usize = (project.module_count(an.root) + 1)::usize;
     val ra: Result[*XRef, str] = allocate[XRef](alloc, cap);
     if (is_err[*XRef, str](ra)) { reply_empty_array(alloc, id_raw); ret; }
     val refs: *XRef = unwrap_ok[*XRef, str](ra);
@@ -488,7 +490,7 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Sessi
     val so: Option[*res.Symbol] = features.symbol(an.rr, sr.sym_id);
     if (!is_some[*res.Symbol](so)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
     val sym: *res.Symbol = unwrap[*res.Symbol](so);
-    if (!renameable(ws, uri, sym, sr)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
+    if (!renameable(ws, an.root, uri, sym, sr)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
 
     # the declared name guards the cross-file walk: only occurrences spelled with
     # it are rewritten, so an aliased import's references are left untouched.
@@ -499,7 +501,7 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Sessi
     var bind: token.Span;
     val has_bind: bool = binding_span(an, sr.sym_id, ?bind);
 
-    val cap: usize = (project.module_count(ws) + 1)::usize;
+    val cap: usize = (project.module_count(an.root) + 1)::usize;
     val ra: Result[*XRef, str] = allocate[XRef](alloc, cap);
     if (is_err[*XRef, str](ra)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
     val refs: *XRef = unwrap_ok[*XRef, str](ra);
@@ -539,7 +541,7 @@ pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, s: *se
 
     val so: Option[*res.Symbol] = features.symbol(an.rr, sr.sym_id);
     if (!is_some[*res.Symbol](so)) { reply_null(alloc, id_raw); ret; }
-    if (!renameable(ws, uri, unwrap[*res.Symbol](so), sr)) { reply_null(alloc, id_raw); ret; }
+    if (!renameable(ws, an.root, uri, unwrap[*res.Symbol](so), sr)) { reply_null(alloc, id_raw); ret; }
 
     val range: positions.LspRange = positions.range_of(an.file, sr.name_span);
     val rng: str = range_json(range, alloc);
@@ -602,11 +604,11 @@ fun binding_span(an: Analyzed, sid: res.SymbolId, out: *token.Span) bool {
 # source opened via go-to-definition, whose symbols all resolve buffer-locally)
 # must also be project-owned. a buffer with no twin (a scratch file, or one
 # outside the loaded graph) renames buffer-local.
-fun renameable(ws: *project.Workspace, uri: str, sym: *res.Symbol, sr: features.SymbolRef) bool {
-    if (!sr.local) { ret project.is_project_module(ws, sym.origin); }
-    val twin_o: Option[sess.ModuleId] = project.module_for_uri(ws, uri);
+fun renameable(ws: *project.Workspace, root: *project.Root, uri: str, sym: *res.Symbol, sr: features.SymbolRef) bool {
+    if (!sr.local) { ret project.is_project_module(ws, root, sym.origin); }
+    val twin_o: Option[sess.ModuleId] = project.module_for_uri(ws, root, uri);
     if (!is_some[sess.ModuleId](twin_o)) { ret true; }
-    ret project.is_project_module(ws, unwrap[sess.ModuleId](twin_o));
+    ret project.is_project_module(ws, root, unwrap[sess.ModuleId](twin_o));
 }
 
 # XRef: one file contributing references to a target symbol — its Ast, resolve
@@ -671,7 +673,7 @@ fun build_refs(ws: *project.Workspace, an: Analyzed, uri: str, sym: *res.Symbol,
     var n: usize = 1;
     @status = BRIDGE_LOCAL;
 
-    val self_o: Option[sess.ModuleId] = project.module_for_uri(ws, uri);
+    val self_o: Option[sess.ModuleId] = project.module_for_uri(ws, an.root, uri);
     val have_self: bool = is_some[sess.ModuleId](self_o);
     var self_mid: sess.ModuleId = 0::sess.ModuleId;
     if (have_self) { self_mid = unwrap[sess.ModuleId](self_o); }
@@ -681,7 +683,7 @@ fun build_refs(ws: *project.Workspace, an: Analyzed, uri: str, sym: *res.Symbol,
     if (sym.origin == an.own) {
         if ((sym.flags & res.SYM_FLAG_MODULE) == 0 || (sym.flags & res.SYM_FLAG_PUB) == 0) { ret n; }
         if (!have_self) { ret n; }
-        val mv_o: Option[project.ModuleView] = project.module_view(ws, self_mid);
+        val mv_o: Option[project.ModuleView] = project.module_view(ws, an.root, self_mid);
         if (!is_some[project.ModuleView](mv_o)) { @status = BRIDGE_FAILED; ret n; }
         canon_decl   = features.export_decl_of(unwrap[project.ModuleView](mv_o).rr, sym.name, sym.kind);
         canon_origin = self_mid;
@@ -690,18 +692,18 @@ fun build_refs(ws: *project.Workspace, an: Analyzed, uri: str, sym: *res.Symbol,
     if (canon_decl == id.DECL_NIL) { ret n; }
     @status = BRIDGE_OK;
 
-    val mc: u32 = project.module_count(ws);
+    val mc: u32 = project.module_count(an.root);
     var mid: u32 = 0;
     for (mid < mc && n < cap) {
         val cur: sess.ModuleId = mid::sess.ModuleId;
         if ((have_self && cur == self_mid)
-            || (project_only && !project.is_project_module(ws, cur))) { mid = mid + 1; cnt; }
-        val mv_o: Option[project.ModuleView] = project.module_view(ws, cur);
+            || (project_only && !project.is_project_module(ws, an.root, cur))) { mid = mid + 1; cnt; }
+        val mv_o: Option[project.ModuleView] = project.module_view(ws, an.root, cur);
         if (!is_some[project.ModuleView](mv_o)) { mid = mid + 1; cnt; }
         val mv: project.ModuleView = unwrap[project.ModuleView](mv_o);
         val tgt: res.SymbolId = features.symbol_by_decl(mv.rr, canon_origin, canon_decl);
         if (tgt == res.SYMBOL_NIL) { mid = mid + 1; cnt; }
-        val muri: str = project.module_uri(ws, cur);
+        val muri: str = project.module_uri(ws, an.root, cur);
         if (muri == nil) { mid = mid + 1; cnt; }
         out[n].a      = mv.a;
         out[n].rr     = mv.rr;
@@ -724,17 +726,19 @@ fun free_refs(ws: *project.Workspace, refs: *XRef, n: usize) {
     }
 }
 
-# analyze: resolve the document named by `uri` against the project dependency
-# graph and populate `out` with its session, file, Ast, ResolveResult, and
-# module id. false when the document is unknown or resolution fails. the module
-# id is the workspace's synthetic buffer id, matching the one resolution bound
-# local symbols under, so the local / cross-module distinction holds.
+# analyze: resolve the document named by `uri` against the dependency graph of
+# the project root that governs it and populate `out` with its session, file,
+# Ast, ResolveResult, governing root, and module id. false when the document is
+# unknown or resolution fails. the module id is the root's synthetic buffer id,
+# matching the one resolution bound local symbols under, so the local /
+# cross-module distinction holds.
 fun analyze(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, docs: *documents.Store, uri: str, out: *Analyzed) bool {
     if (uri == nil) { ret false; }
     val doc: *documents.Document = documents.find(docs, uri);
     if (doc == nil) { ret false; }
 
-    val rr_r: Result[*res.ResolveResult, str] = project.resolve_doc(ws, doc.file_id, uri);
+    val root: *project.Root = project.root_for(ws, uri);
+    val rr_r: Result[*res.ResolveResult, str] = project.resolve_doc(ws, root, doc.file_id);
     if (is_err[*res.ResolveResult, str](rr_r)) { ret false; }
     out.rr = unwrap_ok[*res.ResolveResult, str](rr_r);
     out.a  = editor.ast_of(es, doc.file_id);
@@ -744,7 +748,8 @@ fun analyze(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session,
     if (!is_some[*src.SourceFile](fo)) { ret false; }
     out.s    = s;
     out.file = unwrap[*src.SourceFile](fo);
-    out.own  = project.own_module(ws, doc.file_id);
+    out.root = root;
+    out.own  = project.own_module(root, doc.file_id);
     ret true;
 }
 

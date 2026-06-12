@@ -16,6 +16,7 @@ use std.types.size.usize;
 use std.types.size.isize;
 use std.types.string.str;
 use std.types.string.str_len;
+use std.types.string.str_equals;
 use std.types.result.Result;
 use std.types.result.is_err;
 use std.types.result.unwrap_ok;
@@ -148,6 +149,18 @@ pub fun extract_number_i64(data: str, key: str, alloc: *Allocator) i64 {
     ret result;
 }
 
+# seek_after: the tail of `data` starting just past the first occurrence of
+# `anchor` as an object key, or nil when the anchor is absent or ends the text.
+# the shared prologue of the *_after accessors; the returned pointer borrows
+# `data`.
+fun seek_after(data: str, anchor: str) str {
+    val idx: isize = find_key(data, anchor);
+    if (idx < 0) { ret nil; }
+    val offset: usize = (idx::usize) + str_len(anchor);
+    if (offset >= str_len(data)) { ret nil; }
+    ret (data::usize + offset)::str;
+}
+
 # extract_after: read string `key` that appears after the first occurrence of
 # `anchor` (scopes a key lookup to a nested object whose opening key is known).
 # ---
@@ -157,13 +170,8 @@ pub fun extract_number_i64(data: str, key: str, alloc: *Allocator) i64 {
 # alloc:  allocator backing the returned string
 # ret:    owned decoded value, or nil
 pub fun extract_after(data: str, anchor: str, key: str, alloc: *Allocator) str {
-    val idx: isize = find_key(data, anchor);
-    if (idx < 0) { ret nil; }
-    val data_len: usize = str_len(data);
-    val anchor_len: usize = str_len(anchor);
-    val offset: usize = (idx::usize) + anchor_len;
-    if (offset >= data_len) { ret nil; }
-    val sub: str = (data::usize + offset)::str;
+    val sub: str = seek_after(data, anchor);
+    if (sub == nil) { ret nil; }
     ret extract_string(sub, key, alloc);
 }
 
@@ -175,14 +183,95 @@ pub fun extract_after(data: str, anchor: str, key: str, alloc: *Allocator) str {
 # alloc:  scratch allocator
 # ret:    the parsed integer, or 0
 pub fun extract_number_after(data: str, anchor: str, key: str, alloc: *Allocator) i64 {
-    val idx: isize = find_key(data, anchor);
-    if (idx < 0) { ret 0; }
-    val data_len: usize = str_len(data);
-    val anchor_len: usize = str_len(anchor);
-    val offset: usize = (idx::usize) + anchor_len;
-    if (offset >= data_len) { ret 0; }
-    val sub: str = (data::usize + offset)::str;
+    val sub: str = seek_after(data, anchor);
+    if (sub == nil) { ret 0; }
     ret extract_number_i64(sub, key, alloc);
+}
+
+# extract_string_seq: decode the string value of the `index`-th occurrence of
+# `key` in `data` (0-based), or nil when there are fewer than index+1
+# occurrences. lets a caller iterate a repeated key — e.g. every `"uri"` in a
+# `workspace/didChangeWatchedFiles` changes array — by bumping `index` until nil.
+# ---
+# data:  JSON text to scan
+# key:   quoted key to find, e.g. `"uri"`
+# index: zero-based occurrence to read
+# alloc: allocator backing the returned string
+# ret:   owned decoded value, or nil
+pub fun extract_string_seq(data: str, key: str, index: u32, alloc: *Allocator) str {
+    var sub: str = data;
+    var i: u32 = 0;
+    for (i < index) {
+        sub = seek_after(sub, key);
+        if (sub == nil) { ret nil; }
+        i = i + 1;
+    }
+    ret extract_string(sub, key, alloc);
+}
+
+# extract_bool_after: whether the boolean `key` inside the object value of
+# `anchor` is the literal `true`. the scan is scoped to the anchor's balanced
+# object, so an equally-named key in a later sibling object is never misread —
+# e.g. another capability's `dynamicRegistration` after an empty
+# `"didChangeWatchedFiles":{}`. false when the anchor is absent, its value is
+# not an object, or the key is absent / non-true, so a missing capability reads
+# as unsupported.
+# ---
+# data:   JSON text to scan
+# anchor: quoted key whose object value scopes the lookup
+# key:    quoted boolean key to read inside the anchor's object
+# alloc:  scratch allocator (the window and raw token are freed before return)
+# ret:    true only when the value is the literal `true`
+pub fun extract_bool_after(data: str, anchor: str, key: str, alloc: *Allocator) bool {
+    val sub: str = seek_after(data, anchor);
+    if (sub == nil) { ret false; }
+    val sub_len: usize = str_len(sub);
+    var pos: usize = skip_ws(sub, 0);
+    if (pos >= sub_len || sub[pos] != ':') { ret false; }
+    pos = skip_ws(sub, pos + 1);
+    if (pos >= sub_len || sub[pos] != '{') { ret false; }
+    val end: usize = object_end(sub, pos);
+    if (end == 0) { ret false; }
+
+    val window: str = copy_range(sub, pos, end, alloc);
+    if (window == nil) { ret false; }
+    val raw: str = extract_raw(window, key, alloc);
+    var is_true: bool = false;
+    if (raw != nil) {
+        is_true = str_equals(raw, "true");
+        free_str(raw, alloc);
+    }
+    free_str(window, alloc);
+    ret is_true;
+}
+
+# object_end: the index one past the matching `}` of the `{` at `start`,
+# skipping string contents, or 0 when the object is unbalanced.
+fun object_end(data: str, start: usize) usize {
+    val n: usize = str_len(data);
+    var depth: usize = 0;
+    var in_str: bool = false;
+    var i: usize = start;
+    for (i < n) {
+        val c: u8 = data[i];
+        if (in_str) {
+            if (c == '\\') { i = i + 2; }
+            or {
+                if (c == '"') { in_str = false; }
+                i = i + 1;
+            }
+        }
+        or {
+            if (c == '"')  { in_str = true; }
+            or (c == '{')  { depth = depth + 1; }
+            or (c == '}')  {
+                depth = depth - 1;
+                if (depth == 0) { ret i + 1; }
+            }
+            i = i + 1;
+        }
+    }
+    ret 0;
 }
 
 # quote: JSON-encode `s` as a quoted, escaped string literal (including the
