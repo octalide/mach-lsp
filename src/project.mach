@@ -355,8 +355,8 @@ fun try_load(w: *Workspace, root: str) bool {
 }
 
 # report_load_failure: record `root` as failed, log the loader error, and warn
-# the user through window/showMessage so a manifest the vendored compiler
-# cannot parse (#45) is distinguishable from "no project found".
+# the user through window/showMessage so a manifest that fails to load (a
+# malformed or unparseable mach.toml) is distinguishable from "no project found".
 fun report_load_failure(w: *Workspace, root: str, msg: str) {
     if (w.failed_root != nil) { strutil.str_free(w.alloc, w.failed_root); w.failed_root = nil; }
     val dup_r: Result[str, str] = strutil.str_dup(w.alloc, root);
@@ -426,10 +426,10 @@ fun build_deps(w: *Workspace) {
 }
 
 # module_exports: the public surface of loaded module `mid` as a ModuleExports,
-# copying each pub symbol's (kind, name, decl, origin) so resolve can bind a
-# cross-module reference to the declaring module's Ast. this must track the
-# driver's private build_module_exports field-for-field; revisit at #45, where
-# the driver helper may become pub.
+# copying each pub symbol's (kind, name, decl, slot, origin) so resolve can bind
+# a cross-module reference to the declaring module's Ast. this must track the
+# driver's private build_module_exports field-for-field; the driver helper
+# remained private through the #45 dep bump, so the copy stays.
 fun module_exports(w: *Workspace, mid: sess.ModuleId) res.ModuleExports {
     val m: *driver.ModuleEntry = ?w.p.modules[mid::u32];
     var mx: res.ModuleExports;
@@ -451,6 +451,7 @@ fun module_exports(w: *Workspace, mid: sess.ModuleId) res.ModuleExports {
         ps.kind   = sym.kind;
         ps.name   = sym.name;
         ps.decl   = sym.decl;
+        ps.slot   = sym.slot;
         ps.origin = sym.origin;
         syms[i] = ps;
         i = i + 1;
