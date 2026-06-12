@@ -1,0 +1,488 @@
+# mls.project: the workspace dependency graph that powers cross-module analysis.
+#
+# the editor surface (`mach.lang.editor`) resolves one buffer in isolation with
+# an empty dependency set, so any symbol imported through a `use` binds to
+# SYMBOL_NIL and go-to-definition / references / hover cannot reach it. this
+# module closes that gap: it loads the whole project module graph from disk
+# through the compiler's own `driver.build_project` (manifest + lockfile + the
+# `dep/` tree), snapshots every loaded module's public surface into a single
+# `res.ResolveDeps`, and re-resolves an open buffer against that dep set with
+# `res.resolve` directly — the lower-level API the editor's `resolve` wraps.
+#
+# the graph is loaded lazily the first time a buffer is analyzed, keyed off the
+# document's own filesystem path (the nearest ancestor holding a `mach.toml`).
+# a document outside any project resolves single-file, exactly as before. the
+# loaded `driver.Project` owns every dependency `Ast`; its module ids are
+# registered on the shared session, so a cross-module symbol's `origin` maps
+# back to the defining module's `Ast` + `SourceFile` and hence to a `file://`
+# location on disk (see `site_of`).
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_some;
+use std.types.option.is_none;
+use std.types.option.unwrap;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+use std.allocator.reallocate;
+
+use strutil: std.text.string;
+use fs:      std.filesystem;
+
+use sess:     mach.lang.session;
+use src:      mach.lang.source;
+use editor:   mach.lang.editor;
+use intern:   mach.lang.intern;
+use ast:      mach.lang.fe.ast;
+use res:      mach.lang.fe.resolve;
+use comptime: mach.lang.fe.comptime;
+use driver:   mach.lang.driver;
+use tgt:      mach.lang.target;
+
+# Site: where a resolved symbol's declaration lives — the Ast and SourceFile to
+# read its spans from, and the document URI to report. for a buffer-local symbol
+# this is the request's own buffer; for a cross-module symbol it is the defining
+# dependency module's on-disk file.
+# ---
+# a:     Ast owning the symbol's decl (spans are decl-ids into this tree)
+# file:  SourceFile backing `a` (byte offset <-> position, span text)
+# uri:   document URI of `file`
+# owned: whether `uri` is heap-owned by this Site and must be freed
+pub rec Site {
+    a:     *ast.Ast;
+    file:  *src.SourceFile;
+    uri:   str;
+    owned: bool;
+}
+
+# Workspace: the lazily-loaded project graph plus the per-buffer resolve cache.
+# ---
+# s:           borrowed compiler session (sources, interner, module registry)
+# es:          borrowed editor session (buffer parsing)
+# alloc:       allocator for owned storage
+# loaded:      whether a load has been attempted (success or not)
+# has_project: whether `build_project` found a project and succeeded
+# p:           the loaded project graph; valid only when has_project
+# deps:        snapshot of every loaded module's exports, fed to `res.resolve`
+# own_base:    base module id for open buffers, past every loaded module id, so a
+#              buffer's synthetic module id never collides with a dependency's
+# rr:          per-FileId cache of the buffer's dep-aware ResolveResult
+# rr_len:      number of slots in `rr`
+pub rec Workspace {
+    s:           *sess.Session;
+    es:          *editor.EditorSession;
+    alloc:       *Allocator;
+    loaded:      bool;
+    has_project: bool;
+    p:           driver.Project;
+    deps:        res.ResolveDeps;
+    own_base:    u32;
+    rr:          **res.ResolveResult;
+    rr_len:      u32;
+}
+
+# init: construct an unloaded workspace over the server's sessions.
+# ---
+# s:     compiler session the graph loads into
+# es:    editor session whose buffers are re-resolved against the graph
+# alloc: allocator for all workspace-owned storage
+# ret:   an empty, unloaded Workspace
+pub fun init(s: *sess.Session, es: *editor.EditorSession, alloc: *Allocator) Workspace {
+    var w: Workspace;
+    w.s           = s;
+    w.es          = es;
+    w.alloc       = alloc;
+    w.loaded      = false;
+    w.has_project = false;
+    w.deps.entries = nil;
+    w.deps.count   = 0;
+    w.own_base    = 0;
+    w.rr          = nil;
+    w.rr_len      = 0;
+    ret w;
+}
+
+# dnit: release the resolve cache, the dep snapshot, and the loaded project.
+# ---
+# w: workspace to tear down; all owned fields are zeroed
+pub fun dnit(w: *Workspace) {
+    clear_cache(w);
+    if (w.rr != nil && w.rr_len > 0) {
+        deallocate[*res.ResolveResult](w.alloc, w.rr, w.rr_len::usize);
+    }
+    w.rr     = nil;
+    w.rr_len = 0;
+    free_deps(w);
+    if (w.has_project) {
+        driver.dnit_project(?w.p);
+        w.has_project = false;
+    }
+}
+
+# resolve_doc: the buffer's dep-aware ResolveResult, recomputed against the
+# loaded dependency graph. parses the buffer if needed, loads the project graph
+# on first use (keyed off `uri`'s path), and re-resolves with `res.resolve` and
+# a populated dep set. the result is cached per FileId and replaces any prior
+# one. a document outside a project resolves single-file (empty deps).
+# ---
+# w:   the workspace
+# fid: FileId of an open editor buffer
+# uri: the document's URI, used to locate the project on first load
+# ret: a borrowed pointer to the cached ResolveResult, or an error
+pub fun resolve_doc(w: *Workspace, fid: src.FileId, uri: str) Result[*res.ResolveResult, str] {
+    ensure_loaded(w, uri);
+
+    var a: *ast.Ast = editor.ast_of(w.es, fid);
+    if (a == nil) {
+        val pr: Result[*ast.Ast, str] = editor.parse(w.es, fid);
+        if (is_err[*ast.Ast, str](pr)) { ret err[*res.ResolveResult, str](unwrap_err[*ast.Ast, str](pr)); }
+        a = unwrap_ok[*ast.Ast, str](pr);
+    }
+
+    free_cached(w, fid);
+
+    var ctx: comptime.ComptimeCtx = comptime.init(w.alloc, 0, 0, 8, intern.STR_NIL, intern.STR_NIL);
+    val own: sess.ModuleId = own_module(w, fid);
+    val rr_r: Result[res.ResolveResult, str] = res.resolve(w.s, a, ?w.deps, ?ctx, own);
+    comptime.dnit(?ctx);
+    if (is_err[res.ResolveResult, str](rr_r)) {
+        ret err[*res.ResolveResult, str](unwrap_err[res.ResolveResult, str](rr_r));
+    }
+
+    val slot_r: Result[*res.ResolveResult, str] = allocate[res.ResolveResult](w.alloc, 1);
+    if (is_err[*res.ResolveResult, str](slot_r)) {
+        var local: res.ResolveResult = unwrap_ok[res.ResolveResult, str](rr_r);
+        res.dnit_result(?local);
+        ret slot_r;
+    }
+    val slot: *res.ResolveResult = unwrap_ok[*res.ResolveResult, str](slot_r);
+    @slot = unwrap_ok[res.ResolveResult, str](rr_r);
+    cache_put(w, fid, slot);
+    ret ok[*res.ResolveResult, str](slot);
+}
+
+# own_module: the synthetic module id a buffer resolves under. offset past every
+# loaded module id so a buffer-local symbol's `origin` never equals a loaded
+# dependency's, keeping the local/cross-module distinction exact.
+# ---
+# w:   the workspace
+# fid: FileId of the buffer
+# ret: the buffer's module id for resolution
+pub fun own_module(w: *Workspace, fid: src.FileId) sess.ModuleId {
+    ret (w.own_base + fid::u32)::sess.ModuleId;
+}
+
+# site_of: where symbol `sym` is declared, as an Ast / SourceFile / URI triple.
+# a buffer-local symbol (origin equals the buffer's module) reports against the
+# request buffer; a cross-module symbol reports against the defining dependency
+# module's on-disk file, with a freshly built `file://` URI the caller must free
+# (see `free_site`). none when a cross-module symbol's module is unregistered.
+# ---
+# w:       the workspace
+# own:     the buffer's own module id
+# own_a:   the buffer's Ast
+# own_file:the buffer's SourceFile
+# uri:     the request document's URI
+# sym:     the symbol whose declaration site is wanted
+# ret:     some(Site), or none when the defining module cannot be located
+pub fun site_of(w: *Workspace, own: sess.ModuleId, own_a: *ast.Ast, own_file: *src.SourceFile, uri: str, sym: *res.Symbol) Option[Site] {
+    if (sym.origin == own) {
+        var s: Site;
+        s.a     = own_a;
+        s.file  = own_file;
+        s.uri   = uri;
+        s.owned = false;
+        ret some[Site](s);
+    }
+
+    val dep_a: *ast.Ast = sess.module_ast(w.s, sym.origin);
+    if (dep_a == nil) { ret none[Site](); }
+    val fo: Option[*src.SourceFile] = src.get(?w.s.sources, dep_a.file_id);
+    if (!is_some[*src.SourceFile](fo)) { ret none[Site](); }
+    val dep_file: *src.SourceFile = unwrap[*src.SourceFile](fo);
+
+    val furi: str = file_uri(w.alloc, dep_file.path);
+    if (furi == nil) { ret none[Site](); }
+
+    var s: Site;
+    s.a     = dep_a;
+    s.file  = dep_file;
+    s.uri   = furi;
+    s.owned = true;
+    ret some[Site](s);
+}
+
+# free_site: release a Site's URI when it owns one.
+# ---
+# w:    the workspace
+# site: the site to release
+pub fun free_site(w: *Workspace, site: *Site) {
+    if (site.owned && site.uri != nil) { strutil.str_free(w.alloc, site.uri); }
+    site.uri   = nil;
+    site.owned = false;
+}
+
+# ensure_loaded: load the project graph on first use. derives the project root
+# from `uri`'s path (the nearest ancestor with a mach.toml) and runs
+# `driver.build_project`; on success snapshots every module's exports into the
+# dep set. a missing project is recorded as loaded-but-projectless so subsequent
+# documents resolve single-file without re-probing the filesystem each time.
+fun ensure_loaded(w: *Workspace, uri: str) {
+    if (w.loaded) { ret; }
+    w.loaded = true;
+
+    val path: str = uri_to_path(uri);
+    if (path == nil) { ret; }
+    val root: str = project_root_for(w.alloc, path);
+    if (root == nil) { ret; }
+
+    val reg_r: Result[bool, str] = tgt.register_all(?w.s.interner);
+    if (is_err[bool, str](reg_r)) { strutil.str_free(w.alloc, root); ret; }
+
+    val pr: Result[driver.Project, str] = driver.build_project(w.s, root, "");
+    strutil.str_free(w.alloc, root);
+    if (is_err[driver.Project, str](pr)) { ret; }
+    w.p           = unwrap_ok[driver.Project, str](pr);
+    w.has_project = true;
+    w.own_base    = w.p.module_len;
+
+    build_deps(w);
+}
+
+# build_deps: snapshot every loaded module's public surface into `w.deps`, one
+# ModuleExports per module keyed by FQN. mirrors the driver's per-module
+# dependency assembly but spans the whole graph, so a buffer's `use` of any
+# loaded module binds. modules with no exports contribute an empty entry.
+fun build_deps(w: *Workspace) {
+    val n: u32 = w.p.module_len;
+    if (n == 0) { ret; }
+    val r: Result[*res.ModuleExports, str] = allocate[res.ModuleExports](w.alloc, n::usize);
+    if (is_err[*res.ModuleExports, str](r)) { ret; }
+    w.deps.entries = unwrap_ok[*res.ModuleExports, str](r);
+    w.deps.count   = n;
+
+    var i: u32 = 0;
+    for (i < n) {
+        w.deps.entries[i] = module_exports(w, i::sess.ModuleId);
+        i = i + 1;
+    }
+}
+
+# module_exports: the public surface of loaded module `mid` as a ModuleExports,
+# copying each pub symbol's (kind, name, decl, origin) so resolve can bind a
+# cross-module reference to the declaring module's Ast.
+fun module_exports(w: *Workspace, mid: sess.ModuleId) res.ModuleExports {
+    val m: *driver.ModuleEntry = ?w.p.modules[mid::u32];
+    var mx: res.ModuleExports;
+    mx.path    = m.fqn;
+    mx.module  = mid;
+    mx.symbols = nil;
+    mx.count   = 0;
+    if (!m.resolved || m.resolve_result.pub_count == 0) { ret mx; }
+
+    val pcount: u32 = m.resolve_result.pub_count;
+    val r: Result[*res.PublicSymbol, str] = allocate[res.PublicSymbol](w.alloc, pcount::usize);
+    if (is_err[*res.PublicSymbol, str](r)) { ret mx; }
+    val syms: *res.PublicSymbol = unwrap_ok[*res.PublicSymbol, str](r);
+
+    var i: u32 = 0;
+    for (i < pcount) {
+        val sym: *res.Symbol = ?m.resolve_result.symbols[i];
+        var ps: res.PublicSymbol;
+        ps.kind   = sym.kind;
+        ps.name   = sym.name;
+        ps.decl   = sym.decl;
+        ps.origin = sym.origin;
+        syms[i] = ps;
+        i = i + 1;
+    }
+    mx.symbols = syms;
+    mx.count   = pcount;
+    ret mx;
+}
+
+# free_deps: release the dep snapshot's per-module symbol arrays and the entry
+# array.
+fun free_deps(w: *Workspace) {
+    if (w.deps.entries == nil) { ret; }
+    var i: u32 = 0;
+    for (i < w.deps.count) {
+        val mx: *res.ModuleExports = ?w.deps.entries[i];
+        if (mx.symbols != nil && mx.count > 0) {
+            deallocate[res.PublicSymbol](w.alloc, mx.symbols, mx.count::usize);
+        }
+        i = i + 1;
+    }
+    deallocate[res.ModuleExports](w.alloc, w.deps.entries, w.deps.count::usize);
+    w.deps.entries = nil;
+    w.deps.count   = 0;
+}
+
+# cache_put: store `rr` as the cached ResolveResult for `fid`, growing the cache
+# to cover the FileId and zero-filling any gap.
+fun cache_put(w: *Workspace, fid: src.FileId, rr: *res.ResolveResult) {
+    val needed: u32 = fid::u32 + 1;
+    if (needed > w.rr_len) {
+        var new_len: u32 = w.rr_len;
+        if (new_len == 0) { new_len = 8; }
+        for (new_len < needed) { new_len = new_len * 2; }
+        if (w.rr == nil) {
+            val r: Result[**res.ResolveResult, str] = allocate[*res.ResolveResult](w.alloc, new_len::usize);
+            if (is_err[**res.ResolveResult, str](r)) { ret; }
+            w.rr = unwrap_ok[**res.ResolveResult, str](r);
+        }
+        or {
+            val r: Result[**res.ResolveResult, str] = reallocate[*res.ResolveResult](w.alloc, w.rr, w.rr_len::usize, new_len::usize);
+            if (is_err[**res.ResolveResult, str](r)) { ret; }
+            w.rr = unwrap_ok[**res.ResolveResult, str](r);
+        }
+        var z: u32 = w.rr_len;
+        for (z < new_len) { w.rr[z] = nil; z = z + 1; }
+        w.rr_len = new_len;
+    }
+    w.rr[fid::u32] = rr;
+}
+
+# free_cached: release and clear the cached ResolveResult for `fid`, if any.
+fun free_cached(w: *Workspace, fid: src.FileId) {
+    if (w.rr == nil || fid::u32 >= w.rr_len) { ret; }
+    val rr: *res.ResolveResult = w.rr[fid::u32];
+    if (rr == nil) { ret; }
+    res.dnit_result(rr);
+    deallocate[res.ResolveResult](w.alloc, rr, 1);
+    w.rr[fid::u32] = nil;
+}
+
+# clear_cache: release every cached ResolveResult.
+fun clear_cache(w: *Workspace) {
+    if (w.rr == nil) { ret; }
+    var i: u32 = 0;
+    for (i < w.rr_len) {
+        val rr: *res.ResolveResult = w.rr[i];
+        if (rr != nil) {
+            res.dnit_result(rr);
+            deallocate[res.ResolveResult](w.alloc, rr, 1);
+            w.rr[i] = nil;
+        }
+        i = i + 1;
+    }
+}
+
+# uri_to_path: the filesystem path inside a `file://` URI, as a borrowed slice,
+# or nil when `uri` is not a file URI. percent-encoded octets are not decoded —
+# paths with encoded characters fall through to nil and resolve single-file.
+fun uri_to_path(uri: str) str {
+    if (uri == nil) { ret nil; }
+    val n: usize = str_len(uri);
+    if (n < 7) { ret nil; }
+    if (uri[0] != 'f' || uri[1] != 'i' || uri[2] != 'l' || uri[3] != 'e') { ret nil; }
+    if (uri[4] != ':' || uri[5] != '/' || uri[6] != '/') { ret nil; }
+    var i: usize = 7;
+    for (i < n) {
+        if (uri[i] == '%') { ret nil; }
+        i = i + 1;
+    }
+    ret (uri::usize + 7)::str;
+}
+
+# project_root_for: the nearest ancestor directory of `file_path` that holds a
+# `mach.toml`, as an owned string, or nil when none exists. walks up to the
+# filesystem root.
+fun project_root_for(alloc: *Allocator, file_path: str) str {
+    val n: usize = str_len(file_path);
+    if (n == 0) { ret nil; }
+    var clen: usize = last_slash(file_path, n);
+    if (clen >= n) { ret nil; }
+
+    for (true) {
+        val cand: str = candidate(alloc, file_path, clen);
+        if (cand == nil) { ret nil; }
+        if (fs.is_file(cand)) {
+            strutil.str_free(alloc, cand);
+            ret dup_prefix(alloc, file_path, clen);
+        }
+        strutil.str_free(alloc, cand);
+        if (clen == 0) { ret nil; }
+        clen = last_slash(file_path, clen);
+    }
+    ret nil;
+}
+
+# last_slash: the index of the last '/' in `path[0:end]`, or `end` when none.
+fun last_slash(path: str, end: usize) usize {
+    var i: usize = end;
+    for (i > 0) {
+        i = i - 1;
+        if (path[i] == '/') { ret i; }
+    }
+    ret end;
+}
+
+# candidate: the owned string `path[0:dir_len] + "/mach.toml"`, treating a
+# dir_len of 0 as the filesystem root.
+fun candidate(alloc: *Allocator, path: str, dir_len: usize) str {
+    val suffix: str = "/mach.toml";
+    val slen: usize = str_len(suffix);
+    val total: usize = dir_len + slen;
+    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
+    if (is_err[*u8, str](r)) { ret nil; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+    var k: usize = 0;
+    for (k < dir_len) { buf[k] = path[k]; k = k + 1; }
+    var j: usize = 0;
+    for (j < slen) { buf[dir_len + j] = suffix[j]; j = j + 1; }
+    buf[total] = 0;
+    ret buf::str;
+}
+
+# dup_prefix: an owned copy of `path[0:len]`, or "/" when len is 0.
+fun dup_prefix(alloc: *Allocator, path: str, len: usize) str {
+    if (len == 0) {
+        val r: Result[*u8, str] = allocate[u8](alloc, 2);
+        if (is_err[*u8, str](r)) { ret nil; }
+        val buf: *u8 = unwrap_ok[*u8, str](r);
+        buf[0] = '/';
+        buf[1] = 0;
+        ret buf::str;
+    }
+    val r: Result[*u8, str] = allocate[u8](alloc, len + 1);
+    if (is_err[*u8, str](r)) { ret nil; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+    var k: usize = 0;
+    for (k < len) { buf[k] = path[k]; k = k + 1; }
+    buf[len] = 0;
+    ret buf::str;
+}
+
+# file_uri: a `file://` URI for an absolute filesystem `path`, owned by the
+# caller, or nil on allocation failure.
+fun file_uri(alloc: *Allocator, path: str) str {
+    val scheme: str = "file://";
+    val plen: usize = str_len(path);
+    val slen: usize = str_len(scheme);
+    val total: usize = slen + plen;
+    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
+    if (is_err[*u8, str](r)) { ret nil; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+    var k: usize = 0;
+    for (k < slen) { buf[k] = scheme[k]; k = k + 1; }
+    var j: usize = 0;
+    for (j < plen) { buf[slen + j] = path[j]; j = j + 1; }
+    buf[total] = 0;
+    ret buf::str;
+}
