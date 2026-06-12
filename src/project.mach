@@ -110,29 +110,35 @@ rec Cached {
 }
 
 # Root: one project root open in the session and the dependency graph built from
-# its manifest's default-target import closure.
+# its manifest's default-target import closure. a slot with a nil path is dead
+# and reusable.
 # ---
-# path:        owned absolute project-root path (the dir holding `mach.toml`)
-# live:        whether this slot holds a tracked root; false slots are reusable
-# loaded:      whether the graph built; a live+!loaded slot is a remembered
-#              failed load, retried only when the root is invalidated or its
-#              manifest / lockfile mtime changes
-# p:           the loaded project graph; valid only when loaded
-# deps:        snapshot of every loaded module's exports, fed to `res.resolve`
-# own_base:    base module id for this root's open buffers, past every loaded
-#              module id, so a buffer's synthetic module id never collides with a
-#              dependency's
-# man_mtime:   `mach.toml` mtime at load, for the conservative reload check
-# lock_mtime:  `mach.lock` mtime at load (0 when absent), same purpose
+# path:           owned absolute project-root path (the dir holding `mach.toml`)
+# loaded:         whether the graph built; a tracked !loaded slot is a remembered
+#                 failed load, retried only when the root is invalidated or its
+#                 manifest / lockfile mtime changes
+# p:              the loaded project graph; valid only when loaded
+# deps:           snapshot of every loaded module's exports, fed to `res.resolve`
+# mod_paths:      owned normalized source path per loaded module (nil entries for
+#                 unreadable / unnormalizable sources), so the per-request
+#                 uri -> module lookups are allocation-free string compares
+# mod_path_count: number of entries in `mod_paths`
+# own_base:       base module id for this root's open buffers, past every loaded
+#                 module id, so a buffer's synthetic module id never collides
+#                 with a dependency's
+# man_mtime:      `mach.toml` mtime at the last load attempt, for the
+#                 conservative reload / retry check
+# lock_mtime:     `mach.lock` mtime at the last load attempt (0 when absent)
 pub rec Root {
-    path:       str;
-    live:       bool;
-    loaded:     bool;
-    p:          driver.Project;
-    deps:       res.ResolveDeps;
-    own_base:   u32;
-    man_mtime:  i64;
-    lock_mtime: i64;
+    path:           str;
+    loaded:         bool;
+    p:              driver.Project;
+    deps:           res.ResolveDeps;
+    mod_paths:      *str;
+    mod_path_count: u32;
+    own_base:       u32;
+    man_mtime:      i64;
+    lock_mtime:     i64;
 }
 
 # Workspace: the session's project roots plus the per-buffer resolve cache.
@@ -140,7 +146,7 @@ pub rec Root {
 # s:            borrowed compiler session (sources, interner, module registry)
 # es:           borrowed editor session (buffer parsing)
 # alloc:        allocator for owned storage
-# roots:        array of Root slots (live slots are tracked roots)
+# roots:        array of Root slots (slots with a path are tracked roots)
 # root_cap:     number of slots in `roots`
 # watch_active: whether the client delivers workspace/didChangeWatchedFiles for
 #               the registered globs; when true the per-request manifest-mtime
@@ -205,7 +211,7 @@ pub fun dnit(w: *Workspace) {
     if (w.roots != nil) {
         var i: u32 = 0;
         for (i < w.root_cap) {
-            if (w.roots[i].live) { free_root(w, ?w.roots[i]); }
+            if (w.roots[i].path != nil) { free_root(w, ?w.roots[i]); }
             i = i + 1;
         }
         deallocate[Root](w.alloc, w.roots, w.root_cap::usize);
@@ -422,13 +428,13 @@ fun vendors_dir(w: *Workspace, root_path: str, dir: str) bool {
     ret found;
 }
 
-# find_root: the live slot whose path equals `root_path`, or nil.
+# find_root: the tracked slot whose path equals `root_path`, or nil.
 fun find_root(w: *Workspace, root_path: str) *Root {
     if (w.roots == nil) { ret nil; }
     var i: u32 = 0;
     for (i < w.root_cap) {
         val r: *Root = ?w.roots[i];
-        if (r.live && r.path != nil && str_equals(r.path, root_path)) { ret r; }
+        if (r.path != nil && str_equals(r.path, root_path)) { ret r; }
         i = i + 1;
     }
     ret nil;
@@ -443,18 +449,21 @@ fun find_root(w: *Workspace, root_path: str) *Root {
 # document.
 fun containing_root(w: *Workspace, uri: str, doc_root: str) *Root {
     if (w.roots == nil) { ret nil; }
+    val norm: str = uri_to_norm(w.alloc, uri);
+    if (norm == nil) { ret nil; }
     var found: *Root = nil;
     var i: u32 = 0;
     for (i < w.root_cap && found == nil) {
         val r: *Root = ?w.roots[i];
-        if (r.live && r.loaded
+        if (r.path != nil && r.loaded
             && (doc_root == nil || !str_equals(r.path, doc_root))
-            && is_some[sess.ModuleId](module_for_uri(w, r, uri))) {
+            && is_some[sess.ModuleId](module_for_norm(r, norm))) {
             maybe_reload(w, r);
-            if (r.loaded && is_some[sess.ModuleId](module_for_uri(w, r, uri))) { found = r; }
+            if (r.loaded && is_some[sess.ModuleId](module_for_norm(r, norm))) { found = r; }
         }
         i = i + 1;
     }
+    strutil.str_free(w.alloc, norm);
     ret found;
 }
 
@@ -464,24 +473,32 @@ fun containing_root(w: *Workspace, uri: str, doc_root: str) *Root {
 fun load_root(w: *Workspace, root_path: str) *Root {
     val slot: *Root = alloc_slot(w);
     if (slot == nil) { strutil.str_free(w.alloc, root_path); ret nil; }
-    slot.live       = true;
-    slot.loaded     = false;
-    slot.path       = root_path;
-    slot.deps.entries = nil;
-    slot.deps.count   = 0;
-    slot.own_base   = 0;
-    slot.man_mtime  = 0;
-    slot.lock_mtime = 0;
+    slot.path = root_path;
     if (try_load(w, slot)) { ret slot; }
     ret nil;
 }
 
-# alloc_slot: a reusable dead slot, growing the array if every slot is live.
-# nil on allocation failure.
+# reset_slot: zero a Root slot's fields, marking it dead and reusable. owned
+# storage must already be released (free_root) or never allocated (a fresh
+# slot).
+fun reset_slot(r: *Root) {
+    r.path           = nil;
+    r.loaded         = false;
+    r.deps.entries   = nil;
+    r.deps.count     = 0;
+    r.mod_paths      = nil;
+    r.mod_path_count = 0;
+    r.own_base       = 0;
+    r.man_mtime      = 0;
+    r.lock_mtime     = 0;
+}
+
+# alloc_slot: a reusable dead slot, growing the array when every slot is
+# tracked. nil on allocation failure.
 fun alloc_slot(w: *Workspace) *Root {
     var i: u32 = 0;
     for (i < w.root_cap) {
-        if (!w.roots[i].live) { ret ?w.roots[i]; }
+        if (w.roots[i].path == nil) { ret ?w.roots[i]; }
         i = i + 1;
     }
     val old_cap: u32 = w.root_cap;
@@ -500,10 +517,7 @@ fun alloc_slot(w: *Workspace) *Root {
     }
     var z: u32 = old_cap;
     for (z < new_cap) {
-        val s: *Root = ?w.roots[z];
-        s.live = false; s.loaded = false; s.path = nil;
-        s.deps.entries = nil; s.deps.count = 0;
-        s.own_base = 0; s.man_mtime = 0; s.lock_mtime = 0;
+        reset_slot(?w.roots[z]);
         z = z + 1;
     }
     w.root_cap = new_cap;
@@ -532,14 +546,50 @@ fun try_load(w: *Workspace, r: *Root) bool {
         ret false;
     }
 
-    r.p             = unwrap_ok[driver.Project, str](pr);
-    r.loaded        = true;
-    r.own_base      = r.p.module_len;
-    r.deps.entries  = nil;
-    r.deps.count    = 0;
+    r.p        = unwrap_ok[driver.Project, str](pr);
+    r.loaded   = true;
+    r.own_base = r.p.module_len;
     clear_cache(w);
+    build_mod_paths(w, r);
     build_deps(w, r);
     ret true;
+}
+
+# build_mod_paths: snapshot every loaded module's normalized source path into
+# `r.mod_paths`, indexed by module id, so the per-request uri -> module lookups
+# are allocation-free string compares. a source that cannot be read or
+# normalized leaves a nil entry, making that module unmatchable by uri (the
+# same outcome the per-request normalization had).
+fun build_mod_paths(w: *Workspace, r: *Root) {
+    val n: u32 = r.p.module_len;
+    if (n == 0) { ret; }
+    val arr_r: Result[*str, str] = allocate[str](w.alloc, n::usize);
+    if (is_err[*str, str](arr_r)) { ret; }
+    r.mod_paths      = unwrap_ok[*str, str](arr_r);
+    r.mod_path_count = n;
+
+    var i: u32 = 0;
+    for (i < n) {
+        r.mod_paths[i] = nil;
+        val fo: Option[*src.SourceFile] = src.get(?w.s.sources, (?r.p.modules[i]).file_id);
+        if (is_some[*src.SourceFile](fo)) {
+            r.mod_paths[i] = normalize_path(w.alloc, unwrap[*src.SourceFile](fo).path);
+        }
+        i = i + 1;
+    }
+}
+
+# free_mod_paths: release the per-module normalized path snapshot.
+fun free_mod_paths(w: *Workspace, r: *Root) {
+    if (r.mod_paths == nil) { ret; }
+    var i: u32 = 0;
+    for (i < r.mod_path_count) {
+        if (r.mod_paths[i] != nil) { strutil.str_free(w.alloc, r.mod_paths[i]); }
+        i = i + 1;
+    }
+    deallocate[str](w.alloc, r.mod_paths, r.mod_path_count::usize);
+    r.mod_paths      = nil;
+    r.mod_path_count = 0;
 }
 
 # maybe_reload: rebuild `r`'s graph when its manifest or lockfile changed on
@@ -570,17 +620,14 @@ fun maybe_reload(w: *Workspace, r: *Root) {
 # uri: the URI of the changed file
 pub fun invalidate_uri(w: *Workspace, uri: str) {
     if (uri == nil || w.roots == nil) { ret; }
-    val path: str = uri_to_path(w.alloc, uri);
-    if (path == nil) { ret; }
-    val norm: str = normalize_path(w.alloc, path);
-    strutil.str_free(w.alloc, path);
+    val norm: str = uri_to_norm(w.alloc, uri);
     if (norm == nil) { ret; }
 
     var changed: bool = false;
     var i: u32 = 0;
     for (i < w.root_cap) {
         val r: *Root = ?w.roots[i];
-        if (r.live && root_covers(w, norm, r.path)) {
+        if (r.path != nil && root_covers(w, norm, r.path)) {
             free_root(w, r);
             changed = true;
         }
@@ -610,19 +657,20 @@ fun is_under(file: str, dir: str) bool {
     ret file[dl] == '/';
 }
 
-# free_root: release a root's graph, dep snapshot, and owned path, marking the
-# slot reusable.
+# free_root: release a root's graph, dep snapshot, and owned path, resetting
+# the slot for reuse.
 fun free_root(w: *Workspace, r: *Root) {
     free_root_graph(w, r);
-    if (r.path != nil) { strutil.str_free(w.alloc, r.path); r.path = nil; }
-    r.live   = false;
-    r.loaded = false;
+    if (r.path != nil) { strutil.str_free(w.alloc, r.path); }
+    reset_slot(r);
 }
 
-# free_root_graph: release a root's dep snapshot and loaded project, leaving the
-# slot live with its path so it can reload in place.
+# free_root_graph: release a root's dep snapshot, module-path snapshot, and
+# loaded project, leaving the slot tracked with its path so it can reload in
+# place.
 fun free_root_graph(w: *Workspace, r: *Root) {
     free_deps(w, ?r.deps);
+    free_mod_paths(w, r);
     if (r.loaded) {
         driver.dnit_project(?r.p);
         r.loaded = false;
@@ -684,22 +732,27 @@ pub fun site_of(w: *Workspace, root: *Root, own: sess.ModuleId, own_a: *ast.Ast,
         ret some[Site](s);
     }
 
-    if (root == nil || !root.loaded || sym.origin::u32 >= root.p.module_len) { ret none[Site](); }
-    val m: *driver.ModuleEntry = ?root.p.modules[sym.origin::u32];
-    val dep_a: *ast.Ast = ?m.a;
+    val m: *driver.ModuleEntry = module_entry(root, sym.origin);
+    if (m == nil) { ret none[Site](); }
     val fo: Option[*src.SourceFile] = src.get(?w.s.sources, m.file_id);
     if (!is_some[*src.SourceFile](fo)) { ret none[Site](); }
-    val dep_file: *src.SourceFile = unwrap[*src.SourceFile](fo);
 
-    val furi: str = file_uri(w.alloc, dep_file.path);
+    val furi: str = module_uri(w, root, sym.origin);
     if (furi == nil) { ret none[Site](); }
 
     var s: Site;
-    s.a     = dep_a;
-    s.file  = dep_file;
+    s.a     = ?m.a;
+    s.file  = unwrap[*src.SourceFile](fo);
     s.uri   = furi;
     s.owned = true;
     ret some[Site](s);
+}
+
+# module_entry: loaded module `mid`'s entry in `root`, or nil when there is no
+# loaded project or the id is out of range.
+fun module_entry(root: *Root, mid: sess.ModuleId) *driver.ModuleEntry {
+    if (root == nil || !root.loaded || mid::u32 >= root.p.module_len) { ret nil; }
+    ret ?root.p.modules[mid::u32];
 }
 
 # free_site: release a Site's URI when it owns one.
@@ -744,9 +797,8 @@ pub fun module_count(root: *Root) u32 {
 # mid:  a loaded module id in [0, module_count)
 # ret:  some(ModuleView), or none
 pub fun module_view(w: *Workspace, root: *Root, mid: sess.ModuleId) Option[ModuleView] {
-    if (root == nil || !root.loaded || mid::u32 >= root.p.module_len) { ret none[ModuleView](); }
-    val m: *driver.ModuleEntry = ?root.p.modules[mid::u32];
-    if (!m.resolved) { ret none[ModuleView](); }
+    val m: *driver.ModuleEntry = module_entry(root, mid);
+    if (m == nil || !m.resolved) { ret none[ModuleView](); }
     val fo: Option[*src.SourceFile] = src.get(?w.s.sources, m.file_id);
     if (!is_some[*src.SourceFile](fo)) { ret none[ModuleView](); }
     var v: ModuleView;
@@ -757,19 +809,17 @@ pub fun module_view(w: *Workspace, root: *Root, mid: sess.ModuleId) Option[Modul
 }
 
 # module_uri: a freshly built, normalized `file://` URI for loaded module `mid`'s
-# source file in `root`, owned by the caller, or nil when there is no project,
-# the id is out of range, or allocation fails.
+# source file in `root` (from the root's path snapshot), owned by the caller, or
+# nil when there is no project, the id is out of range, or allocation fails.
 # ---
 # w:    the workspace
 # root: the root governing the request, or nil
 # mid:  a loaded module id
 # ret:  an owned URI, or nil
 pub fun module_uri(w: *Workspace, root: *Root, mid: sess.ModuleId) str {
-    if (root == nil || !root.loaded || mid::u32 >= root.p.module_len) { ret nil; }
-    val m: *driver.ModuleEntry = ?root.p.modules[mid::u32];
-    val fo: Option[*src.SourceFile] = src.get(?w.s.sources, m.file_id);
-    if (!is_some[*src.SourceFile](fo)) { ret nil; }
-    ret file_uri(w.alloc, unwrap[*src.SourceFile](fo).path);
+    if (root == nil || !root.loaded || mid::u32 >= root.mod_path_count) { ret nil; }
+    if (root.mod_paths[mid::u32] == nil) { ret nil; }
+    ret norm_uri(w.alloc, root.mod_paths[mid::u32]);
 }
 
 # module_for_uri: the loaded module in `root` whose source file is the document
@@ -788,30 +838,26 @@ pub fun module_uri(w: *Workspace, root: *Root, mid: sess.ModuleId) str {
 # ret:  some(ModuleId), or none
 pub fun module_for_uri(w: *Workspace, root: *Root, uri: str) Option[sess.ModuleId] {
     if (root == nil || !root.loaded || uri == nil) { ret none[sess.ModuleId](); }
-    val path: str = uri_to_path(w.alloc, uri);
-    if (path == nil) { ret none[sess.ModuleId](); }
-    val norm: str = normalize_path(w.alloc, path);
-    strutil.str_free(w.alloc, path);
+    val norm: str = uri_to_norm(w.alloc, uri);
     if (norm == nil) { ret none[sess.ModuleId](); }
+    val result: Option[sess.ModuleId] = module_for_norm(root, norm);
+    strutil.str_free(w.alloc, norm);
+    ret result;
+}
 
-    var found:  bool = false;
-    var result: sess.ModuleId = 0::sess.ModuleId;
+# module_for_norm: the loaded module in `root` whose normalized source path
+# equals `norm`, or none. the allocation-free core of module_for_uri, also used
+# where one normalized document path is matched against several roots.
+fun module_for_norm(root: *Root, norm: str) Option[sess.ModuleId] {
+    if (root == nil || !root.loaded || norm == nil) { ret none[sess.ModuleId](); }
     var i: u32 = 0;
-    for (i < root.p.module_len && !found) {
-        val m: *driver.ModuleEntry = ?root.p.modules[i];
-        val fo: Option[*src.SourceFile] = src.get(?w.s.sources, m.file_id);
-        if (is_some[*src.SourceFile](fo)) {
-            val mnorm: str = normalize_path(w.alloc, unwrap[*src.SourceFile](fo).path);
-            if (mnorm != nil) {
-                if (str_equals(mnorm, norm)) { found = true; result = i::sess.ModuleId; }
-                strutil.str_free(w.alloc, mnorm);
-            }
+    for (i < root.mod_path_count) {
+        if (root.mod_paths[i] != nil && str_equals(root.mod_paths[i], norm)) {
+            ret some[sess.ModuleId](i::sess.ModuleId);
         }
         i = i + 1;
     }
-    strutil.str_free(w.alloc, norm);
-    if (!found) { ret none[sess.ModuleId](); }
-    ret some[sess.ModuleId](result);
+    ret none[sess.ModuleId]();
 }
 
 # is_project_module: whether loaded module `mid` in `root` belongs to the user's
@@ -824,8 +870,8 @@ pub fun module_for_uri(w: *Workspace, root: *Root, uri: str) Option[sess.ModuleI
 # mid:  a loaded module id
 # ret:  true for a project-owned module
 pub fun is_project_module(w: *Workspace, root: *Root, mid: sess.ModuleId) bool {
-    if (root == nil || !root.loaded || mid::u32 >= root.p.module_len) { ret false; }
-    val m: *driver.ModuleEntry = ?root.p.modules[mid::u32];
+    val m: *driver.ModuleEntry = module_entry(root, mid);
+    if (m == nil) { ret false; }
     val id_opt:  Option[str] = intern.lookup(?w.s.interner, root.p.config.id);
     val fqn_opt: Option[str] = intern.lookup(?w.s.interner, m.fqn);
     if (!is_some[str](id_opt) || !is_some[str](fqn_opt)) { ret false; }
@@ -852,8 +898,8 @@ fun document_root(w: *Workspace, uri: str) str {
 # report_load_failure: log the loader error and warn the user through
 # window/showMessage so a manifest that fails to load (a malformed or
 # unparseable mach.toml) is distinguishable from "no project found". the slot
-# itself remembers the failure (live + !loaded), so the load is not retried per
-# request.
+# itself remembers the failure (tracked + !loaded), so the load is only retried
+# when the manifest / lockfile changes.
 fun report_load_failure(w: *Workspace, root: str, msg: str) {
     trace.log("project: failed to load project at ");
     trace.log(root);
@@ -1071,6 +1117,16 @@ fun uri_to_path(alloc: *Allocator, uri: str) str {
     ret buf::str;
 }
 
+# uri_to_norm: the normalized filesystem path of a `file://` URI, as an owned
+# string, or nil for a non-file URI / malformed escape / allocation failure.
+fun uri_to_norm(alloc: *Allocator, uri: str) str {
+    val path: str = uri_to_path(alloc, uri);
+    if (path == nil) { ret nil; }
+    val norm: str = normalize_path(alloc, path);
+    strutil.str_free(alloc, path);
+    ret norm;
+}
+
 # hex_val: the value of a hex digit, or -1.
 fun hex_val(c: u8) i64 {
     if (c >= '0' && c <= '9') { ret (c - '0')::i64; }
@@ -1147,24 +1203,20 @@ fun normalize_path(alloc: *Allocator, path: str) str {
     ret buf::str;
 }
 
-# file_uri: a `file://` URI for an absolute filesystem `path`, lexically
-# normalized, owned by the caller, or nil on allocation failure.
-fun file_uri(alloc: *Allocator, path: str) str {
-    val norm: str = normalize_path(alloc, path);
-    if (norm == nil) { ret nil; }
-
+# norm_uri: a `file://` URI for an already-normalized absolute path, owned by
+# the caller, or nil on allocation failure.
+fun norm_uri(alloc: *Allocator, norm: str) str {
     val scheme: str = "file://";
     val plen: usize = str_len(norm);
     val slen: usize = str_len(scheme);
     val total: usize = slen + plen;
     val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](r)) { strutil.str_free(alloc, norm); ret nil; }
+    if (is_err[*u8, str](r)) { ret nil; }
     val buf: *u8 = unwrap_ok[*u8, str](r);
     var off: usize = 0;
     off = append(buf, off, scheme);
     off = append(buf, off, norm);
     buf[off] = 0;
-    strutil.str_free(alloc, norm);
     ret buf::str;
 }
 
