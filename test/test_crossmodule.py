@@ -3,7 +3,8 @@
 on the vendored mach-std. definition / references / hover on a `use`d std symbol
 must reach the canonical file:// URI of the decl inside dep/mach-std, while a
 local symbol still resolves in the buffer. also covers project-load ordering (a
-scratch file opened first must not disable the later project load) and
+scratch file opened first must not disable the later project load; a dep source
+opened first must still refuse rename via its vendoring project) and
 percent-encoded document URIs."""
 import os
 
@@ -165,25 +166,28 @@ def percent_encoding_scenario():
     return failures
 
 
+def _strlen_decl():
+    """(dep text, position of the str_len declaration name) from the vendored
+    string.mach, or (None, None) when it cannot be located."""
+    dep_path = os.path.join(REPO, "dep", "mach-std", "src", "types", "string.mach")
+    dep_text = open(dep_path).read()
+    for i, line in enumerate(dep_text.splitlines()):
+        if "pub fun str_len" in line:
+            return dep_text, pos(i, line.find("str_len"))
+    return None, None
+
+
 def dep_buffer_rename_scenario():
     """a dependency source opened directly (as after go-to-definition) is not the
     editor's to rewrite: even though its symbols resolve buffer-locally, its
     on-disk twin is a non-project module, so prepareRename refuses and rename
     yields an empty WorkspaceEdit (regression: the local-symbol path skipped the
     project-ownership check)."""
-    dep_path = os.path.join(REPO, "dep", "mach-std", "src", "types", "string.mach")
-    dep_text = open(dep_path).read()
-    decl_line = None
-    decl_col = None
-    for i, line in enumerate(dep_text.splitlines()):
-        if "pub fun str_len" in line:
-            decl_line, decl_col = i, line.find("str_len")
-            break
-    if decl_line is None:
-        return [f"str_len declaration not found in {dep_path}"]
+    dep_text, dep_pos = _strlen_decl()
+    if dep_text is None:
+        return ["str_len declaration not found in dep/mach-std"]
 
     app_text = open(APP).read()
-    dep_pos = pos(decl_line, decl_col)
     frames = [
         req(1, "initialize", {"capabilities": {}}),
         notify("initialized"),
@@ -214,6 +218,41 @@ def dep_buffer_rename_scenario():
     return failures
 
 
+def dep_buffer_first_scenario():
+    """a dependency source opened cold — before any project document — must
+    still refuse rename: the vendoring project above it (this repo, which
+    declares mach-std as a dep) is loaded and the document routed as its
+    read-only twin, instead of the dep's own manifest dir becoming a renameable
+    project root (regression: open-order dependence of the refusal)."""
+    dep_text, dep_pos = _strlen_decl()
+    if dep_text is None:
+        return ["str_len declaration not found in dep/mach-std"]
+
+    frames = [
+        req(1, "initialize", {"capabilities": {}}),
+        notify("initialized"),
+        did_open(DEP_STRING_URI, dep_text),
+        req(20, "textDocument/prepareRename",
+            {"textDocument": {"uri": DEP_STRING_URI}, "position": dep_pos}),
+        req(21, "textDocument/rename",
+            {"textDocument": {"uri": DEP_STRING_URI}, "position": dep_pos, "newName": "nope"}),
+        req(2, "shutdown", None),
+        notify("exit"),
+    ]
+    code, msgs = drive(frames)
+
+    failures = []
+    prv = (by_id(msgs, 20) or {}).get("result", "missing")
+    if prv is not None:
+        failures.append(f"prepareRename(cold dep buffer decl) should be null, got {prv!r}")
+    rnv = (by_id(msgs, 21) or {}).get("result")
+    if not isinstance(rnv, dict) or rnv.get("changes") != {}:
+        failures.append(f"rename(cold dep buffer decl) should be an empty WorkspaceEdit, got {rnv!r}")
+    if code != 0:
+        failures.append("non-zero exit code after clean shutdown")
+    return failures
+
+
 def run():
     """drive the cross-module scenarios; return a list of failure strings."""
     if not os.path.exists(APP):
@@ -223,6 +262,7 @@ def run():
     failures += scratch_ordering_scenario()
     failures += percent_encoding_scenario()
     failures += dep_buffer_rename_scenario()
+    failures += dep_buffer_first_scenario()
     return failures
 
 

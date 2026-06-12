@@ -13,11 +13,12 @@
 # multi-root by design: a `Workspace` holds one `Root` per distinct project
 # root open in the session, each with its own `driver.Project`, dep snapshot,
 # and synthetic buffer-id base. a document is routed to the root that governs
-# its path (the nearest ancestor `mach.toml`); a document that is already a
-# dependency module of a loaded root is routed to that root read-only, rather
-# than spun up as its own project; a document under no `mach.toml` resolves
-# single-file (empty dep set). the legacy "one project per session" behaviour
-# is just the one-Root case.
+# its path (the nearest ancestor `mach.toml`); a document that is a dependency
+# module of a root rooted elsewhere — already loaded, or an ancestor project
+# loaded on demand when the document's own root is nested under it — is routed
+# to that root read-only, rather than spun up as its own project; a document
+# under no `mach.toml` resolves single-file (empty dep set). the legacy "one
+# project per session" behaviour is just the one-Root case.
 #
 # module-id namespacing: `driver.build_project` allocates project-local module
 # ids from 0 and writes them into the session's global module registries, so a
@@ -65,6 +66,7 @@ use std.allocator.reallocate;
 use strutil: std.text.string;
 use fs:      std.filesystem;
 use pathlib: std.types.path;
+use toml:    std.data.toml;
 
 use mem: std.memory;
 
@@ -286,11 +288,12 @@ pub fun own_module(root: *Root, fid: src.FileId) sess.ModuleId {
     ret (base + fid::u32)::sess.ModuleId;
 }
 
-# root_for: the root governing the document at `uri`, loading it on first use, or
-# nil when the document resolves single-file (no ancestor `mach.toml`, or a
-# remembered failed load). a document whose own project root is not loaded but
-# which is already a dependency module of a loaded root is routed to that root
-# read-only, rather than spun up as its own project.
+# root_for: the root governing the document at `uri`, loading it on first use,
+# or nil when the document resolves single-file (no ancestor `mach.toml`, or a
+# remembered failed load). a document that is a dependency module of a root
+# rooted elsewhere — whether that root is already loaded, or is an ancestor
+# project loaded here on demand — is routed to that root read-only, rather than
+# spun up as its own project, regardless of document open order.
 # ---
 # w:   the workspace
 # uri: the document's URI
@@ -316,7 +319,107 @@ pub fun root_for(w: *Workspace, uri: str) *Root {
         if (!existing.loaded) { ret nil; }
         ret existing;
     }
+
+    # fresh root: when an ancestor project declares this root as one of its dep
+    # vendor dirs, load that project and prefer it when its graph holds the
+    # document — so a dependency source opened before any project document
+    # still routes read-only instead of becoming its own renameable project.
+    val outer: *Root = ancestor_root(w, uri, doc_root, doc_root);
+    if (outer != nil) { strutil.str_free(w.alloc, doc_root); ret outer; }
+
     ret load_root(w, doc_root);
+}
+
+# ancestor_root: load-and-prefer an outer project for the document at `uri`
+# whose own (fresh) root is `doc_root`. walks the chain of ancestor manifest
+# dirs strictly above `dir` (`doc_root` on the outer call), outermost first; an
+# ancestor is only considered when its manifest declares `doc_root` as one of
+# its dep vendor dirs (`vendors_dir`), so unrelated outer projects — a monorepo
+# root, this repo above its test fixtures — are never speculatively built. the
+# first considered ancestor whose loaded graph holds the document as a module
+# governs it; one that loads but does not hold it stays loaded (it is a real
+# project). ancestors already tracked are skipped: a loaded-and-containing one
+# was already returned by containing_root, and a failed one is not retried
+# here. only the document's direct vendoring project is found — a dep nested
+# inside another dep's tree routes to that dep's root, not the outermost
+# project. nil when no ancestor claims the document.
+fun ancestor_root(w: *Workspace, uri: str, doc_root: str, dir: str) *Root {
+    val par_r: Result[pathlib.Path, str] = pathlib.parent(w.alloc, dir);
+    if (is_err[pathlib.Path, str](par_r)) { ret nil; }
+    val par: str = unwrap_ok[pathlib.Path, str](par_r);
+    if (str_equals(par, dir)) { strutil.str_free(w.alloc, par); ret nil; }
+    val anc: str = project_root_for(w.alloc, par);
+    strutil.str_free(w.alloc, par);
+    if (anc == nil) { ret nil; }
+
+    val above: *Root = ancestor_root(w, uri, doc_root, anc);
+    if (above != nil) { strutil.str_free(w.alloc, anc); ret above; }
+
+    if (find_root(w, anc) != nil || !vendors_dir(w, anc, doc_root)) {
+        strutil.str_free(w.alloc, anc);
+        ret nil;
+    }
+
+    val r: *Root = load_root(w, anc);
+    if (r == nil) { ret nil; }
+    if (is_some[sess.ModuleId](module_for_uri(w, r, uri))) { ret r; }
+    ret nil;
+}
+
+# vendors_dir: whether the project at `root_path` declares a dependency whose
+# vendor dir is `dir` — i.e. `dir` equals `<root>/<[project].dep>/<alias>` for
+# some `[deps.<alias>]`, the same layout the driver's dep resolution reads. one
+# small manifest parse answers "could this project claim that nested root?"
+# without paying a full graph build; the loaded graph remains the authority on
+# actual containment. a manifest that fails to read or parse vendors nothing.
+# the parsed table is leaked into the server's page allocator — std.data.toml
+# exposes no teardown, the same convention the driver's own manifest reads use.
+fun vendors_dir(w: *Workspace, root_path: str, dir: str) bool {
+    val mp_r: Result[pathlib.Path, str] = pathlib.join(w.alloc, root_path, "mach.toml");
+    if (is_err[pathlib.Path, str](mp_r)) { ret false; }
+    val mp: str = unwrap_ok[pathlib.Path, str](mp_r);
+    val text_r: Result[str, str] = fs.read_all(w.alloc, mp);
+    strutil.str_free(w.alloc, mp);
+    if (is_err[str, str](text_r)) { ret false; }
+    val text: str = unwrap_ok[str, str](text_r);
+    val t_r: Result[toml.Table, str] = toml.parse(w.alloc, text);
+    strutil.str_free(w.alloc, text);
+    if (is_err[toml.Table, str](t_r)) { ret false; }
+    var t: toml.Table = unwrap_ok[toml.Table, str](t_r);
+
+    val deps: *toml.Table = toml.get_table(?t, "deps");
+    if (deps == nil) { ret false; }
+    var dir_dep: str = toml.get_str(?t, "project.dep");
+    if (dir_dep == nil) { dir_dep = "dep"; }
+
+    val want: str = normalize_path(w.alloc, dir);
+    if (want == nil) { ret false; }
+
+    var found: bool = false;
+    var i: usize = 0;
+    for (i < toml.table_len(deps) && !found) {
+        val alias: str = toml.table_key(deps, i);
+        if (alias != nil) {
+            val base_r: Result[pathlib.Path, str] = pathlib.join(w.alloc, root_path, dir_dep);
+            if (!is_err[pathlib.Path, str](base_r)) {
+                val base: str = unwrap_ok[pathlib.Path, str](base_r);
+                val cand_r: Result[pathlib.Path, str] = pathlib.join(w.alloc, base, alias);
+                strutil.str_free(w.alloc, base);
+                if (!is_err[pathlib.Path, str](cand_r)) {
+                    val cand: str = unwrap_ok[pathlib.Path, str](cand_r);
+                    val norm: str = normalize_path(w.alloc, cand);
+                    strutil.str_free(w.alloc, cand);
+                    if (norm != nil) {
+                        if (str_equals(norm, want)) { found = true; }
+                        strutil.str_free(w.alloc, norm);
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    strutil.str_free(w.alloc, want);
+    ret found;
 }
 
 # find_root: the live slot whose path equals `root_path`, or nil.
