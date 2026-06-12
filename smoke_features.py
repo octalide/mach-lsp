@@ -6,14 +6,17 @@ import json
 import subprocess
 import sys
 
-BIN = "out/linux/bin/mach-lsp"
+BIN = "out/linux/debug/bin/mls"
 
+DOC = "helper returns its argument unchanged."
 SRC = (
-    "fun helper(a: i64) i64 { ret a; }\n"   # line 0
-    "fun main() i64 {\n"                     # line 1
-    "    val x: i64 = helper(7);\n"          # line 2
-    "    ret x;\n"                            # line 3
-    "}\n"                                     # line 4
+    "# helper returns its argument unchanged.\n"      # line 0 (doc comment)
+    "# exercised by the hover doc-comment assertion.\n"  # line 1 (doc comment)
+    "fun helper(a: i64) i64 { ret a; }\n"   # line 2
+    "fun main() i64 {\n"                     # line 3
+    "    val x: i64 = helper(7);\n"          # line 4
+    "    ret x;\n"                            # line 5
+    "}\n"                                     # line 6
 )
 URI = "file:///feat.mach"
 
@@ -53,35 +56,35 @@ requests = b"".join([
     frame({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
     frame({"jsonrpc": "2.0", "method": "textDocument/didOpen",
            "params": {"textDocument": {"uri": URI, "languageId": "mach", "version": 1, "text": SRC}}}),
-    # hover on `helper` at its call site (line 2, char ~17)
+    # hover on `helper` at its call site (line 4, char ~17)
     frame({"jsonrpc": "2.0", "id": 10, "method": "textDocument/hover",
-           "params": {"textDocument": {"uri": URI}, "position": pos(2, 17)}}),
-    # hover on `x` use at `ret x` (line 3, char 8)
+           "params": {"textDocument": {"uri": URI}, "position": pos(4, 17)}}),
+    # hover on `x` use at `ret x` (line 5, char 8)
     frame({"jsonrpc": "2.0", "id": 11, "method": "textDocument/hover",
-           "params": {"textDocument": {"uri": URI}, "position": pos(3, 8)}}),
-    # definition of `helper` call (line 2) -> decl on line 0
+           "params": {"textDocument": {"uri": URI}, "position": pos(5, 8)}}),
+    # definition of `helper` call (line 4) -> decl on line 2
     frame({"jsonrpc": "2.0", "id": 20, "method": "textDocument/definition",
-           "params": {"textDocument": {"uri": URI}, "position": pos(2, 17)}}),
+           "params": {"textDocument": {"uri": URI}, "position": pos(4, 17)}}),
     # references of `helper` (decl + the one call)
     frame({"jsonrpc": "2.0", "id": 30, "method": "textDocument/references",
-           "params": {"textDocument": {"uri": URI}, "position": pos(0, 4),
+           "params": {"textDocument": {"uri": URI}, "position": pos(2, 4),
                       "context": {"includeDeclaration": True}}}),
     # prepareRename on `x`
     frame({"jsonrpc": "2.0", "id": 40, "method": "textDocument/prepareRename",
-           "params": {"textDocument": {"uri": URI}, "position": pos(2, 8)}}),
+           "params": {"textDocument": {"uri": URI}, "position": pos(4, 8)}}),
     # rename `x` -> `y`
     frame({"jsonrpc": "2.0", "id": 41, "method": "textDocument/rename",
-           "params": {"textDocument": {"uri": URI}, "position": pos(2, 8), "newName": "y"}}),
-    # rename parameter `a` from its binding site (line 0, char 11) -> `arg`;
+           "params": {"textDocument": {"uri": URI}, "position": pos(4, 8), "newName": "y"}}),
+    # rename parameter `a` from its binding site (line 2, char 11) -> `arg`;
     # must rewrite the binding plus the `ret a` use (a correct, compiling rename)
     frame({"jsonrpc": "2.0", "id": 42, "method": "textDocument/rename",
-           "params": {"textDocument": {"uri": URI}, "position": pos(0, 11), "newName": "arg"}}),
+           "params": {"textDocument": {"uri": URI}, "position": pos(2, 11), "newName": "arg"}}),
     # documentSymbol
     frame({"jsonrpc": "2.0", "id": 50, "method": "textDocument/documentSymbol",
            "params": {"textDocument": {"uri": URI}}}),
     # completion at statement position inside main
     frame({"jsonrpc": "2.0", "id": 60, "method": "textDocument/completion",
-           "params": {"textDocument": {"uri": URI}, "position": pos(3, 4)}}),
+           "params": {"textDocument": {"uri": URI}, "position": pos(5, 4)}}),
     frame({"jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": None}),
     frame({"jsonrpc": "2.0", "method": "exit", "params": None}),
 ])
@@ -110,13 +113,17 @@ for cap in ["hoverProvider", "definitionProvider", "referencesProvider",
     if cap not in caps:
         failures.append(f"initialize missing capability {cap}")
 
-# hover on helper -> markdown mentioning helper signature
+# hover on helper -> markdown mentioning helper signature and its doc comment
 h = by_id(10)
 hv = (h or {}).get("result")
 if not hv or "contents" not in hv:
     failures.append("hover(helper) returned no contents")
-elif "helper" not in hv["contents"].get("value", ""):
-    failures.append("hover(helper) value does not mention 'helper'")
+else:
+    hval = hv["contents"].get("value", "")
+    if "helper" not in hval:
+        failures.append("hover(helper) value does not mention 'helper'")
+    if DOC not in hval:
+        failures.append(f"hover(helper) value does not include the doc comment {DOC!r}")
 
 # hover on x -> mentions x and i64
 h2 = by_id(11)
@@ -126,13 +133,13 @@ if not hv2 or "contents" not in hv2:
 elif "i64" not in hv2["contents"].get("value", ""):
     failures.append("hover(x) value does not mention type 'i64'")
 
-# definition of helper -> a Location on line 0
+# definition of helper -> a Location on line 2 (its decl)
 d = by_id(20)
 dv = (d or {}).get("result")
 if not dv or "range" not in dv:
     failures.append("definition(helper) returned no Location")
-elif dv["range"]["start"]["line"] != 0:
-    failures.append(f"definition(helper) points to line {dv['range']['start']['line']}, expected 0")
+elif dv["range"]["start"]["line"] != 2:
+    failures.append(f"definition(helper) points to line {dv['range']['start']['line']}, expected 2")
 
 # references of helper -> at least 2 (decl + call)
 r = by_id(30)
@@ -172,9 +179,9 @@ else:
     elif any(e.get("newText") != "arg" for e in pedits):
         failures.append("rename(param a) edit newText is not 'arg'")
     else:
-        # the binding site is on line 0 (the signature); a use is on line 0 too,
+        # the binding site is on line 2 (the signature); a use is on line 2 too,
         # but there must be an edit at the binding column (char 11)
-        cols = {e["range"]["start"]["character"] for e in pedits if e["range"]["start"]["line"] == 0}
+        cols = {e["range"]["start"]["character"] for e in pedits if e["range"]["start"]["line"] == 2}
         if 11 not in cols:
             failures.append(f"rename(param a) did not rewrite the binding at col 11 (cols {sorted(cols)})")
 
