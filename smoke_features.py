@@ -10,7 +10,7 @@ BIN = "out/linux/debug/bin/mls"
 
 DOC = "helper returns its argument unchanged."
 SRC = (
-    "# helper returns its argument unchanged.\n"      # line 0 (doc comment)
+    f"# {DOC}\n"                                         # line 0 (doc comment)
     "# exercised by the hover doc-comment assertion.\n"  # line 1 (doc comment)
     "fun helper(a: i64) i64 { ret a; }\n"   # line 2
     "fun main() i64 {\n"                     # line 3

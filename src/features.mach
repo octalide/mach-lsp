@@ -29,6 +29,7 @@ use std.types.option.is_some;
 use std.types.option.unwrap;
 
 use sess:   mach.lang.session;
+use src:    mach.lang.source;
 use intern: mach.lang.intern;
 use token:  mach.lang.fe.token;
 use ast:    mach.lang.fe.ast;
@@ -379,53 +380,52 @@ fun param_signature_span(a: *ast.Ast, sym: *res.Symbol) Option[token.Span] {
 
 # doc_comment_span: the byte span of the contiguous run of `#` comment lines
 # immediately above a local symbol's declaration — its doc comment. the lexer
-# discards comment tokens, so this back-scans the raw source the way `mach doc`
-# does: from the decl's first line it walks backward over comment lines
-# (tolerating leading whitespace before the `#`), stopping at the first
-# non-comment line. none for a param / generic, a decl with no comment run
-# flush above it, or a decl at the file start.
+# discards comment tokens, so this back-scans the file's line index the way
+# `mach doc` scans raw text: from the decl's line it walks backward over
+# comment lines (tolerating leading whitespace before the `#`), stopping at
+# the first non-comment line. none for a param / generic, a decl with no
+# comment run flush above it, or a decl on the first line.
 # ---
 # a:    the Ast owning the decl
 # sym:  the symbol whose doc comment is wanted
-# text: the full source text of the file owning the decl
-# ret:  some(span) covering the comment run (its trailing newline included), or
-#       none
-pub fun doc_comment_span(a: *ast.Ast, sym: *res.Symbol, text: str) Option[token.Span] {
+# file: the source file owning the decl
+# ret:  some(span) covering the comment run (its line endings included), or none
+pub fun doc_comment_span(a: *ast.Ast, sym: *res.Symbol, file: *src.SourceFile) Option[token.Span] {
     if (sym.kind == res.SYM_PARAM || sym.kind == res.SYM_GENERIC) { ret none[token.Span](); }
     val dso: Option[token.Span] = decl_span_of(a, sym);
     if (!is_some[token.Span](dso)) { ret none[token.Span](); }
+    val decl_line: usize = src.position(file, unwrap[token.Span](dso).offset).line;
 
-    val s: *u8 = text::*u8;
-    val decl_line: usize = line_start_back(s, unwrap[token.Span](dso).offset);
+    var first: usize = decl_line;
+    for (first > 1 && comment_line(file, first - 1)) { first = first - 1; }
+    if (first == decl_line) { ret none[token.Span](); }
 
-    var run: usize = decl_line;
-    for (run > 0) {
-        val prev: usize = line_start_back(s, run - 1);
-        if (!is_comment_line(s, prev)) { brk; }
-        run = prev;
-    }
-    if (run == decl_line) { ret none[token.Span](); }
+    val so: Option[usize] = src.line_start(file, first);
+    val eo: Option[usize] = src.line_start(file, decl_line);
+    if (!is_some[usize](so) || !is_some[usize](eo)) { ret none[token.Span](); }
 
     var sp: token.Span;
-    sp.offset = run;
-    sp.len    = decl_line - run;
+    sp.offset = unwrap[usize](so);
+    sp.len    = unwrap[usize](eo) - sp.offset;
     ret some[token.Span](sp);
 }
 
-# line_start_back: the byte offset of the start of the line containing `pos`,
-# found by scanning back to just past the preceding newline (or the file start).
-fun line_start_back(s: *u8, pos: usize) usize {
+# first_nonspace: index of the first non-space, non-tab byte in `s` at or after
+# `pos`, clamped to `end`. shared by the doc-comment scan and its renderer.
+pub fun first_nonspace(s: *u8, pos: usize, end: usize) usize {
     var i: usize = pos;
-    for (i > 0 && s[i - 1] != '\n') { i = i - 1; }
+    for (i < end && (s[i] == ' ' || s[i] == '\t')) { i = i + 1; }
     ret i;
 }
 
-# is_comment_line: true when the first significant byte of the line at `pos` is
-# `#`, tolerating leading spaces / tabs.
-fun is_comment_line(s: *u8, pos: usize) bool {
-    var i: usize = pos;
-    for (s[i] == ' ' || s[i] == '\t') { i = i + 1; }
-    ret s[i] == '#';
+# comment_line: true when the 1-based `line`'s first significant byte is `#`.
+fun comment_line(file: *src.SourceFile, line: usize) bool {
+    val bo: Option[src.LineSpan] = src.line_bounds(file, line);
+    if (!is_some[src.LineSpan](bo)) { ret false; }
+    val lb: src.LineSpan = unwrap[src.LineSpan](bo);
+    val s: *u8 = file.text::*u8;
+    val i: usize = first_nonspace(s, lb.start, lb.end);
+    ret i < lb.end && s[i] == '#';
 }
 
 # kind_label: a human-readable label for a symbol kind, for hover rendering.
