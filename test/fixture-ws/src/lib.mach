@@ -1,0 +1,11 @@
+# lib: a project module whose pub symbol is imported across files, so renaming
+# it must rewrite this declaration and every importer.
+
+# shared: a value passed through; imported and used by the app module.
+pub fun shared(x: i64) i64 {
+    ret x;
+}
+
+# LIMIT: a pub constant the app module imports; a function-local binding that
+# shadows this name must rename buffer-local without bridging to it.
+pub val LIMIT: i64 = 10;
