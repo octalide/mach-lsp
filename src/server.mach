@@ -260,6 +260,9 @@ fun handle_initialized(srv: *Server) {
     if (!srv.watch_dynamic) { ret; }
     val reg: str = "{\"jsonrpc\":\"2.0\",\"id\":\"mls/registerWatchers\",\"method\":\"client/registerCapability\",\"params\":{\"registrations\":[{\"id\":\"mls-watched-files\",\"method\":\"workspace/didChangeWatchedFiles\",\"registerOptions\":{\"watchers\":[{\"globPattern\":\"**/mach.toml\"},{\"globPattern\":\"**/mach.lock\"},{\"globPattern\":\"**/*.mach\"}]}}]}}";
     transport.send_message(reg, srv.alloc);
+    # the watcher now covers manifest / lockfile changes; skip the per-request
+    # mtime fallback check.
+    project.set_watch_active(?srv.ws, true);
 }
 
 # handle_did_change_watched_files: invalidate every project root whose tree

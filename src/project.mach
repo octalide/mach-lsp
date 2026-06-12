@@ -32,9 +32,10 @@
 #
 # invalidation: a root's graph is a load-time snapshot. `invalidate_uri` (driven
 # by `workspace/didChangeWatchedFiles`) drops every root whose tree contains the
-# changed file, so the next request rebuilds it from disk; a conservative
-# manifest/lockfile mtime check on each access reloads even when the client does
-# not deliver watch notifications.
+# changed file, so the next request rebuilds it from disk. when the client does
+# not deliver watch notifications, a conservative manifest/lockfile mtime check
+# on each access reloads a stale root and retries a previously failed one (a
+# since-fixed manifest); with watching active the check is skipped.
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -112,7 +113,8 @@ rec Cached {
 # path:        owned absolute project-root path (the dir holding `mach.toml`)
 # live:        whether this slot holds a tracked root; false slots are reusable
 # loaded:      whether the graph built; a live+!loaded slot is a remembered
-#              failed load, not retried per request until the root is invalidated
+#              failed load, retried only when the root is invalidated or its
+#              manifest / lockfile mtime changes
 # p:           the loaded project graph; valid only when loaded
 # deps:        snapshot of every loaded module's exports, fed to `res.resolve`
 # own_base:    base module id for this root's open buffers, past every loaded
@@ -133,23 +135,27 @@ pub rec Root {
 
 # Workspace: the session's project roots plus the per-buffer resolve cache.
 # ---
-# s:         borrowed compiler session (sources, interner, module registry)
-# es:        borrowed editor session (buffer parsing)
-# alloc:     allocator for owned storage
-# roots:     array of Root slots (live slots are tracked roots)
-# root_cap:  number of slots in `roots`
-# empty:     the empty dep set used for documents outside any project
-# cache:     per-FileId cache of each buffer's dep-aware ResolveResult
-# cache_len: number of slots in `cache`
+# s:            borrowed compiler session (sources, interner, module registry)
+# es:           borrowed editor session (buffer parsing)
+# alloc:        allocator for owned storage
+# roots:        array of Root slots (live slots are tracked roots)
+# root_cap:     number of slots in `roots`
+# watch_active: whether the client delivers workspace/didChangeWatchedFiles for
+#               the registered globs; when true the per-request manifest-mtime
+#               fallback check is skipped (the watcher covers it)
+# empty:        the empty dep set used for documents outside any project
+# cache:        per-FileId cache of each buffer's dep-aware ResolveResult
+# cache_len:    number of slots in `cache`
 pub rec Workspace {
-    s:         *sess.Session;
-    es:        *editor.EditorSession;
-    alloc:     *Allocator;
-    roots:     *Root;
-    root_cap:  u32;
-    empty:     res.ResolveDeps;
-    cache:     *Cached;
-    cache_len: u32;
+    s:            *sess.Session;
+    es:           *editor.EditorSession;
+    alloc:        *Allocator;
+    roots:        *Root;
+    root_cap:     u32;
+    watch_active: bool;
+    empty:        res.ResolveDeps;
+    cache:        *Cached;
+    cache_len:    u32;
 }
 
 # init: construct an empty workspace over the server's sessions.
@@ -165,11 +171,23 @@ pub fun init(s: *sess.Session, es: *editor.EditorSession, alloc: *Allocator) Wor
     w.alloc         = alloc;
     w.roots         = nil;
     w.root_cap      = 0;
+    w.watch_active  = false;
     w.empty.entries = nil;
     w.empty.count   = 0;
     w.cache         = nil;
     w.cache_len     = 0;
     ret w;
+}
+
+# set_watch_active: record that the client delivers
+# workspace/didChangeWatchedFiles for the registered manifest / lockfile /
+# source globs, so invalidation is event-driven and the per-request
+# manifest-mtime fallback check is skipped.
+# ---
+# w:  the workspace
+# on: whether file watching is active
+pub fun set_watch_active(w: *Workspace, on: bool) {
+    w.watch_active = on;
 }
 
 # dnit: release the resolve cache and every loaded root.
@@ -280,22 +298,25 @@ pub fun own_module(root: *Root, fid: src.FileId) sess.ModuleId {
 pub fun root_for(w: *Workspace, uri: str) *Root {
     if (uri == nil) { ret nil; }
     val doc_root: str = document_root(w, uri);
-    if (doc_root != nil) {
-        val existing: *Root = find_root(w, doc_root);
-        if (existing != nil) {
-            strutil.str_free(w.alloc, doc_root);
-            if (!existing.loaded) { ret nil; }
-            maybe_reload(w, existing);
-            if (!existing.loaded) { ret nil; }
-            ret existing;
-        }
-        # not its own project (yet): a dependency of a loaded root resolves there.
-        val twin: *Root = root_containing(w, uri);
-        if (twin != nil) { strutil.str_free(w.alloc, doc_root); ret twin; }
-        ret load_root(w, doc_root);
+
+    # a loaded root rooted elsewhere that holds the document as one of its
+    # modules governs it read-only: a vendored dependency resolves in the
+    # project that depends on it, never as its own project.
+    val twin: *Root = containing_root(w, uri, doc_root);
+    if (twin != nil) {
+        if (doc_root != nil) { strutil.str_free(w.alloc, doc_root); }
+        ret twin;
     }
-    # rootless document: bound to a loaded root only if it is a dependency twin.
-    ret root_containing(w, uri);
+    if (doc_root == nil) { ret nil; }
+
+    val existing: *Root = find_root(w, doc_root);
+    if (existing != nil) {
+        strutil.str_free(w.alloc, doc_root);
+        maybe_reload(w, existing);
+        if (!existing.loaded) { ret nil; }
+        ret existing;
+    }
+    ret load_root(w, doc_root);
 }
 
 # find_root: the live slot whose path equals `root_path`, or nil.
@@ -310,21 +331,28 @@ fun find_root(w: *Workspace, root_path: str) *Root {
     ret nil;
 }
 
-# root_containing: the loaded root whose graph holds the document at `uri` as a
-# module (matched on the normalized filesystem path), or nil. routes a
-# dependency source opened directly to the root that depends on it.
-fun root_containing(w: *Workspace, uri: str) *Root {
+# containing_root: the loaded root whose graph holds the document at `uri` as a
+# module (matched on the normalized filesystem path), skipping the document's
+# own root at `doc_root` (which find_root handles, with its outside-the-closure
+# files resolving against its dep set). a candidate is reload-checked and its
+# containment re-verified before it is handed out, so a twin-routed document
+# does not bypass the staleness check. nil when no other loaded root holds the
+# document.
+fun containing_root(w: *Workspace, uri: str, doc_root: str) *Root {
     if (w.roots == nil) { ret nil; }
+    var found: *Root = nil;
     var i: u32 = 0;
-    for (i < w.root_cap) {
+    for (i < w.root_cap && found == nil) {
         val r: *Root = ?w.roots[i];
-        if (r.live && r.loaded) {
-            val mo: Option[sess.ModuleId] = module_for_uri(w, r, uri);
-            if (is_some[sess.ModuleId](mo)) { ret r; }
+        if (r.live && r.loaded
+            && (doc_root == nil || !str_equals(r.path, doc_root))
+            && is_some[sess.ModuleId](module_for_uri(w, r, uri))) {
+            maybe_reload(w, r);
+            if (r.loaded && is_some[sess.ModuleId](module_for_uri(w, r, uri))) { found = r; }
         }
         i = i + 1;
     }
-    ret nil;
+    ret found;
 }
 
 # load_root: claim a slot for `root_path` (taking ownership of the string) and
@@ -379,11 +407,16 @@ fun alloc_slot(w: *Workspace) *Root {
     ret ?w.roots[old_cap];
 }
 
-# try_load: run build_project for `r.path` and snapshot the dep set into `r`. a
-# failure is surfaced (trace log + window/showMessage) and `r` left as a
-# remembered failed load. on success the whole resolve cache is cleared: results
-# resolved before the load used the empty dep set and the pre-load own_base.
+# try_load: run build_project for `r.path` and snapshot the dep set into `r`.
+# the manifest / lockfile mtimes are recorded at the start of the attempt
+# whether it succeeds or fails, so maybe_reload retries a failed root once those
+# files change instead of pinning the failure for the session. a failure is
+# surfaced (trace log + window/showMessage); on success the whole resolve cache
+# is cleared: results resolved before the load used the empty dep set and the
+# pre-load own_base.
 fun try_load(w: *Workspace, r: *Root) bool {
+    record_mtimes(w, r);
+
     val reg_r: Result[bool, str] = tgt.register_all(?w.s.interner);
     if (is_err[bool, str](reg_r)) {
         report_load_failure(w, r.path, unwrap_err[bool, str](reg_r));
@@ -401,17 +434,20 @@ fun try_load(w: *Workspace, r: *Root) bool {
     r.own_base      = r.p.module_len;
     r.deps.entries  = nil;
     r.deps.count    = 0;
-    record_mtimes(w, r);
     clear_cache(w);
     build_deps(w, r);
     ret true;
 }
 
-# maybe_reload: rebuild `r`'s graph when its manifest or lockfile changed on disk
-# since the load — the conservative fallback for clients that do not deliver
-# `workspace/didChangeWatchedFiles`. a no-op when nothing changed.
+# maybe_reload: rebuild `r`'s graph when its manifest or lockfile changed on
+# disk since the last load attempt — the conservative fallback for clients that
+# do not deliver `workspace/didChangeWatchedFiles`, and the retry path for a
+# root whose previous load failed (a since-fixed manifest). skipped entirely
+# when file watching is active: the watcher already invalidates on those
+# changes, so the per-request stats would be pure overhead. a no-op when
+# nothing changed.
 fun maybe_reload(w: *Workspace, r: *Root) {
-    if (!r.loaded) { ret; }
+    if (w.watch_active) { ret; }
     var man:  i64 = 0;
     var lock: i64 = 0;
     stat_mtimes(w, r.path, ?man, ?lock);

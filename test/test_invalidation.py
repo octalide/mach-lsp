@@ -6,7 +6,8 @@ scenario copies test/fixture-ws to a scratch dir, resolves a cross-file symbol
 that declaration down on disk and confirms the next resolve serves the new line —
 once via a `workspace/didChangeWatchedFiles` notification (the primary trigger),
 once via the manifest-mtime fallback for clients that do not deliver watch
-notifications."""
+notifications. a third scenario covers failed-load recovery: a broken manifest
+must not pin the failure for the session — fixing it on disk retries the load."""
 import os
 import shutil
 import tempfile
@@ -118,6 +119,48 @@ def mtime_fallback_trigger():
     return failures
 
 
+def broken_manifest_recovers():
+    """a root whose manifest fails to parse must not stay bricked for the whole
+    session on a non-watch client: once the manifest is fixed on disk (mtime
+    bumped past the failure snapshot), the next request retries the load and
+    cross-module resolution comes back."""
+    proj, app, lib = _scratch_project()
+    app_uri = file_uri(app)
+    lib_uri = file_uri(lib)
+    manifest = os.path.join(proj, "mach.toml")
+    good = open(manifest).read()
+    with open(manifest, "w") as f:
+        f.write("this is [ not a manifest\n")
+    failures = []
+    srv = LiveServer()
+    try:
+        srv.send(req(1, "initialize", {"capabilities": {}}))
+        srv.recv_id(1)
+        srv.send(notify("initialized"))
+        srv.send(did_open(app_uri, open(app).read()))
+
+        # broken manifest: the load fails, `shared` stays unresolved single-file
+        uri1, _ = _definition_line(srv, app_uri, 20)
+        if uri1 == lib_uri:
+            failures.append("definition(shared) resolved cross-module despite a broken manifest")
+
+        with open(manifest, "w") as f:
+            f.write(good)
+        future = os.path.getmtime(manifest) + 1000
+        os.utime(manifest, (future, future))
+
+        uri2, line2 = _definition_line(srv, app_uri, 21)
+        if uri2 != lib_uri or line2 != DECL_LINE:
+            failures.append(f"definition(shared) after manifest fix: uri {uri2} line {line2}, expected {lib_uri} line {DECL_LINE}")
+
+        srv.send(req(2, "shutdown", None))
+        srv.send(notify("exit"))
+    finally:
+        srv.close()
+        shutil.rmtree(proj, ignore_errors=True)
+    return failures
+
+
 def run():
     """drive the invalidation scenarios; return a list of failure strings."""
     if not os.path.exists(os.path.join(WS, "src", "app.mach")):
@@ -125,6 +168,7 @@ def run():
     failures = []
     failures += watched_files_trigger()
     failures += mtime_fallback_trigger()
+    failures += broken_manifest_recovers()
     return failures
 
 
