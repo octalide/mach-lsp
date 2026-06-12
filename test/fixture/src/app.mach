@@ -1,0 +1,18 @@
+# cross-module resolution fixture: every reference here binds into the vendored
+# std library, so the language server's definition / references / hover must
+# reach a `file://` location inside dep/mach-std.
+
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+# length: a thin wrapper whose body calls the imported std.types.string.str_len.
+fun length(s: str) usize {
+    ret str_len(s);
+}
+
+# twice: a second use-site of the same imported symbol, so references finds more
+# than one in-buffer occurrence.
+fun twice(s: str) usize {
+    ret str_len(s) + str_len(s);
+}
