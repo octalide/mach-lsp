@@ -16,6 +16,7 @@ use std.types.size.usize;
 use std.types.size.isize;
 use std.types.string.str;
 use std.types.string.str_len;
+use std.types.string.str_equals;
 use std.types.result.Result;
 use std.types.result.is_err;
 use std.types.result.unwrap_ok;
@@ -183,6 +184,55 @@ pub fun extract_number_after(data: str, anchor: str, key: str, alloc: *Allocator
     if (offset >= data_len) { ret 0; }
     val sub: str = (data::usize + offset)::str;
     ret extract_number_i64(sub, key, alloc);
+}
+
+# extract_string_seq: decode the string value of the `index`-th occurrence of
+# `key` in `data` (0-based), or nil when there are fewer than index+1
+# occurrences. lets a caller iterate a repeated key — e.g. every `"uri"` in a
+# `workspace/didChangeWatchedFiles` changes array — by bumping `index` until nil.
+# ---
+# data:  JSON text to scan
+# key:   quoted key to find, e.g. `"uri"`
+# index: zero-based occurrence to read
+# alloc: allocator backing the returned string
+# ret:   owned decoded value, or nil
+pub fun extract_string_seq(data: str, key: str, index: u32, alloc: *Allocator) str {
+    var sub: str = data;
+    val key_len: usize = str_len(key);
+    var i: u32 = 0;
+    for (i < index) {
+        val idx: isize = find_key(sub, key);
+        if (idx < 0) { ret nil; }
+        val off: usize = (idx::usize) + key_len;
+        if (off >= str_len(sub)) { ret nil; }
+        sub = (sub::usize + off)::str;
+        i = i + 1;
+    }
+    ret extract_string(sub, key, alloc);
+}
+
+# extract_bool_after: whether the boolean `key` appearing after the first
+# occurrence of `anchor` is the literal `true`. false when absent or non-true,
+# so a missing capability reads as unsupported.
+# ---
+# data:   JSON text to scan
+# anchor: quoted key marking where to start scanning
+# key:    quoted boolean key to read after the anchor
+# alloc:  scratch allocator (the raw token is freed before return)
+# ret:    true only when the value is the literal `true`
+pub fun extract_bool_after(data: str, anchor: str, key: str, alloc: *Allocator) bool {
+    val idx: isize = find_key(data, anchor);
+    if (idx < 0) { ret false; }
+    val data_len: usize = str_len(data);
+    val anchor_len: usize = str_len(anchor);
+    val offset: usize = (idx::usize) + anchor_len;
+    if (offset >= data_len) { ret false; }
+    val sub: str = (data::usize + offset)::str;
+    val raw: str = extract_raw(sub, key, alloc);
+    if (raw == nil) { ret false; }
+    val is_true: bool = str_equals(raw, "true");
+    free_str(raw, alloc);
+    ret is_true;
 }
 
 # quote: JSON-encode `s` as a quoted, escaped string literal (including the
