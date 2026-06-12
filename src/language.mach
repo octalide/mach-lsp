@@ -567,7 +567,6 @@ pub fun document_symbol(ws: *project.Workspace, es: *editor.EditorSession, s: *s
     if (!okd) { reply_empty_array(alloc, id_raw); ret; }
 
     emit_document_symbols(an, s, alloc, id_raw);
-    json.free_str(id_raw, alloc);
 }
 
 # completion: answer textDocument/completion with the in-scope top-level names
@@ -581,7 +580,6 @@ pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.S
     if (!okc) { reply_empty_array(alloc, id_raw); ret; }
 
     emit_completions(an, s, alloc, id_raw);
-    json.free_str(id_raw, alloc);
 }
 
 # binding_span: write the binding name span of a param / generic symbol into
@@ -990,6 +988,7 @@ fun free_groups(groups: *str, n: usize, alloc: *Allocator) {
 }
 
 # emit_document_symbols: send a DocumentSymbol[] of the file's top-level decls.
+# takes ownership of `id_raw` and frees it.
 fun emit_document_symbols(an: Analyzed, s: *sess.Session, alloc: *Allocator, id_raw: str) {
     val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
     val mid:    str = ",\"result\":[";
@@ -1038,6 +1037,7 @@ fun emit_document_symbols(an: Analyzed, s: *sess.Session, alloc: *Allocator, id_
     buf[off] = 0;
     transport.send_message(buf::str, alloc);
     deallocate[u8](alloc, buf, total + 1);
+    json.free_str(id_raw, alloc);
 }
 
 # doc_symbol_json: render decl `did` as a DocumentSymbol object, or nil when the
@@ -1107,7 +1107,8 @@ fun decl_lsp_kind(kind: decl.DeclKind) i64 {
 }
 
 # emit_completions: send a CompletionItem[] of the file's top-level names, each
-# deduped by spelling so a name declared once appears once.
+# deduped by spelling so a name declared once appears once. takes ownership of
+# `id_raw` and frees it.
 fun emit_completions(an: Analyzed, s: *sess.Session, alloc: *Allocator, id_raw: str) {
     val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
     val mid:    str = ",\"result\":{\"isIncomplete\":false,\"items\":[";
@@ -1158,6 +1159,7 @@ fun emit_completions(an: Analyzed, s: *sess.Session, alloc: *Allocator, id_raw: 
     buf[off] = 0;
     transport.send_message(buf::str, alloc);
     deallocate[u8](alloc, buf, total + 1);
+    json.free_str(id_raw, alloc);
 }
 
 # completion_first: whether symbol `sid` is a completion candidate AND the first
