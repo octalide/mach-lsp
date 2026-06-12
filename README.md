@@ -46,11 +46,13 @@ routed to the project root that governs its path (the nearest ancestor
 (`mls.project` runs the compiler's own `driver.build_project` over the manifest
 and `dep/` tree, snapshotting every loaded module's exports into a dependency
 set). The buffer is then re-resolved against its root's dep set, so several
-projects open in one session resolve independently. A document that is already a
-dependency module of a loaded root (e.g. a dep source opened via
-go-to-definition) is bound to that root read-only rather than spun up as its own
-project. A symbol imported through a `use` binds to its declaration in a
-dependency module, and:
+projects open in one session resolve independently. A document that is a
+dependency module of another root — one already loaded (e.g. a dep source opened
+via go-to-definition), or the project whose manifest declares the document's own
+nested root as a dep vendor dir, loaded on demand when the dep file is opened
+first — is bound to that root read-only rather than spun up as its own project,
+regardless of document open order. A symbol imported through a `use` binds to
+its declaration in a dependency module, and:
 
 - hover / definition reach **cross-module and cross-file** symbols, pointing at
   the defining module's source file on disk (a `file://` location);
@@ -77,10 +79,13 @@ A root's graph is **invalidated and rebuilt** when its sources change on disk:
 the server registers `workspace/didChangeWatchedFiles` watchers (via
 `client/registerCapability` when the client supports dynamic registration) for
 the manifest, lockfile, and source trees, and a change to any file under a root
-drops that root so the next request reloads it. For clients that do not deliver
-watch notifications, a conservative manifest/lockfile mtime check on each access
-reloads the root. So editing a dependency source, or pulling updated deps,
-serves the new positions and text rather than the as-of-first-load snapshot.
+drops that root so the next request reloads it. With watching active, editing a
+dependency source or pulling updated deps serves the new positions and text
+rather than the as-of-first-load snapshot. For clients that do not deliver watch
+notifications, a manifest/lockfile mtime check on each access reloads the root —
+and retries a previously failed load once the manifest is fixed — but bare
+source edits are only picked up through a watch notification (or a manifest /
+lockfile touch).
 
 > **Module-id namespacing:** `driver.build_project` numbers modules from 0 and
 > writes them into the session's global module registries, so a second build
@@ -157,8 +162,9 @@ each scenario module asserts one surface:
   `mach-std`): definition / references / hover on a `use`d std symbol reach a
   `file://` location inside `dep/mach-std`, a local symbol still resolves in the
   buffer, and renaming a dependency symbol is refused (prepareRename null, empty
-  edit) — whether referenced cross-module or with the dependency source itself
-  opened as the buffer.
+  edit) — whether referenced cross-module, with the dependency source opened as
+  the buffer, or with the dependency source opened cold before any project
+  document.
 - `test_workspace.py` — against `test/fixture-ws`, a depless two-module project:
   references on a `pub` symbol used across files returns use-sites in both
   modules, and rename rewrites the declaration, the importer's `use` path leaf,
@@ -172,7 +178,8 @@ each scenario module asserts one surface:
 - `test_invalidation.py` — a scratch copy of `test/fixture-ws`: editing a dep
   source on disk and firing `workspace/didChangeWatchedFiles` (and, separately,
   bumping the manifest mtime for the fallback path) makes the next definition
-  serve the shifted declaration line, proving the root's graph reloaded.
+  serve the shifted declaration line, proving the root's graph reloaded; a
+  broken manifest fixed on disk is retried rather than pinned failed.
 
 ```sh
 make test          # builds, then runs test/run.py
