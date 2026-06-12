@@ -52,14 +52,24 @@ a `use` binds to its declaration in a dependency module, and:
   importer's body references, and each importer's `use` path leaf (guarded by
   the declared name, so an aliased import's references are left intact).
   Cross-file rename is confined to symbols declared in the user's own project —
-  a dependency's declaration is not the editor's to rewrite — and reflects the
-  on-disk state of files other than the active buffer, since the project graph
-  is a load-time snapshot not rebuilt on `didChange`;
+  a dependency's declaration is not the editor's to rewrite, whether referenced
+  cross-module or opened directly as the buffer — and reflects the on-disk
+  state of files other than the active buffer, since the project graph is a
+  load-time snapshot not rebuilt on `didChange`. When a module-scope `pub`
+  symbol's cross-file identity cannot be recovered from its stale on-disk twin
+  (unsaved edits renamed the declaration), rename refuses with an empty edit
+  rather than emit a partial, compile-breaking one;
 - completion is a flat list of the file's named symbols and the primitives, not
   a lexically scoped view (the resolver's scope chain is not exposed by the
   side tables);
 - a document outside any project (no ancestor `mach.toml`) resolves single-file
   with an empty dependency set — references and rename then stay buffer-local.
+
+> **Scope note:** the loader builds the import-reachable module closure of the
+> manifest's default target (the compiler's own DFS load), so project files
+> outside that closure — secondary `bin` targets, modules nothing imports — are
+> not in the graph: references cannot see their use-sites and rename silently
+> leaves them untouched. Per-root multi-graph loading is tracked in #46.
 
 > **Known limitation (#45):** the vendored `dep/mach` only parses the old
 > `[targets.<name>]` manifest format, so cross-module resolution is currently
@@ -120,11 +130,15 @@ each scenario module asserts one surface:
   `mach-std`): definition / references / hover on a `use`d std symbol reach a
   `file://` location inside `dep/mach-std`, a local symbol still resolves in the
   buffer, and renaming a dependency symbol is refused (prepareRename null, empty
-  edit).
+  edit) — whether referenced cross-module or with the dependency source itself
+  opened as the buffer.
 - `test_workspace.py` — against `test/fixture-ws`, a depless two-module project:
   references on a `pub` symbol used across files returns use-sites in both
   modules, and rename rewrites the declaration, the importer's `use` path leaf,
-  and every use-site across both files — invoked from either buffer.
+  and every use-site across both files — invoked from either buffer. a
+  block-local binding shadowing a pub name renames buffer-local without touching
+  importers, and a pub declaration renamed by unsaved edits refuses (empty edit)
+  instead of emitting a partial rename.
 
 ```sh
 make test          # builds, then runs test/run.py
