@@ -8,8 +8,10 @@ no scenario duplicates them.
 """
 import json
 import os
+import select
 import subprocess
 import sys
+import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -100,3 +102,74 @@ def standalone(name, run):
         print("  -", f)
     print(f"{name}:", "FAILED" if fails else "PASSED")
     sys.exit(1 if fails else 0)
+
+
+class LiveServer:
+    """an interactive server session: send frames and read responses as they
+    arrive, so a scenario can act between requests (e.g. edit a file on disk and
+    fire a watched-files change before the next request). reads are bounded by a
+    timeout via select, so a misbehaving server cannot hang the suite."""
+
+    def __init__(self):
+        if not os.path.exists(BIN):
+            raise FileNotFoundError(f"server binary not found at {BIN} — run `mach build` first")
+        self.proc = subprocess.Popen([BIN], stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.buf = b""
+
+    def send(self, frame):
+        """write one framed message to the server's stdin."""
+        self.proc.stdin.write(frame)
+        self.proc.stdin.flush()
+
+    def _pop(self):
+        """parse and remove one complete framed message from the buffer, or None."""
+        hdr_end = self.buf.find(b"\r\n\r\n")
+        if hdr_end < 0:
+            return None
+        header = self.buf[:hdr_end].decode(errors="replace")
+        clen = None
+        for line in header.split("\r\n"):
+            if line.lower().startswith("content-length:"):
+                clen = int(line.split(":", 1)[1].strip())
+        if clen is None:
+            return None
+        bstart = hdr_end + 4
+        if len(self.buf) < bstart + clen:
+            return None
+        msg = json.loads(self.buf[bstart:bstart + clen].decode())
+        self.buf = self.buf[bstart + clen:]
+        return msg
+
+    def recv_id(self, want_id, timeout=60):
+        """read messages until the response with id `want_id` arrives (draining
+        any notifications), or None on timeout."""
+        deadline = time.time() + timeout
+        while True:
+            msg = self._pop()
+            if msg is not None:
+                if msg.get("id") == want_id:
+                    return msg
+                continue
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None
+            r, _, _ = select.select([self.proc.stdout], [], [], remaining)
+            if not r:
+                return None
+            chunk = os.read(self.proc.stdout.fileno(), 65536)
+            if not chunk:
+                return None
+            self.buf += chunk
+
+    def close(self, timeout=10):
+        """close stdin and wait for the server to exit; returns the exit code."""
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            return self.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            return self.proc.wait()
