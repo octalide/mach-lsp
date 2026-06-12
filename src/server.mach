@@ -35,6 +35,7 @@ use json:      mls.json;
 use documents: mls.documents;
 use diagnostics: mls.diagnostics;
 use language:  mls.language;
+use project:   mls.project;
 use trace:     mls.trace;
 
 # lifecycle statuses.
@@ -51,6 +52,7 @@ pub val STATUS_EXITED:        u8 = 3;
 # s:         compiler session (SourceMap + DiagList)
 # es:        editor session over `s` (per-buffer analysis)
 # docs:      URI -> editor buffer registry
+# ws:        project dependency graph backing cross-module analysis
 pub rec Server {
     status:    u8;
     exit_code: i64;
@@ -58,6 +60,7 @@ pub rec Server {
     s:         sess.Session;
     es:        editor.EditorSession;
     docs:      documents.Store;
+    ws:        project.Workspace;
 }
 
 # init: build a server over the given allocator.
@@ -76,6 +79,7 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
 
     srv.es = editor.init(?srv.s);
     srv.docs = documents.init(?srv.es, alloc);
+    srv.ws = project.init(?srv.s, ?srv.es, alloc);
     ret true;
 }
 
@@ -84,6 +88,7 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
 # srv: server to tear down
 pub fun dnit(srv: *Server) {
     documents.dnit(?srv.docs);
+    project.dnit(?srv.ws);
     editor.dnit(?srv.es);
     sess.dnit(?srv.s);
     srv.status = STATUS_EXITED;
@@ -297,13 +302,13 @@ fun handle_did_close(srv: *Server, body: str) {
 fun handle_feature(srv: *Server, body: str, which: i64) {
     val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
 
-    if (which == 0) { language.hover(?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 1) { language.definition(?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 2) { language.references(?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 3) { language.rename(?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 4) { language.prepare_rename(?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 5) { language.document_symbol(?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 6) { language.completion(?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
+    if (which == 0) { language.hover(?srv.ws, ?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 1) { language.definition(?srv.ws, ?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 2) { language.references(?srv.ws, ?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 3) { language.rename(?srv.ws, ?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 4) { language.prepare_rename(?srv.ws, ?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 5) { language.document_symbol(?srv.ws, ?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 6) { language.completion(?srv.ws, ?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
 
     if (uri != nil) { json.free_str(uri, srv.alloc); }
 }

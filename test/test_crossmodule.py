@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""cross-module scenarios over the fixture project (test/fixture), which depends
+on the vendored mach-std. definition / references / hover on a `use`d std symbol
+must reach the canonical file:// URI of the decl inside dep/mach-std, while a
+local symbol still resolves in the buffer. also covers project-load ordering (a
+scratch file opened first must not disable the later project load) and
+percent-encoded document URIs."""
+import os
+
+from harness import drive, req, notify, did_open, pos, by_id, file_uri, standalone, FIXTURE, REPO
+
+APP = os.path.join(FIXTURE, "src", "app.mach")
+URI = file_uri(APP)
+
+# the canonical URI of str_len's declaring file; emitted locations must match
+# it exactly (no '..' segments), or clients cannot correlate them with buffers.
+DEP_STRING_URI = file_uri(os.path.join(REPO, "dep", "mach-std", "src", "types", "string.mach"))
+
+# byte positions in app.mach (0-based):
+#   line 6:  `use std.types.string.str_len;`
+#   line 9:  `fun length(s: str) usize {`        -> `length` at col 4
+#   line 10: `    ret str_len(s);`               -> `str_len` at col 8
+#   line 16: `    ret str_len(s) + str_len(s);`  -> two more use-sites
+STR_LEN = pos(10, 10)
+LOCAL = pos(9, 6)
+
+SCRATCH_URI = "file:///scratch.mach"
+SCRATCH_SRC = "fun lone() i64 { ret 1; }\n"
+
+
+def check_dep_definition(failures, msg, dv):
+    """assert `dv` is a Location at str_len's decl, canonical URI equality."""
+    if not dv or "uri" not in dv:
+        failures.append(f"{msg} returned no Location")
+        return
+    if dv["uri"] != DEP_STRING_URI:
+        failures.append(f"{msg} uri is not the canonical dep URI: {dv['uri']} != {DEP_STRING_URI}")
+
+
+def main_scenario():
+    """definition / hover / references on a cross-module symbol, plus a local one."""
+    text = open(APP).read()
+    frames = [
+        req(1, "initialize", {"capabilities": {}}),
+        notify("initialized"),
+        did_open(URI, text),
+        req(20, "textDocument/definition", {"textDocument": {"uri": URI}, "position": STR_LEN}),
+        req(21, "textDocument/hover", {"textDocument": {"uri": URI}, "position": STR_LEN}),
+        req(22, "textDocument/references",
+            {"textDocument": {"uri": URI}, "position": STR_LEN,
+             "context": {"includeDeclaration": True}}),
+        req(23, "textDocument/definition", {"textDocument": {"uri": URI}, "position": LOCAL}),
+        req(2, "shutdown", None),
+        notify("exit"),
+    ]
+    code, msgs = drive(frames)
+
+    failures = []
+
+    check_dep_definition(failures, "definition(str_len)", (by_id(msgs, 20) or {}).get("result"))
+
+    # hover on str_len -> renders the dependency's signature (and its doc comment)
+    hv = (by_id(msgs, 21) or {}).get("result")
+    if not hv or "contents" not in hv:
+        failures.append("hover(str_len) returned no contents")
+    else:
+        hval = hv["contents"].get("value", "")
+        if "str_len" not in hval:
+            failures.append("hover(str_len) value does not mention 'str_len'")
+        if "fun" not in hval:
+            failures.append(f"hover(str_len) value does not render a signature: {hval!r}")
+
+    # references on str_len -> the dep decl (canonical URI) plus the in-buffer use-sites
+    rv = (by_id(msgs, 22) or {}).get("result")
+    if not isinstance(rv, list):
+        failures.append("references(str_len) result is not an array")
+    else:
+        if len(rv) < 2:
+            failures.append(f"references(str_len) found {len(rv)}, expected >= 2 (decl + use-sites)")
+        uris = [e.get("uri", "") for e in rv]
+        if DEP_STRING_URI not in uris:
+            failures.append(f"references(str_len) has no canonical dep decl location (got {sorted(set(uris))})")
+        if not any(u == URI for u in uris):
+            failures.append("references(str_len) has no in-buffer use-site")
+
+    # definition on the local `length` -> stays in the buffer
+    lv = (by_id(msgs, 23) or {}).get("result")
+    if not lv or "uri" not in lv:
+        failures.append("definition(length) returned no Location")
+    else:
+        if lv["uri"] != URI:
+            failures.append(f"definition(length) left the buffer: {lv['uri']}")
+        if lv["range"]["start"]["line"] != 9:
+            failures.append(f"definition(length) points to line {lv['range']['start']['line']}, expected 9")
+
+    if code != 0:
+        failures.append("non-zero exit code after clean shutdown")
+    return failures
+
+
+def scratch_ordering_scenario():
+    """a scratch file with no project root, resolved first, must not latch the
+    no-project outcome: a project document opened later still loads the graph."""
+    text = open(APP).read()
+    frames = [
+        req(1, "initialize", {"capabilities": {}}),
+        notify("initialized"),
+        did_open(SCRATCH_URI, SCRATCH_SRC),
+        # force a resolve of the rootless scratch buffer before the project doc
+        req(10, "textDocument/definition", {"textDocument": {"uri": SCRATCH_URI}, "position": pos(0, 5)}),
+        did_open(URI, text),
+        req(20, "textDocument/definition", {"textDocument": {"uri": URI}, "position": STR_LEN}),
+        req(2, "shutdown", None),
+        notify("exit"),
+    ]
+    code, msgs = drive(frames)
+
+    failures = []
+
+    # the scratch buffer's own local symbol still resolves in-buffer
+    sv = (by_id(msgs, 10) or {}).get("result")
+    if not sv or sv.get("uri") != SCRATCH_URI:
+        failures.append(f"definition(lone) in the scratch buffer did not resolve locally: {sv}")
+
+    check_dep_definition(failures, "definition(str_len) after scratch-first ordering",
+                         (by_id(msgs, 20) or {}).get("result"))
+
+    if code != 0:
+        failures.append("non-zero exit code after clean shutdown")
+    return failures
+
+
+def percent_encoding_scenario():
+    """a percent-encoded document URI must decode for project discovery: the
+    fixture URI with 'app.mach' spelled '%61pp.mach' still loads the project."""
+    text = open(APP).read()
+    enc_uri = URI.replace("app.mach", "%61pp.mach")
+    frames = [
+        req(1, "initialize", {"capabilities": {}}),
+        notify("initialized"),
+        did_open(enc_uri, text),
+        req(20, "textDocument/definition", {"textDocument": {"uri": enc_uri}, "position": STR_LEN}),
+        req(2, "shutdown", None),
+        notify("exit"),
+    ]
+    code, msgs = drive(frames)
+
+    failures = []
+    check_dep_definition(failures, "definition(str_len) via percent-encoded URI",
+                         (by_id(msgs, 20) or {}).get("result"))
+    if code != 0:
+        failures.append("non-zero exit code after clean shutdown")
+    return failures
+
+
+def run():
+    """drive the cross-module scenarios; return a list of failure strings."""
+    if not os.path.exists(APP):
+        return [f"fixture not found at {APP}"]
+    failures = []
+    failures += main_scenario()
+    failures += scratch_ordering_scenario()
+    failures += percent_encoding_scenario()
+    return failures
+
+
+if __name__ == "__main__":
+    standalone("crossmodule", run)

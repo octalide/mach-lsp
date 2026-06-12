@@ -1,0 +1,28 @@
+# fixture project for the cross-module resolution tests. it depends on the
+# repo's vendored mach-std (reached via `dir_dep = "../../dep"`) so the language
+# server can resolve a `use`d std symbol to its declaration on disk.
+#
+# this manifest deliberately uses the OLD [targets.<name>] format — the only
+# format the vendored dep/mach driver parses (see #45). it is loaded by the
+# server's own build_project, never by the installed `mach` toolchain. once
+# #45 bumps dep/mach to a version parsing the v1.4.0 [target.X]/[bin.X]
+# format, convert this fixture to match.
+[project]
+id      = "fixture"
+dir_src = "src"
+dir_dep = "../../dep"
+target  = "native"
+
+[targets.linux]
+os         = "linux"
+isa        = "x86_64"
+abi        = "sysv64"
+mode       = "executable"
+entrypoint = "app.mach"
+artifacts  = "linux"
+binary     = "linux/bin/fixture"
+
+[deps.mach-std]
+type    = "remote"
+path    = "https://github.com/octalide/mach-std"
+version = "branch/dev"

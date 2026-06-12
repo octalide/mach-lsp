@@ -1,19 +1,20 @@
 # mls.language: the rich language-feature request handlers.
 #
 # hover, definition, references, rename, prepareRename, documentSymbol, and
-# completion, each driven off the editor's single-buffer analysis. every
-# request resolves the document's buffer (`editor.resolve`), pivots the cursor
-# position to a byte offset, joins it against the resolve side tables through
-# `features`, and shapes the LSP result with `json`. lifecycle and dispatch
-# stay in `server`; this module is the request bodies it routes to.
+# completion. every request resolves the document's buffer against the loaded
+# project dependency graph (`project.resolve_doc`), pivots the cursor position
+# to a byte offset, joins it against the resolve side tables through `features`,
+# and shapes the LSP result with `json`. lifecycle and dispatch stay in
+# `server`; this module is the request bodies it routes to.
 #
-# single-file scope: the editor resolves one buffer in isolation, so
-# definition / references / rename only reach symbols declared in the same
-# file. a symbol imported through a `use` resolves to a decl in a dependency
-# Ast this server never loaded, so those requests return an empty / null
-# result for it rather than a wrong one. hover still renders an imported
-# symbol's name and kind. completion offers the file's module-level names,
-# `use` aliases, and the primitive types (see `features.completion_candidate`).
+# cross-module scope: the buffer is resolved with a populated dependency set, so
+# a symbol imported through a `use` binds to its declaration in a dependency Ast.
+# definition / references / hover resolve that declaration through `project`'s
+# symbol -> Ast / SourceFile / URI mapping, pointing at the defining module's
+# file on disk (`project.site_of`). rename / prepareRename stay confined to
+# symbols local to the buffer — a dependency's declaration is not the editor's to
+# rewrite. completion offers the file's module-level names, `use` aliases, and
+# the primitive types (see `features.completion_candidate`).
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -24,11 +25,10 @@ use std.types.string.str_len;
 use std.types.string.str_equals;
 use std.types.string.str_starts_with;
 use std.types.option.Option;
+use std.types.option.none;
 use std.types.option.is_some;
 use std.types.option.unwrap;
 use std.types.result.Result;
-use std.types.result.ok;
-use std.types.result.err;
 use std.types.result.is_err;
 use std.types.result.unwrap_ok;
 
@@ -53,6 +53,7 @@ use json:      mls.json;
 use documents: mls.documents;
 use features:  mls.features;
 use positions: mls.positions;
+use project:   mls.project;
 
 # Analyzed: the resolved analysis of one request's target document.
 # ---
@@ -71,14 +72,14 @@ rec Analyzed {
 
 # hover: answer textDocument/hover with the type / declaration of the symbol at
 # the cursor, or null when the position is not on a resolved symbol.
-pub fun hover(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
+pub fun hover(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
     val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val off_r: Result[usize, str] = locate(es, s, alloc, docs, body, uri, ?an);
-    if (is_err[usize, str](off_r)) { reply_null(alloc, id_raw); ret; }
-    val offset: usize = unwrap_ok[usize, str](off_r);
+    val off_o: Option[usize] = locate(ws, es, s, alloc, docs, body, uri, ?an);
+    if (!is_some[usize](off_o)) { reply_null(alloc, id_raw); ret; }
+    val offset: usize = unwrap[usize](off_o);
 
     val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
     if (!is_some[features.SymbolRef](ro)) { reply_null(alloc, id_raw); ret; }
@@ -88,7 +89,7 @@ pub fun hover(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, do
     if (!is_some[*res.Symbol](so)) { reply_null(alloc, id_raw); ret; }
     val sym: *res.Symbol = unwrap[*res.Symbol](so);
 
-    val md: str = hover_markdown(an, sym, alloc);
+    val md: str = hover_markdown(ws, an, sym, uri, alloc);
     if (md == nil) { reply_null(alloc, id_raw); ret; }
 
     val qmd: str = json.quote(md, alloc);
@@ -109,20 +110,27 @@ pub fun hover(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, do
     json.free_str(id_raw, alloc);
 }
 
-# hover_markdown: a fenced `mach` code block rendering the symbol at hover. for
-# a local symbol it shows the declaration header as written; otherwise the
-# symbol kind and name. a local symbol's doc comment, if any, follows the block
-# as prose.
-fun hover_markdown(an: Analyzed, sym: *res.Symbol, alloc: *Allocator) str {
+# hover_markdown: a fenced `mach` code block rendering the symbol at hover. it
+# shows the declaration header as written — read from the buffer for a local
+# symbol, from the defining dependency module's file for a cross-module one —
+# falling back to the symbol kind and name when no decl header is available. the
+# decl's doc comment, if any, follows the block as prose, read from the same
+# Site so a cross-module symbol's docs render too.
+fun hover_markdown(ws: *project.Workspace, an: Analyzed, sym: *res.Symbol, uri: str, alloc: *Allocator) str {
     var sig: str = nil;
     var doc: str = nil;
-    if (sym.origin == an.own && sym.decl != id.DECL_NIL) {
-        val sso: Option[token.Span] = features.signature_span(an.a, sym);
-        if (is_some[token.Span](sso)) {
-            sig = positions.span_text(an.file, unwrap[token.Span](sso), alloc);
+    val site_o: Option[project.Site] = project.site_of(ws, an.own, an.a, an.file, uri, sym);
+    if (is_some[project.Site](site_o)) {
+        var site: project.Site = unwrap[project.Site](site_o);
+        if (sym.decl != id.DECL_NIL) {
+            val sso: Option[token.Span] = features.signature_span(site.a, sym);
+            if (is_some[token.Span](sso)) {
+                sig = positions.span_text(site.file, unwrap[token.Span](sso), alloc);
+            }
+            val dso: Option[token.Span] = features.doc_comment_span(site.a, sym, site.file);
+            if (is_some[token.Span](dso)) { doc = doc_prose(site.file, unwrap[token.Span](dso), alloc); }
         }
-        val dso: Option[token.Span] = features.doc_comment_span(an.a, sym, an.file);
-        if (is_some[token.Span](dso)) { doc = doc_prose(an.file, unwrap[token.Span](dso), alloc); }
+        project.free_site(ws, ?site);
     }
     if (sig == nil) {
         sig = compose_kind_name(sym, ?an.s.interner, alloc);
@@ -231,30 +239,36 @@ fun compose_kind_name(sym: *res.Symbol, interner: *intern.Interner, alloc: *Allo
 }
 
 # definition: answer textDocument/definition with the Location of the resolved
-# symbol's declaration, or null when the position is not on a local symbol.
-pub fun definition(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
+# symbol's declaration. lands in the buffer for a local symbol and in the
+# defining dependency module's on-disk file for a cross-module one; null when
+# the position is not on a resolved symbol or its declaration cannot be located.
+pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
     val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val off_r: Result[usize, str] = locate(es, s, alloc, docs, body, uri, ?an);
-    if (is_err[usize, str](off_r)) { reply_null(alloc, id_raw); ret; }
-    val offset: usize = unwrap_ok[usize, str](off_r);
+    val off_o: Option[usize] = locate(ws, es, s, alloc, docs, body, uri, ?an);
+    if (!is_some[usize](off_o)) { reply_null(alloc, id_raw); ret; }
+    val offset: usize = unwrap[usize](off_o);
 
     val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
     if (!is_some[features.SymbolRef](ro)) { reply_null(alloc, id_raw); ret; }
     val sr: features.SymbolRef = unwrap[features.SymbolRef](ro);
-    if (!sr.local) { reply_null(alloc, id_raw); ret; }
 
     val so: Option[*res.Symbol] = features.symbol(an.rr, sr.sym_id);
     if (!is_some[*res.Symbol](so)) { reply_null(alloc, id_raw); ret; }
     val sym: *res.Symbol = unwrap[*res.Symbol](so);
 
-    val spo: Option[token.Span] = features.definition_name_span(an.a, sym);
-    if (!is_some[token.Span](spo)) { reply_null(alloc, id_raw); ret; }
+    val site_o: Option[project.Site] = project.site_of(ws, an.own, an.a, an.file, uri, sym);
+    if (!is_some[project.Site](site_o)) { reply_null(alloc, id_raw); ret; }
+    var site: project.Site = unwrap[project.Site](site_o);
+
+    val spo: Option[token.Span] = features.definition_name_span(site.a, sym);
+    if (!is_some[token.Span](spo)) { project.free_site(ws, ?site); reply_null(alloc, id_raw); ret; }
     val span: token.Span = unwrap[token.Span](spo);
 
-    val loc: str = location_json(an.file, uri, span, alloc);
+    val loc: str = location_json(site.file, site.uri, span, alloc);
+    project.free_site(ws, ?site);
     if (loc == nil) { reply_null(alloc, id_raw); ret; }
 
     val p1: str = "{\"jsonrpc\":\"2.0\",\"id\":";
@@ -266,33 +280,63 @@ pub fun definition(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocato
     json.free_str(id_raw, alloc);
 }
 
-# references: answer textDocument/references with every Location in this file
-# that resolves to the symbol at the cursor (the decl plus all use-sites).
-# empty for a non-local symbol.
-pub fun references(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
+# references: answer textDocument/references with every Location resolving to
+# the symbol at the cursor — the use-sites in this buffer plus the declaration.
+# the declaration lands in the buffer for a local symbol and in the defining
+# dependency module's file for a cross-module one. empty when the position is
+# not on a resolved symbol.
+pub fun references(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
     val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val off_r: Result[usize, str] = locate(es, s, alloc, docs, body, uri, ?an);
-    if (is_err[usize, str](off_r)) { reply_empty_array(alloc, id_raw); ret; }
-    val offset: usize = unwrap_ok[usize, str](off_r);
+    val off_o: Option[usize] = locate(ws, es, s, alloc, docs, body, uri, ?an);
+    if (!is_some[usize](off_o)) { reply_empty_array(alloc, id_raw); ret; }
+    val offset: usize = unwrap[usize](off_o);
 
     val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
     if (!is_some[features.SymbolRef](ro)) { reply_empty_array(alloc, id_raw); ret; }
     val sr: features.SymbolRef = unwrap[features.SymbolRef](ro);
-    if (!sr.local) { reply_empty_array(alloc, id_raw); ret; }
+
+    val so: Option[*res.Symbol] = features.symbol(an.rr, sr.sym_id);
+    if (!is_some[*res.Symbol](so)) { reply_empty_array(alloc, id_raw); ret; }
+    val sym: *res.Symbol = unwrap[*res.Symbol](so);
 
     var bind: token.Span;
     val has_bind: bool = binding_span(an, sr.sym_id, ?bind);
-    emit_locations(an, alloc, id_raw, uri, sr.sym_id, bind, has_bind);
+
+    # the in-buffer walk finds the local decl and every use-site; a cross-module
+    # symbol's declaration lives in a dependency file and is added separately.
+    var xfile: *src.SourceFile = an.file;
+    var xuri:  str = uri;
+    var xspan: token.Span = bind;
+    var has_x: bool = false;
+    var site:  project.Site;
+    var has_site: bool = false;
+    if (sym.origin != an.own) {
+        val site_o: Option[project.Site] = project.site_of(ws, an.own, an.a, an.file, uri, sym);
+        if (is_some[project.Site](site_o)) {
+            site = unwrap[project.Site](site_o);
+            has_site = true;
+            val spo: Option[token.Span] = features.definition_name_span(site.a, sym);
+            if (is_some[token.Span](spo)) {
+                xfile = site.file;
+                xuri  = site.uri;
+                xspan = unwrap[token.Span](spo);
+                has_x = true;
+            }
+        }
+    }
+
+    emit_locations(an, alloc, id_raw, uri, sr.sym_id, bind, has_bind, xfile, xuri, xspan, has_x);
+    if (has_site) { project.free_site(ws, ?site); }
     json.free_str(id_raw, alloc);
 }
 
 # rename: answer textDocument/rename with a WorkspaceEdit replacing every
 # reference to the symbol at the cursor with the requested new name, across
 # this file. empty edit for a non-local symbol.
-pub fun rename(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
+pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
     val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
     if (id_raw == nil) { ret; }
 
@@ -300,9 +344,9 @@ pub fun rename(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, d
     if (new_name == nil) { reply_null(alloc, id_raw); ret; }
 
     var an: Analyzed;
-    val off_r: Result[usize, str] = locate(es, s, alloc, docs, body, uri, ?an);
-    if (is_err[usize, str](off_r)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
-    val offset: usize = unwrap_ok[usize, str](off_r);
+    val off_o: Option[usize] = locate(ws, es, s, alloc, docs, body, uri, ?an);
+    if (!is_some[usize](off_o)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
+    val offset: usize = unwrap[usize](off_o);
 
     val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
     if (!is_some[features.SymbolRef](ro)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
@@ -318,14 +362,14 @@ pub fun rename(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, d
 
 # prepare_rename: answer textDocument/prepareRename with the range of the name
 # token at the cursor when it is a renameable local symbol, or null.
-pub fun prepare_rename(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
+pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
     val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val off_r: Result[usize, str] = locate(es, s, alloc, docs, body, uri, ?an);
-    if (is_err[usize, str](off_r)) { reply_null(alloc, id_raw); ret; }
-    val offset: usize = unwrap_ok[usize, str](off_r);
+    val off_o: Option[usize] = locate(ws, es, s, alloc, docs, body, uri, ?an);
+    if (!is_some[usize](off_o)) { reply_null(alloc, id_raw); ret; }
+    val offset: usize = unwrap[usize](off_o);
 
     val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
     if (!is_some[features.SymbolRef](ro)) { reply_null(alloc, id_raw); ret; }
@@ -347,12 +391,12 @@ pub fun prepare_rename(es: *editor.EditorSession, s: *sess.Session, alloc: *Allo
 # document_symbol: answer textDocument/documentSymbol with a flat list of the
 # file's top-level declarations as DocumentSymbol nodes (name, kind, range,
 # selectionRange).
-pub fun document_symbol(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
+pub fun document_symbol(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
     val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val okd: bool = analyze(es, s, docs, uri, ?an);
+    val okd: bool = analyze(ws, es, s, docs, uri, ?an);
     if (!okd) { reply_empty_array(alloc, id_raw); ret; }
 
     emit_document_symbols(an, s, alloc, id_raw);
@@ -361,12 +405,12 @@ pub fun document_symbol(es: *editor.EditorSession, s: *sess.Session, alloc: *All
 
 # completion: answer textDocument/completion with the in-scope top-level names
 # (module decls, `use` aliases / imports, primitives) as CompletionItems.
-pub fun completion(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
+pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
     val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val okc: bool = analyze(es, s, docs, uri, ?an);
+    val okc: bool = analyze(ws, es, s, docs, uri, ?an);
     if (!okc) { reply_empty_array(alloc, id_raw); ret; }
 
     emit_completions(an, s, alloc, id_raw);
@@ -386,15 +430,17 @@ fun binding_span(an: Analyzed, sid: res.SymbolId, out: *token.Span) bool {
     ret true;
 }
 
-# analyze: resolve the document named by `uri` and populate `out` with its
-# session, file, Ast, ResolveResult, and module id. false when the document is
-# unknown or resolution fails.
-fun analyze(es: *editor.EditorSession, s: *sess.Session, docs: *documents.Store, uri: str, out: *Analyzed) bool {
+# analyze: resolve the document named by `uri` against the project dependency
+# graph and populate `out` with its session, file, Ast, ResolveResult, and
+# module id. false when the document is unknown or resolution fails. the module
+# id is the workspace's synthetic buffer id, matching the one resolution bound
+# local symbols under, so the local / cross-module distinction holds.
+fun analyze(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, docs: *documents.Store, uri: str, out: *Analyzed) bool {
     if (uri == nil) { ret false; }
     val doc: *documents.Document = documents.find(docs, uri);
     if (doc == nil) { ret false; }
 
-    val rr_r: Result[*res.ResolveResult, str] = editor.resolve(es, doc.file_id);
+    val rr_r: Result[*res.ResolveResult, str] = project.resolve_doc(ws, doc.file_id, uri);
     if (is_err[*res.ResolveResult, str](rr_r)) { ret false; }
     out.rr = unwrap_ok[*res.ResolveResult, str](rr_r);
     out.a  = editor.ast_of(es, doc.file_id);
@@ -404,29 +450,29 @@ fun analyze(es: *editor.EditorSession, s: *sess.Session, docs: *documents.Store,
     if (!is_some[*src.SourceFile](fo)) { ret false; }
     out.s    = s;
     out.file = unwrap[*src.SourceFile](fo);
-    out.own  = doc.file_id::sess.ModuleId;
+    out.own  = project.own_module(ws, doc.file_id);
     ret true;
 }
 
 # locate: analyze the target document and resolve the request's cursor position
-# to a byte offset. the error string is unused by callers (they fall back to a
-# null / empty reply) but distinguishes failure from a real offset of 0.
-fun locate(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str, out: *Analyzed) Result[usize, str] {
-    if (!analyze(es, s, docs, uri, out)) { ret r_err("document not analyzable"); }
+# to a byte offset, or none when the document is unknown / unresolvable or the
+# position is invalid (callers fall back to a null / empty reply).
+fun locate(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str, out: *Analyzed) Option[usize] {
+    if (!analyze(ws, es, s, docs, uri, out)) { ret none[usize](); }
 
     val line: i64 = json.extract_number_after(body, "\"position\"", "\"line\"", alloc);
     val ch:   i64 = json.extract_number_after(body, "\"position\"", "\"character\"", alloc);
-    if (line < 0 || ch < 0) { ret r_err("invalid position"); }
+    if (line < 0 || ch < 0) { ret none[usize](); }
 
-    val oo: Option[usize] = positions.offset_at(out.file, line::usize, ch::usize);
-    if (!is_some[usize](oo)) { ret r_err("position out of range"); }
-    ret r_ok(unwrap[usize](oo));
+    ret positions.offset_at(out.file, line::usize, ch::usize);
 }
 
-# emit_locations: send a Location[] result of every in-file reference to
-# `target`. the decl name span is included via decl_ref_span; a param / generic
-# binding site, which has no Decl node, is passed in `bind` when `has_bind`.
-fun emit_locations(an: Analyzed, alloc: *Allocator, id_raw: str, uri: str, target: res.SymbolId, bind: token.Span, has_bind: bool) {
+# emit_locations: send a Location[] result of every reference to `target`. the
+# in-buffer use-sites and the local decl name span come from the resolve walk
+# over `an`; a param / generic binding site, which has no Decl node, is passed
+# in `bind` when `has_bind`; a cross-module declaration, which lives in another
+# file, is passed in (`xfile`, `xuri`, `xspan`) when `has_x`.
+fun emit_locations(an: Analyzed, alloc: *Allocator, id_raw: str, uri: str, target: res.SymbolId, bind: token.Span, has_bind: bool, xfile: *src.SourceFile, xuri: str, xspan: token.Span, has_x: bool) {
     val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
     val mid:    str = ",\"result\":[";
     val suffix: str = "]}";
@@ -434,6 +480,7 @@ fun emit_locations(an: Analyzed, alloc: *Allocator, id_raw: str, uri: str, targe
     var total: usize = str_len(prefix) + str_len(id_raw) + str_len(mid) + str_len(suffix);
     var count: usize = 0;
 
+    if (has_x)    { total = total + loc_len(xfile, xuri, xspan, alloc, count); count = count + 1; }
     if (has_bind) { total = total + loc_len(an.file, uri, bind, alloc, count); count = count + 1; }
 
     # first pass: size
@@ -466,6 +513,7 @@ fun emit_locations(an: Analyzed, alloc: *Allocator, id_raw: str, uri: str, targe
     off = append(buf, off, mid);
 
     var emitted: usize = 0;
+    if (has_x)    { off = put_loc(buf, off, xfile, xuri, xspan, alloc, emitted); emitted = emitted + 1; }
     if (has_bind) { off = put_loc(buf, off, an.file, uri, bind, alloc, emitted); emitted = emitted + 1; }
     var e2: usize = 0;
     for (e2 < an.a.expr_len) {
@@ -995,10 +1043,3 @@ fun free4(a: str, b: str, c: str, d: str, alloc: *Allocator) {
     json.free_str(d, alloc);
 }
 
-# r_ok / r_err: Result[usize, str] constructors for `locate`.
-fun r_ok(v: usize) Result[usize, str] {
-    ret ok[usize, str](v);
-}
-fun r_err(m: str) Result[usize, str] {
-    ret err[usize, str](m);
-}
