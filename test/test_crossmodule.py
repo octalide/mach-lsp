@@ -50,6 +50,9 @@ def main_scenario():
             {"textDocument": {"uri": URI}, "position": STR_LEN,
              "context": {"includeDeclaration": True}}),
         req(23, "textDocument/definition", {"textDocument": {"uri": URI}, "position": LOCAL}),
+        req(24, "textDocument/prepareRename", {"textDocument": {"uri": URI}, "position": STR_LEN}),
+        req(25, "textDocument/rename",
+            {"textDocument": {"uri": URI}, "position": STR_LEN, "newName": "nope"}),
         req(2, "shutdown", None),
         notify("exit"),
     ]
@@ -92,6 +95,15 @@ def main_scenario():
             failures.append(f"definition(length) left the buffer: {lv['uri']}")
         if lv["range"]["start"]["line"] != 9:
             failures.append(f"definition(length) points to line {lv['range']['start']['line']}, expected 9")
+
+    # a dependency symbol is not the editor's to rewrite: prepareRename refuses
+    # (null) and rename yields an empty WorkspaceEdit.
+    prv = (by_id(msgs, 24) or {}).get("result", "missing")
+    if prv is not None:
+        failures.append(f"prepareRename(str_len dep) should be null, got {prv!r}")
+    rnv = (by_id(msgs, 25) or {}).get("result")
+    if not isinstance(rnv, dict) or rnv.get("changes") != {}:
+        failures.append(f"rename(str_len dep) should be an empty WorkspaceEdit, got {rnv!r}")
 
     if code != 0:
         failures.append("non-zero exit code after clean shutdown")

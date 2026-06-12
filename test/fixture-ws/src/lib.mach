@@ -1,0 +1,7 @@
+# lib: a project module whose pub symbol is imported across files, so renaming
+# it must rewrite this declaration and every importer.
+
+# shared: a value passed through; imported and used by the app module.
+pub fun shared(x: i64) i64 {
+    ret x;
+}

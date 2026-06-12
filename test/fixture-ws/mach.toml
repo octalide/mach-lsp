@@ -1,0 +1,20 @@
+# cross-file fixture for the workspace-wide references / rename tests. two
+# project-owned modules, no external deps: `lib` declares a `pub` symbol and the
+# entry module `app` imports and uses it, so a rename of that symbol must reach
+# both files (the declaration, the import path leaf, and the use-sites).
+#
+# uses the mach v1.4.0 [target.X]/[bin.X] manifest format, so the server's
+# bumped build_project loads it the same way it loads a real project.
+[project]
+id      = "wsfix"
+version = "0.0.0"
+src     = "src"
+target  = "native"
+
+[target.linux]
+isa = "x86_64"
+os  = "linux"
+abi = "sysv64"
+
+[bin.wsfix]
+entry = "app.mach"
