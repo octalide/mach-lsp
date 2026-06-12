@@ -24,10 +24,13 @@ This server implements the **diagnostics** vertical slice plus the
     comment as trailing prose.
   - `textDocument/definition` — the resolved symbol's declaration `Location`.
   - `textDocument/references` — the symbol's declaration (which may live in a
-    dependency file) plus every use-site **in the requesting buffer**;
-    workspace-wide use-site search is tracked in #47.
-  - `textDocument/rename` / `prepareRename` — a `WorkspaceEdit` renaming every
-    in-file reference; `prepareRename` returns the name range.
+    dependency file) plus every use-site **across the loaded project graph**
+    (the requesting buffer and every other module that references the symbol).
+  - `textDocument/rename` / `prepareRename` — a **cross-file** `WorkspaceEdit`
+    renaming the declaration, every importer's references, and each importer's
+    `use` path leaf; confined to symbols declared in the user's own project.
+    `prepareRename` returns the name range for a renameable symbol, null for a
+    dependency-declared one.
   - `textDocument/documentSymbol` — the module's top-level declarations as a
     `DocumentSymbol` list.
   - `textDocument/completion` — the file's named declarations, `use` aliases,
@@ -41,15 +44,22 @@ and `dep/` tree) and snapshots every loaded module's exports into a dependency
 set, then re-resolves the open buffer against it. So a symbol imported through
 a `use` binds to its declaration in a dependency module, and:
 
-- hover / definition / references reach **cross-module and cross-file** symbols,
-  pointing at the defining module's source file on disk (a `file://` location);
-- rename / prepareRename stay confined to symbols **local** to the buffer — a
-  dependency's declaration is not the editor's to rewrite;
+- hover / definition reach **cross-module and cross-file** symbols, pointing at
+  the defining module's source file on disk (a `file://` location);
+- references and rename walk a shared use-site index over the loaded module
+  graph (`build_refs` over `mls.project`'s `module_view`): references reports
+  every use-site across all modules; rename rewrites the declaring file, every
+  importer's body references, and each importer's `use` path leaf (guarded by
+  the declared name, so an aliased import's references are left intact).
+  Cross-file rename is confined to symbols declared in the user's own project —
+  a dependency's declaration is not the editor's to rewrite — and reflects the
+  on-disk state of files other than the active buffer, since the project graph
+  is a load-time snapshot not rebuilt on `didChange`;
 - completion is a flat list of the file's named symbols and the primitives, not
   a lexically scoped view (the resolver's scope chain is not exposed by the
   side tables);
 - a document outside any project (no ancestor `mach.toml`) resolves single-file
-  with an empty dependency set.
+  with an empty dependency set — references and rename then stay buffer-local.
 
 > **Known limitation (#45):** the vendored `dep/mach` only parses the old
 > `[targets.<name>]` manifest format, so cross-module resolution is currently
@@ -89,7 +99,7 @@ and fetched by `mach dep pull`; `mach-std` tracks `branch/dev` and `mach` is pin
 | `diagnostics` | run `editor.diagnostics`, map spans, publish |
 | `positions` | byte offset ⇄ LSP `(line, character)` and span text |
 | `features` | offset → id → symbol query core over the resolve side tables |
-| `project` | load the project module graph; re-resolve a buffer against its dependency set; map a symbol to its declaring file's `file://` URI |
+| `project` | load the project module graph; re-resolve a buffer against its dependency set; map a symbol to its declaring file's `file://` URI; expose the loaded modules for the workspace-wide use-site walk |
 | `language` | hover / definition / references / rename / documentSymbol / completion request bodies |
 | `trace` | append-only debug trace log (`/tmp/mach-lsp.log`) |
 
@@ -108,8 +118,13 @@ each scenario module asserts one surface:
   file's functions.
 - `test_crossmodule.py` — against `test/fixture` (which depends on the vendored
   `mach-std`): definition / references / hover on a `use`d std symbol reach a
-  `file://` location inside `dep/mach-std`, and a local symbol still resolves in
-  the buffer.
+  `file://` location inside `dep/mach-std`, a local symbol still resolves in the
+  buffer, and renaming a dependency symbol is refused (prepareRename null, empty
+  edit).
+- `test_workspace.py` — against `test/fixture-ws`, a depless two-module project:
+  references on a `pub` symbol used across files returns use-sites in both
+  modules, and rename rewrites the declaration, the importer's `use` path leaf,
+  and every use-site across both files — invoked from either buffer.
 
 ```sh
 make test          # builds, then runs test/run.py
