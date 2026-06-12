@@ -355,7 +355,13 @@ pub fun module_uri(w: *Workspace, mid: sess.ModuleId) str {
 # module_for_uri: the loaded module whose source file is the document at `uri`
 # (matched on the normalized filesystem path), or none. lets the workspace walk
 # skip the active buffer's on-disk twin, whose live edits the buffer's own
-# resolve already covers, so its references are not counted twice.
+# resolve already covers, so its references are not counted twice. matching is
+# lexical (`.` / `..` collapse only): the std fs surface exposes neither
+# realpath nor inode identity, so a buffer opened through a symlinked or
+# differently-cased path does not match its twin and that file is walked as a
+# separate module — yielding duplicate locations / a duplicate WorkspaceEdit
+# key for the same physical file. such documents normally fail the
+# project-root gate and resolve single-file, which keeps the window narrow.
 # ---
 # w:   the workspace
 # uri: a document URI
