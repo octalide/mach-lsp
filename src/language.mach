@@ -9,12 +9,16 @@
 #
 # cross-module scope: the buffer is resolved with a populated dependency set, so
 # a symbol imported through a `use` binds to its declaration in a dependency Ast.
-# definition / references / hover resolve that declaration through `project`'s
-# symbol -> Ast / SourceFile / URI mapping, pointing at the defining module's
-# file on disk (`project.site_of`). rename / prepareRename stay confined to
-# symbols local to the buffer — a dependency's declaration is not the editor's to
-# rewrite. completion offers the file's module-level names, `use` aliases, and
-# the primitive types (see `features.completion_candidate`).
+# definition / hover resolve that declaration through `project`'s symbol -> Ast /
+# SourceFile / URI mapping, pointing at the defining module's file on disk
+# (`project.site_of`). references and rename walk the whole loaded project graph
+# through a shared use-site index (`build_refs` over `project.module_view`):
+# references reports every use-site across all modules; rename rewrites the
+# declaration plus every importer (body references and `use` path leaves), but
+# only for symbols declared in the user's own project — a dependency's
+# declaration is not the editor's to rewrite. completion offers the file's
+# module-level names, `use` aliases, and the primitive types (see
+# `features.completion_candidate`).
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -419,10 +423,9 @@ pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.S
 }
 
 # references: answer textDocument/references with every Location resolving to
-# the symbol at the cursor — the use-sites in this buffer plus the declaration.
-# the declaration lands in the buffer for a local symbol and in the defining
-# dependency module's file for a cross-module one. empty when the position is
-# not on a resolved symbol.
+# the symbol at the cursor — its declaration plus every use-site across the
+# loaded project graph (the requesting buffer and every other module that
+# references the symbol). empty when the position is not on a resolved symbol.
 pub fun references(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
     val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
     if (id_raw == nil) { ret; }
@@ -443,37 +446,24 @@ pub fun references(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.S
     var bind: token.Span;
     val has_bind: bool = binding_span(an, sr.sym_id, ?bind);
 
-    # the in-buffer walk finds the local decl and every use-site; a cross-module
-    # symbol's declaration lives in a dependency file and is added separately.
-    var xfile: *src.SourceFile = an.file;
-    var xuri:  str = uri;
-    var xspan: token.Span = bind;
-    var has_x: bool = false;
-    var site:  project.Site;
-    var has_site: bool = false;
-    if (sym.origin != an.own) {
-        val site_o: Option[project.Site] = project.site_of(ws, an.own, an.a, an.file, uri, sym);
-        if (is_some[project.Site](site_o)) {
-            site = unwrap[project.Site](site_o);
-            has_site = true;
-            val spo: Option[token.Span] = features.definition_name_span(site.a, sym);
-            if (is_some[token.Span](spo)) {
-                xfile = site.file;
-                xuri  = site.uri;
-                xspan = unwrap[token.Span](spo);
-                has_x = true;
-            }
-        }
-    }
+    val cap: usize = (project.module_count(ws) + 1)::usize;
+    val ra: Result[*XRef, str] = allocate[XRef](alloc, cap);
+    if (is_err[*XRef, str](ra)) { reply_empty_array(alloc, id_raw); ret; }
+    val refs: *XRef = unwrap_ok[*XRef, str](ra);
 
-    emit_locations(an, alloc, id_raw, uri, sr.sym_id, bind, has_bind, xfile, xuri, xspan, has_x);
-    if (has_site) { project.free_site(ws, ?site); }
-    json.free_str(id_raw, alloc);
+    val n: usize = build_refs(ws, an, uri, sym, sr.sym_id, false, refs, cap);
+    emit_locations(alloc, id_raw, refs, n, bind, has_bind);
+    free_refs(ws, refs, n);
+    deallocate[XRef](alloc, refs, cap);
 }
 
 # rename: answer textDocument/rename with a WorkspaceEdit replacing every
-# reference to the symbol at the cursor with the requested new name, across
-# this file. empty edit for a non-local symbol.
+# reference to the symbol at the cursor with the requested new name, across the
+# whole project graph — the declaring file plus every module that imports or
+# uses it (including each importer's `use` path leaf). confined to symbols
+# declared in the user's own project: a dependency's declaration is not the
+# editor's to rewrite, so renaming a cross-module dependency symbol yields an
+# empty edit.
 pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
     val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
     if (id_raw == nil) { ret; }
@@ -489,17 +479,36 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Sessi
     val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
     if (!is_some[features.SymbolRef](ro)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
     val sr: features.SymbolRef = unwrap[features.SymbolRef](ro);
-    if (!sr.local) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
+
+    val so: Option[*res.Symbol] = features.symbol(an.rr, sr.sym_id);
+    if (!is_some[*res.Symbol](so)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
+    val sym: *res.Symbol = unwrap[*res.Symbol](so);
+    if (!renameable(ws, sym, sr)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
+
+    # the declared name guards the cross-file walk: only occurrences spelled with
+    # it are rewritten, so an aliased import's references are left untouched.
+    val no: Option[str] = intern.lookup(?s.interner, sym.name);
+    if (!is_some[str](no)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
+    val name: str = unwrap[str](no);
 
     var bind: token.Span;
     val has_bind: bool = binding_span(an, sr.sym_id, ?bind);
-    emit_rename(an, alloc, id_raw, uri, sr.sym_id, new_name, bind, has_bind);
+
+    val cap: usize = (project.module_count(ws) + 1)::usize;
+    val ra: Result[*XRef, str] = allocate[XRef](alloc, cap);
+    if (is_err[*XRef, str](ra)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
+    val refs: *XRef = unwrap_ok[*XRef, str](ra);
+
+    val n: usize = build_refs(ws, an, uri, sym, sr.sym_id, true, refs, cap);
+    emit_rename(alloc, id_raw, refs, n, new_name, name, bind, has_bind);
+    free_refs(ws, refs, n);
+    deallocate[XRef](alloc, refs, cap);
     json.free_str(new_name, alloc);
-    json.free_str(id_raw, alloc);
 }
 
 # prepare_rename: answer textDocument/prepareRename with the range of the name
-# token at the cursor when it is a renameable local symbol, or null.
+# token at the cursor when it is a renameable symbol (a buffer-local symbol, or a
+# project-owned cross-module one), or null when it is not the editor's to rename.
 pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
     val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
     if (id_raw == nil) { ret; }
@@ -512,7 +521,10 @@ pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, s: *se
     val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
     if (!is_some[features.SymbolRef](ro)) { reply_null(alloc, id_raw); ret; }
     val sr: features.SymbolRef = unwrap[features.SymbolRef](ro);
-    if (!sr.local) { reply_null(alloc, id_raw); ret; }
+
+    val so: Option[*res.Symbol] = features.symbol(an.rr, sr.sym_id);
+    if (!is_some[*res.Symbol](so)) { reply_null(alloc, id_raw); ret; }
+    if (!renameable(ws, unwrap[*res.Symbol](so), sr)) { reply_null(alloc, id_raw); ret; }
 
     val range: positions.LspRange = positions.range_of(an.file, sr.name_span);
     val rng: str = range_json(range, alloc);
@@ -568,6 +580,109 @@ fun binding_span(an: Analyzed, sid: res.SymbolId, out: *token.Span) bool {
     ret true;
 }
 
+# renameable: whether the symbol at the cursor may be renamed — a buffer-local
+# symbol always, a cross-module symbol only when declared in a project-owned
+# module (a dependency's declaration is not the editor's to rewrite). primitives
+# and unresolved positions are excluded upstream (sr.local is false for them).
+fun renameable(ws: *project.Workspace, sym: *res.Symbol, sr: features.SymbolRef) bool {
+    if (sr.local) { ret true; }
+    ret project.is_project_module(ws, sym.origin);
+}
+
+# XRef: one file contributing references to a target symbol — its Ast, resolve
+# tables, source file, document URI, and the local SymbolId every reference in
+# it resolves to. the active buffer is the first XRef (live resolve, borrowed
+# URI); each other loaded module that references the symbol is another (graph
+# snapshot, an owned `file://` URI freed by free_refs). see build_refs.
+rec XRef {
+    a:         *ast.Ast;
+    rr:        *res.ResolveResult;
+    file:      *src.SourceFile;
+    uri:       str;
+    owned_uri: bool;
+    target:    res.SymbolId;
+}
+
+# build_refs: populate `out` with the files that reference the symbol at the
+# cursor and return the count. `out[0]` is always the active buffer (resolved
+# live, matched by its own SymbolId). each subsequent entry is a loaded module
+# whose resolve result contains the symbol's canonical (origin, decl) identity,
+# skipping the buffer's on-disk twin so its live edits are not double-counted.
+# `project_only` restricts the walk to project-owned modules (rename); references
+# passes false to include dependency modules. the symbol's canonical identity is
+# read directly for a cross-module reference, or recovered from the buffer's
+# on-disk module for a buffer-local pub declaration; a buffer-local non-pub
+# symbol has no cross-file use-sites, so only the active buffer is returned.
+# ---
+# ws:          the workspace
+# an:          the active buffer's analysis
+# uri:         the active buffer's document URI
+# sym:         the resolved symbol at the cursor
+# self_target: the symbol's SymbolId in the active buffer's resolve result
+# project_only:restrict the graph walk to project-owned modules
+# out:         array of at least `cap` XRef slots
+# cap:         capacity of `out` (module_count + 1)
+# ret:         number of populated entries (>= 1)
+fun build_refs(ws: *project.Workspace, an: Analyzed, uri: str, sym: *res.Symbol, self_target: res.SymbolId, project_only: bool, out: *XRef, cap: usize) usize {
+    out[0].a         = an.a;
+    out[0].rr        = an.rr;
+    out[0].file      = an.file;
+    out[0].uri       = uri;
+    out[0].owned_uri = false;
+    out[0].target    = self_target;
+    var n: usize = 1;
+
+    val self_o: Option[sess.ModuleId] = project.module_for_uri(ws, uri);
+    val have_self: bool = is_some[sess.ModuleId](self_o);
+    var self_mid: sess.ModuleId = 0::sess.ModuleId;
+    if (have_self) { self_mid = unwrap[sess.ModuleId](self_o); }
+
+    var canon_origin: sess.ModuleId = sym.origin;
+    var canon_decl:   id.DeclId     = sym.decl;
+    if (sym.origin == an.own) {
+        if (!have_self) { ret n; }
+        val mv_o: Option[project.ModuleView] = project.module_view(ws, self_mid);
+        if (!is_some[project.ModuleView](mv_o)) { ret n; }
+        canon_decl   = features.export_decl_of(unwrap[project.ModuleView](mv_o).rr, sym.name, sym.kind);
+        canon_origin = self_mid;
+    }
+    if (canon_decl == id.DECL_NIL) { ret n; }
+
+    val mc: u32 = project.module_count(ws);
+    var mid: u32 = 0;
+    for (mid < mc && n < cap) {
+        val cur: sess.ModuleId = mid::sess.ModuleId;
+        if ((have_self && cur == self_mid)
+            || (project_only && !project.is_project_module(ws, cur))) { mid = mid + 1; cnt; }
+        val mv_o: Option[project.ModuleView] = project.module_view(ws, cur);
+        if (!is_some[project.ModuleView](mv_o)) { mid = mid + 1; cnt; }
+        val mv: project.ModuleView = unwrap[project.ModuleView](mv_o);
+        val tgt: res.SymbolId = features.symbol_by_decl(mv.rr, canon_origin, canon_decl);
+        if (tgt == res.SYMBOL_NIL) { mid = mid + 1; cnt; }
+        val muri: str = project.module_uri(ws, cur);
+        if (muri == nil) { mid = mid + 1; cnt; }
+        out[n].a         = mv.a;
+        out[n].rr        = mv.rr;
+        out[n].file      = mv.file;
+        out[n].uri       = muri;
+        out[n].owned_uri = true;
+        out[n].target    = tgt;
+        n = n + 1;
+        mid = mid + 1;
+    }
+    ret n;
+}
+
+# free_refs: release the owned `file://` URIs of the graph-module entries in a
+# built XRef array. the active buffer's borrowed URI is left untouched.
+fun free_refs(ws: *project.Workspace, refs: *XRef, n: usize) {
+    var i: usize = 0;
+    for (i < n) {
+        if (refs[i].owned_uri && refs[i].uri != nil) { json.free_str(refs[i].uri, ws.alloc); }
+        i = i + 1;
+    }
+}
+
 # analyze: resolve the document named by `uri` against the project dependency
 # graph and populate `out` with its session, file, Ast, ResolveResult, and
 # module id. false when the document is unknown or resolution fails. the module
@@ -605,41 +720,21 @@ fun locate(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, 
     ret positions.offset_at(out.file, line::usize, ch::usize);
 }
 
-# emit_locations: send a Location[] result of every reference to `target`. the
-# in-buffer use-sites and the local decl name span come from the resolve walk
-# over `an`; a param / generic binding site, which has no Decl node, is passed
-# in `bind` when `has_bind`; a cross-module declaration, which lives in another
-# file, is passed in (`xfile`, `xuri`, `xspan`) when `has_x`.
-fun emit_locations(an: Analyzed, alloc: *Allocator, id_raw: str, uri: str, target: res.SymbolId, bind: token.Span, has_bind: bool, xfile: *src.SourceFile, xuri: str, xspan: token.Span, has_x: bool) {
+# emit_locations: send a Location[] of every reference to the symbol across the
+# files in `refs`. each XRef contributes its declaration, import-path leaves, and
+# every body use-site of its local target; the active buffer's param / generic
+# binding (which has no Decl node) is `refs[0]`'s and is passed in `bind` when
+# `has_bind`. takes ownership of `id_raw` and frees it.
+fun emit_locations(alloc: *Allocator, id_raw: str, refs: *XRef, nref: usize, bind: token.Span, has_bind: bool) {
     val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
     val mid:    str = ",\"result\":[";
     val suffix: str = "]}";
 
     var total: usize = str_len(prefix) + str_len(id_raw) + str_len(mid) + str_len(suffix);
     var count: usize = 0;
-
-    if (has_x)    { total = total + loc_len(xfile, xuri, xspan, alloc, count); count = count + 1; }
-    if (has_bind) { total = total + loc_len(an.file, uri, bind, alloc, count); count = count + 1; }
-
-    # first pass: size
-    var ei: usize = 0;
-    for (ei < an.a.expr_len) {
-        val so: Option[token.Span] = features.expr_ref_span(an.a, an.rr, ei::id.ExprId, target);
-        if (is_some[token.Span](so)) { total = total + loc_len(an.file, uri, unwrap[token.Span](so), alloc, count); count = count + 1; }
-        ei = ei + 1;
-    }
-    var ti: usize = 0;
-    for (ti < an.a.type_len) {
-        val so: Option[token.Span] = features.type_ref_span(an.a, an.rr, ti::id.TypeId, target);
-        if (is_some[token.Span](so)) { total = total + loc_len(an.file, uri, unwrap[token.Span](so), alloc, count); count = count + 1; }
-        ti = ti + 1;
-    }
-    var di: usize = 0;
-    for (di < an.a.decl_len) {
-        val so: Option[token.Span] = features.decl_ref_span(an.a, an.rr, di::id.DeclId, target);
-        if (is_some[token.Span](so)) { total = total + loc_len(an.file, uri, unwrap[token.Span](so), alloc, count); count = count + 1; }
-        di = di + 1;
-    }
+    if (nref > 0 && has_bind) { total = total + loc_len(refs[0].file, refs[0].uri, bind, alloc, count); count = count + 1; }
+    var si: usize = 0;
+    for (si < nref) { size_locations(?refs[si], alloc, ?total, ?count); si = si + 1; }
 
     val br: Result[*u8, str] = allocate[u8](alloc, total + 1);
     if (is_err[*u8, str](br)) { reply_empty_array(alloc, id_raw); ret; }
@@ -651,76 +746,109 @@ fun emit_locations(an: Analyzed, alloc: *Allocator, id_raw: str, uri: str, targe
     off = append(buf, off, mid);
 
     var emitted: usize = 0;
-    if (has_x)    { off = put_loc(buf, off, xfile, xuri, xspan, alloc, emitted); emitted = emitted + 1; }
-    if (has_bind) { off = put_loc(buf, off, an.file, uri, bind, alloc, emitted); emitted = emitted + 1; }
-    var e2: usize = 0;
-    for (e2 < an.a.expr_len) {
-        val so: Option[token.Span] = features.expr_ref_span(an.a, an.rr, e2::id.ExprId, target);
-        if (is_some[token.Span](so)) { off = put_loc(buf, off, an.file, uri, unwrap[token.Span](so), alloc, emitted); emitted = emitted + 1; }
-        e2 = e2 + 1;
-    }
-    var t2: usize = 0;
-    for (t2 < an.a.type_len) {
-        val so: Option[token.Span] = features.type_ref_span(an.a, an.rr, t2::id.TypeId, target);
-        if (is_some[token.Span](so)) { off = put_loc(buf, off, an.file, uri, unwrap[token.Span](so), alloc, emitted); emitted = emitted + 1; }
-        t2 = t2 + 1;
-    }
-    var d2: usize = 0;
-    for (d2 < an.a.decl_len) {
-        val so: Option[token.Span] = features.decl_ref_span(an.a, an.rr, d2::id.DeclId, target);
-        if (is_some[token.Span](so)) { off = put_loc(buf, off, an.file, uri, unwrap[token.Span](so), alloc, emitted); emitted = emitted + 1; }
-        d2 = d2 + 1;
-    }
+    if (nref > 0 && has_bind) { off = put_loc(buf, off, refs[0].file, refs[0].uri, bind, alloc, emitted); emitted = emitted + 1; }
+    var sj: usize = 0;
+    for (sj < nref) { off = write_locations(?refs[sj], buf, off, alloc, ?emitted); sj = sj + 1; }
 
     off = append(buf, off, suffix);
     buf[off] = 0;
     transport.send_message(buf::str, alloc);
     deallocate[u8](alloc, buf, total + 1);
+    json.free_str(id_raw, alloc);
 }
 
-# emit_rename: send a WorkspaceEdit with one TextEdit per in-file reference to
-# `target`, each replacing the reference's range with `new_name`. a param /
-# generic binding site is passed in `bind` when `has_bind`.
-fun emit_rename(an: Analyzed, alloc: *Allocator, id_raw: str, uri: str, target: res.SymbolId, new_name: str, bind: token.Span, has_bind: bool) {
-    val quri: str = json.quote(uri, alloc);
-    val qname: str = json.quote(new_name, alloc);
-    if (quri == nil || qname == nil) {
-        json.free_str(quri, alloc); json.free_str(qname, alloc);
-        reply_empty_edit(alloc, id_raw); ret;
+# size_locations: add the JSON length of every reference to `s.target` in source
+# `s` to `total`, advancing the running `count` (which sequences the separating
+# commas across the whole Location array).
+fun size_locations(s: *XRef, alloc: *Allocator, total: *usize, count: *usize) {
+    if (s.target == res.SYMBOL_NIL) { ret; }
+    var di: usize = 0;
+    for (di < s.a.decl_len) {
+        val dso: Option[token.Span] = features.decl_ref_span(s.a, s.rr, di::id.DeclId, s.target);
+        if (is_some[token.Span](dso)) { @total = @total + loc_len(s.file, s.uri, unwrap[token.Span](dso), alloc, @count); @count = @count + 1; }
+        val iso: Option[token.Span] = features.import_ref_span(s.a, s.rr, di::id.DeclId, s.target, s.file);
+        if (is_some[token.Span](iso)) { @total = @total + loc_len(s.file, s.uri, unwrap[token.Span](iso), alloc, @count); @count = @count + 1; }
+        di = di + 1;
     }
+    var ei: usize = 0;
+    for (ei < s.a.expr_len) {
+        val so: Option[token.Span] = features.expr_ref_span(s.a, s.rr, ei::id.ExprId, s.target);
+        if (is_some[token.Span](so)) { @total = @total + loc_len(s.file, s.uri, unwrap[token.Span](so), alloc, @count); @count = @count + 1; }
+        ei = ei + 1;
+    }
+    var ti: usize = 0;
+    for (ti < s.a.type_len) {
+        val so: Option[token.Span] = features.type_ref_span(s.a, s.rr, ti::id.TypeId, s.target);
+        if (is_some[token.Span](so)) { @total = @total + loc_len(s.file, s.uri, unwrap[token.Span](so), alloc, @count); @count = @count + 1; }
+        ti = ti + 1;
+    }
+}
+
+# write_locations: append every reference to `s.target` in source `s` to `buf`,
+# advancing the running `emitted` count (sequencing the separating commas), and
+# return the new offset. mirrors size_locations.
+fun write_locations(s: *XRef, buf: *u8, off: usize, alloc: *Allocator, emitted: *usize) usize {
+    if (s.target == res.SYMBOL_NIL) { ret off; }
+    var o: usize = off;
+    var di: usize = 0;
+    for (di < s.a.decl_len) {
+        val dso: Option[token.Span] = features.decl_ref_span(s.a, s.rr, di::id.DeclId, s.target);
+        if (is_some[token.Span](dso)) { o = put_loc(buf, o, s.file, s.uri, unwrap[token.Span](dso), alloc, @emitted); @emitted = @emitted + 1; }
+        val iso: Option[token.Span] = features.import_ref_span(s.a, s.rr, di::id.DeclId, s.target, s.file);
+        if (is_some[token.Span](iso)) { o = put_loc(buf, o, s.file, s.uri, unwrap[token.Span](iso), alloc, @emitted); @emitted = @emitted + 1; }
+        di = di + 1;
+    }
+    var ei: usize = 0;
+    for (ei < s.a.expr_len) {
+        val so: Option[token.Span] = features.expr_ref_span(s.a, s.rr, ei::id.ExprId, s.target);
+        if (is_some[token.Span](so)) { o = put_loc(buf, o, s.file, s.uri, unwrap[token.Span](so), alloc, @emitted); @emitted = @emitted + 1; }
+        ei = ei + 1;
+    }
+    var ti: usize = 0;
+    for (ti < s.a.type_len) {
+        val so: Option[token.Span] = features.type_ref_span(s.a, s.rr, ti::id.TypeId, s.target);
+        if (is_some[token.Span](so)) { o = put_loc(buf, o, s.file, s.uri, unwrap[token.Span](so), alloc, @emitted); @emitted = @emitted + 1; }
+        ti = ti + 1;
+    }
+    ret o;
+}
+
+# emit_rename: send a WorkspaceEdit renaming the symbol to `new_name` across the
+# files in `refs`, one `changes` entry per file. each entry renames the
+# declaration, the import-path leaves, and every body reference spelled with the
+# declared name `name` (so an aliased import's references are not rewritten); the
+# active buffer's param / generic binding is included when `has_bind`. takes
+# ownership of `id_raw` and frees it.
+fun emit_rename(alloc: *Allocator, id_raw: str, refs: *XRef, nref: usize, new_name: str, name: str, bind: token.Span, has_bind: bool) {
+    val qname: str = json.quote(new_name, alloc);
+    if (qname == nil) { reply_empty_edit(alloc, id_raw); ret; }
+
+    val ga: Result[*str, str] = allocate[str](alloc, nref);
+    if (is_err[*str, str](ga)) { json.free_str(qname, alloc); reply_empty_edit(alloc, id_raw); ret; }
+    val groups: *str = unwrap_ok[*str, str](ga);
 
     val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
-    val mid1:   str = ",\"result\":{\"changes\":{";
-    val mid2:   str = ":[";
-    val suffix: str = "]}}}";
-
-    var total: usize = str_len(prefix) + str_len(id_raw) + str_len(mid1) + str_len(quri) + str_len(mid2) + str_len(suffix);
-    var count: usize = 0;
-
-    if (has_bind) { total = total + edit_len(an.file, bind, qname, alloc, count); count = count + 1; }
-
-    var e1: usize = 0;
-    for (e1 < an.a.expr_len) {
-        val so: Option[token.Span] = features.expr_ref_span(an.a, an.rr, e1::id.ExprId, target);
-        if (is_some[token.Span](so)) { total = total + edit_len(an.file, unwrap[token.Span](so), qname, alloc, count); count = count + 1; }
-        e1 = e1 + 1;
-    }
-    var ty1: usize = 0;
-    for (ty1 < an.a.type_len) {
-        val so: Option[token.Span] = features.type_ref_span(an.a, an.rr, ty1::id.TypeId, target);
-        if (is_some[token.Span](so)) { total = total + edit_len(an.file, unwrap[token.Span](so), qname, alloc, count); count = count + 1; }
-        ty1 = ty1 + 1;
-    }
-    var d1: usize = 0;
-    for (d1 < an.a.decl_len) {
-        val so: Option[token.Span] = features.decl_ref_span(an.a, an.rr, d1::id.DeclId, target);
-        if (is_some[token.Span](so)) { total = total + edit_len(an.file, unwrap[token.Span](so), qname, alloc, count); count = count + 1; }
-        d1 = d1 + 1;
+    val mid:    str = ",\"result\":{\"changes\":{";
+    val suffix: str = "}}}";
+    var total: usize = str_len(prefix) + str_len(id_raw) + str_len(mid) + str_len(suffix);
+    var ng: usize = 0;
+    var si: usize = 0;
+    for (si < nref) {
+        val g: str = rename_group_json(?refs[si], si == 0 && has_bind, bind, name, qname, alloc);
+        if (g != nil) {
+            if (ng > 0) { total = total + 1; }
+            total = total + str_len(g);
+            groups[ng] = g;
+            ng = ng + 1;
+        }
+        si = si + 1;
     }
 
     val br: Result[*u8, str] = allocate[u8](alloc, total + 1);
     if (is_err[*u8, str](br)) {
-        json.free_str(quri, alloc); json.free_str(qname, alloc);
+        free_groups(groups, ng, alloc);
+        deallocate[str](alloc, groups, nref);
+        json.free_str(qname, alloc);
         reply_empty_edit(alloc, id_raw); ret;
     }
     val buf: *u8 = unwrap_ok[*u8, str](br);
@@ -728,37 +856,100 @@ fun emit_rename(an: Analyzed, alloc: *Allocator, id_raw: str, uri: str, target: 
     var off: usize = 0;
     off = append(buf, off, prefix);
     off = append(buf, off, id_raw);
-    off = append(buf, off, mid1);
-    off = append(buf, off, quri);
-    off = append(buf, off, mid2);
-
-    var emitted: usize = 0;
-    if (has_bind) { off = put_edit(buf, off, an.file, bind, qname, alloc, emitted); emitted = emitted + 1; }
-    var e2: usize = 0;
-    for (e2 < an.a.expr_len) {
-        val so: Option[token.Span] = features.expr_ref_span(an.a, an.rr, e2::id.ExprId, target);
-        if (is_some[token.Span](so)) { off = put_edit(buf, off, an.file, unwrap[token.Span](so), qname, alloc, emitted); emitted = emitted + 1; }
-        e2 = e2 + 1;
+    off = append(buf, off, mid);
+    var gi: usize = 0;
+    for (gi < ng) {
+        if (gi > 0) { buf[off] = ','; off = off + 1; }
+        off = append(buf, off, groups[gi]);
+        gi = gi + 1;
     }
-    var t2: usize = 0;
-    for (t2 < an.a.type_len) {
-        val so: Option[token.Span] = features.type_ref_span(an.a, an.rr, t2::id.TypeId, target);
-        if (is_some[token.Span](so)) { off = put_edit(buf, off, an.file, unwrap[token.Span](so), qname, alloc, emitted); emitted = emitted + 1; }
-        t2 = t2 + 1;
-    }
-    var d2: usize = 0;
-    for (d2 < an.a.decl_len) {
-        val so: Option[token.Span] = features.decl_ref_span(an.a, an.rr, d2::id.DeclId, target);
-        if (is_some[token.Span](so)) { off = put_edit(buf, off, an.file, unwrap[token.Span](so), qname, alloc, emitted); emitted = emitted + 1; }
-        d2 = d2 + 1;
-    }
-
     off = append(buf, off, suffix);
     buf[off] = 0;
     transport.send_message(buf::str, alloc);
     deallocate[u8](alloc, buf, total + 1);
-    json.free_str(quri, alloc);
+
+    free_groups(groups, ng, alloc);
+    deallocate[str](alloc, groups, nref);
     json.free_str(qname, alloc);
+    json.free_str(id_raw, alloc);
+}
+
+# rename_group_json: the `changes`-map entry `"<uri>":[<edits>]` for source `s`,
+# renaming the declaration, import-path leaves, and every body reference spelled
+# `name` to the already-quoted `qname`, or nil when `s` contributes no edit. the
+# active buffer's param / generic binding is included when `include_bind`.
+fun rename_group_json(s: *XRef, include_bind: bool, bind: token.Span, name: str, qname: str, alloc: *Allocator) str {
+    if (s.target == res.SYMBOL_NIL) { ret nil; }
+    val quri: str = json.quote(s.uri, alloc);
+    if (quri == nil) { ret nil; }
+
+    var ebytes: usize = 0;
+    var count:  usize = 0;
+    if (include_bind) { ebytes = ebytes + edit_len(s.file, bind, qname, alloc, count); count = count + 1; }
+    var di: usize = 0;
+    for (di < s.a.decl_len) {
+        val dso: Option[token.Span] = features.decl_ref_span(s.a, s.rr, di::id.DeclId, s.target);
+        if (is_some[token.Span](dso)) { ebytes = ebytes + edit_len(s.file, unwrap[token.Span](dso), qname, alloc, count); count = count + 1; }
+        val iso: Option[token.Span] = features.import_ref_span(s.a, s.rr, di::id.DeclId, s.target, s.file);
+        if (is_some[token.Span](iso)) { ebytes = ebytes + edit_len(s.file, unwrap[token.Span](iso), qname, alloc, count); count = count + 1; }
+        di = di + 1;
+    }
+    var ei: usize = 0;
+    for (ei < s.a.expr_len) {
+        val so: Option[token.Span] = features.expr_ref_span(s.a, s.rr, ei::id.ExprId, s.target);
+        if (is_some[token.Span](so) && features.span_text_equals(s.file, unwrap[token.Span](so), name)) { ebytes = ebytes + edit_len(s.file, unwrap[token.Span](so), qname, alloc, count); count = count + 1; }
+        ei = ei + 1;
+    }
+    var ti: usize = 0;
+    for (ti < s.a.type_len) {
+        val so: Option[token.Span] = features.type_ref_span(s.a, s.rr, ti::id.TypeId, s.target);
+        if (is_some[token.Span](so) && features.span_text_equals(s.file, unwrap[token.Span](so), name)) { ebytes = ebytes + edit_len(s.file, unwrap[token.Span](so), qname, alloc, count); count = count + 1; }
+        ti = ti + 1;
+    }
+    if (count == 0) { json.free_str(quri, alloc); ret nil; }
+
+    val open:  str = ":[";
+    val close: str = "]";
+    val total: usize = str_len(quri) + str_len(open) + ebytes + str_len(close);
+    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
+    if (is_err[*u8, str](r)) { json.free_str(quri, alloc); ret nil; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+
+    var off: usize = 0;
+    off = append(buf, off, quri);
+    off = append(buf, off, open);
+    var emitted: usize = 0;
+    if (include_bind) { off = put_edit(buf, off, s.file, bind, qname, alloc, emitted); emitted = emitted + 1; }
+    var d2: usize = 0;
+    for (d2 < s.a.decl_len) {
+        val dso: Option[token.Span] = features.decl_ref_span(s.a, s.rr, d2::id.DeclId, s.target);
+        if (is_some[token.Span](dso)) { off = put_edit(buf, off, s.file, unwrap[token.Span](dso), qname, alloc, emitted); emitted = emitted + 1; }
+        val iso: Option[token.Span] = features.import_ref_span(s.a, s.rr, d2::id.DeclId, s.target, s.file);
+        if (is_some[token.Span](iso)) { off = put_edit(buf, off, s.file, unwrap[token.Span](iso), qname, alloc, emitted); emitted = emitted + 1; }
+        d2 = d2 + 1;
+    }
+    var e2: usize = 0;
+    for (e2 < s.a.expr_len) {
+        val so: Option[token.Span] = features.expr_ref_span(s.a, s.rr, e2::id.ExprId, s.target);
+        if (is_some[token.Span](so) && features.span_text_equals(s.file, unwrap[token.Span](so), name)) { off = put_edit(buf, off, s.file, unwrap[token.Span](so), qname, alloc, emitted); emitted = emitted + 1; }
+        e2 = e2 + 1;
+    }
+    var t2: usize = 0;
+    for (t2 < s.a.type_len) {
+        val so: Option[token.Span] = features.type_ref_span(s.a, s.rr, t2::id.TypeId, s.target);
+        if (is_some[token.Span](so) && features.span_text_equals(s.file, unwrap[token.Span](so), name)) { off = put_edit(buf, off, s.file, unwrap[token.Span](so), qname, alloc, emitted); emitted = emitted + 1; }
+        t2 = t2 + 1;
+    }
+    off = append(buf, off, close);
+    buf[off] = 0;
+    json.free_str(quri, alloc);
+    ret buf::str;
+}
+
+# free_groups: free the first `n` owned changes-map entry strings in `groups`.
+fun free_groups(groups: *str, n: usize, alloc: *Allocator) {
+    var i: usize = 0;
+    for (i < n) { json.free_str(groups[i], alloc); i = i + 1; }
 }
 
 # emit_document_symbols: send a DocumentSymbol[] of the file's top-level decls.
