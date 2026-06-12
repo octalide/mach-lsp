@@ -165,6 +165,55 @@ def percent_encoding_scenario():
     return failures
 
 
+def dep_buffer_rename_scenario():
+    """a dependency source opened directly (as after go-to-definition) is not the
+    editor's to rewrite: even though its symbols resolve buffer-locally, its
+    on-disk twin is a non-project module, so prepareRename refuses and rename
+    yields an empty WorkspaceEdit (regression: the local-symbol path skipped the
+    project-ownership check)."""
+    dep_path = os.path.join(REPO, "dep", "mach-std", "src", "types", "string.mach")
+    dep_text = open(dep_path).read()
+    decl_line = None
+    decl_col = None
+    for i, line in enumerate(dep_text.splitlines()):
+        if "pub fun str_len" in line:
+            decl_line, decl_col = i, line.find("str_len")
+            break
+    if decl_line is None:
+        return [f"str_len declaration not found in {dep_path}"]
+
+    app_text = open(APP).read()
+    dep_pos = pos(decl_line, decl_col)
+    frames = [
+        req(1, "initialize", {"capabilities": {}}),
+        notify("initialized"),
+        did_open(URI, app_text),
+        # resolve the project document first so the fixture graph is loaded
+        req(10, "textDocument/definition", {"textDocument": {"uri": URI}, "position": STR_LEN}),
+        did_open(DEP_STRING_URI, dep_text),
+        req(20, "textDocument/prepareRename",
+            {"textDocument": {"uri": DEP_STRING_URI}, "position": dep_pos}),
+        req(21, "textDocument/rename",
+            {"textDocument": {"uri": DEP_STRING_URI}, "position": dep_pos, "newName": "nope"}),
+        req(2, "shutdown", None),
+        notify("exit"),
+    ]
+    code, msgs = drive(frames)
+
+    failures = []
+    check_dep_definition(failures, "definition(str_len) before the dep open",
+                         (by_id(msgs, 10) or {}).get("result"))
+    prv = (by_id(msgs, 20) or {}).get("result", "missing")
+    if prv is not None:
+        failures.append(f"prepareRename(dep buffer decl) should be null, got {prv!r}")
+    rnv = (by_id(msgs, 21) or {}).get("result")
+    if not isinstance(rnv, dict) or rnv.get("changes") != {}:
+        failures.append(f"rename(dep buffer decl) should be an empty WorkspaceEdit, got {rnv!r}")
+    if code != 0:
+        failures.append("non-zero exit code after clean shutdown")
+    return failures
+
+
 def run():
     """drive the cross-module scenarios; return a list of failure strings."""
     if not os.path.exists(APP):
@@ -173,6 +222,7 @@ def run():
     failures += main_scenario()
     failures += scratch_ordering_scenario()
     failures += percent_encoding_scenario()
+    failures += dep_buffer_rename_scenario()
     return failures
 
 
