@@ -295,6 +295,122 @@ pub fun free_site(w: *Workspace, site: *Site) {
     site.owned = false;
 }
 
+# ModuleView: a borrowed view of one loaded module for the workspace-wide
+# use-site walk — its parsed Ast, resolve side tables, and backing source file.
+# ---
+# a:    the module's parsed Ast (decl / expr / type ids index into it)
+# rr:   the module's ResolveResult side tables
+# file: the SourceFile backing `a` (byte offset <-> position, span text)
+pub rec ModuleView {
+    a:    *ast.Ast;
+    rr:   *res.ResolveResult;
+    file: *src.SourceFile;
+}
+
+# module_count: the number of loaded project modules, or 0 when no project is
+# loaded. the workspace-wide references / rename walk iterates [0, count).
+# ---
+# w:   the workspace
+# ret: the loaded module count
+pub fun module_count(w: *Workspace) u32 {
+    if (!w.has_project) { ret 0; }
+    ret w.p.module_len;
+}
+
+# module_view: a borrowed view of loaded module `mid` for the use-site walk, or
+# none when the id is out of range, the module did not resolve, or its source is
+# missing. the returned pointers are owned by the loaded project / session.
+# ---
+# w:   the workspace
+# mid: a loaded module id in [0, module_count)
+# ret: some(ModuleView), or none
+pub fun module_view(w: *Workspace, mid: sess.ModuleId) Option[ModuleView] {
+    if (!w.has_project || mid::u32 >= w.p.module_len) { ret none[ModuleView](); }
+    val m: *driver.ModuleEntry = ?w.p.modules[mid::u32];
+    if (!m.resolved) { ret none[ModuleView](); }
+    val fo: Option[*src.SourceFile] = src.get(?w.s.sources, m.file_id);
+    if (!is_some[*src.SourceFile](fo)) { ret none[ModuleView](); }
+    var v: ModuleView;
+    v.a    = ?m.a;
+    v.rr   = ?m.resolve_result;
+    v.file = unwrap[*src.SourceFile](fo);
+    ret some[ModuleView](v);
+}
+
+# module_uri: a freshly built, normalized `file://` URI for loaded module `mid`'s
+# source file, owned by the caller, or nil when the id is out of range / on
+# allocation failure.
+# ---
+# w:   the workspace
+# mid: a loaded module id
+# ret: an owned URI, or nil
+pub fun module_uri(w: *Workspace, mid: sess.ModuleId) str {
+    if (!w.has_project || mid::u32 >= w.p.module_len) { ret nil; }
+    val m: *driver.ModuleEntry = ?w.p.modules[mid::u32];
+    val fo: Option[*src.SourceFile] = src.get(?w.s.sources, m.file_id);
+    if (!is_some[*src.SourceFile](fo)) { ret nil; }
+    ret file_uri(w.alloc, unwrap[*src.SourceFile](fo).path);
+}
+
+# module_for_uri: the loaded module whose source file is the document at `uri`
+# (matched on the normalized filesystem path), or none. lets the workspace walk
+# skip the active buffer's on-disk twin, whose live edits the buffer's own
+# resolve already covers, so its references are not counted twice.
+# ---
+# w:   the workspace
+# uri: a document URI
+# ret: some(ModuleId), or none
+pub fun module_for_uri(w: *Workspace, uri: str) Option[sess.ModuleId] {
+    if (!w.has_project || uri == nil) { ret none[sess.ModuleId](); }
+    val path: str = uri_to_path(w.alloc, uri);
+    if (path == nil) { ret none[sess.ModuleId](); }
+    val norm: str = normalize_path(w.alloc, path);
+    strutil.str_free(w.alloc, path);
+    if (norm == nil) { ret none[sess.ModuleId](); }
+
+    var found:  bool = false;
+    var result: sess.ModuleId = 0::sess.ModuleId;
+    var i: u32 = 0;
+    for (i < w.p.module_len && !found) {
+        val m: *driver.ModuleEntry = ?w.p.modules[i];
+        val fo: Option[*src.SourceFile] = src.get(?w.s.sources, m.file_id);
+        if (is_some[*src.SourceFile](fo)) {
+            val mnorm: str = normalize_path(w.alloc, unwrap[*src.SourceFile](fo).path);
+            if (mnorm != nil) {
+                if (str_equals(mnorm, norm)) { found = true; result = i::sess.ModuleId; }
+                strutil.str_free(w.alloc, mnorm);
+            }
+        }
+        i = i + 1;
+    }
+    strutil.str_free(w.alloc, norm);
+    if (!found) { ret none[sess.ModuleId](); }
+    ret some[sess.ModuleId](result);
+}
+
+# is_project_module: whether loaded module `mid` belongs to the user's own
+# project rather than a vendored dependency — true iff its fully-qualified path's
+# head segment is the project id. rename gates cross-file edits on it so a
+# dependency's declaration (e.g. a std symbol) is never rewritten.
+# ---
+# w:   the workspace
+# mid: a loaded module id
+# ret: true for a project-owned module
+pub fun is_project_module(w: *Workspace, mid: sess.ModuleId) bool {
+    if (!w.has_project || mid::u32 >= w.p.module_len) { ret false; }
+    val m: *driver.ModuleEntry = ?w.p.modules[mid::u32];
+    val id_opt:  Option[str] = intern.lookup(?w.s.interner, w.p.config.id);
+    val fqn_opt: Option[str] = intern.lookup(?w.s.interner, m.fqn);
+    if (!is_some[str](id_opt) || !is_some[str](fqn_opt)) { ret false; }
+    val pid: str = unwrap[str](id_opt);
+    val fqn: str = unwrap[str](fqn_opt);
+    val plen: usize = str_len(pid);
+    val flen: usize = str_len(fqn);
+    if (flen < plen || !str_starts_with(fqn, pid)) { ret false; }
+    if (flen == plen) { ret true; }
+    ret fqn[plen] == '.';
+}
+
 # document_root: the project root governing `uri` — the nearest ancestor of its
 # decoded filesystem path holding a `mach.toml` — as an owned string, or nil
 # for a non-file URI or a document outside any project.
