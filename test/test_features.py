@@ -7,14 +7,25 @@ file's functions."""
 from harness import drive, req, notify, did_open, pos, by_id, standalone
 
 DOC = "helper returns its argument unchanged."
+# the doc comment carries a `# ---` separator and a two-field stanza so hover
+# rendering is exercised structure-aware: prose, a horizontal rule, then list
+# items. the em dash and exact newlines are asserted below.
+EM = "—"
+STANZA = (
+    "\n\n---\n\n"
+    f"- **a** {EM} the value to echo\n"
+    f"- **ret** {EM} the same value, unchanged"
+)
 SRC = (
-    f"# {DOC}\n"                                          # line 0 (doc comment)
-    "# exercised by the hover doc-comment assertion.\n"  # line 1 (doc comment)
-    "fun helper(a: i64) i64 { ret a; }\n"                # line 2
-    "fun main() i64 {\n"                                 # line 3
-    "    val x: i64 = helper(7);\n"                       # line 4
-    "    ret x;\n"                                         # line 5
-    "}\n"                                                 # line 6
+    f"# {DOC}\n"                              # line 0 (doc comment, prose)
+    "# ---\n"                                 # line 1 (doc comment, separator)
+    "# a:   the value to echo\n"              # line 2 (doc comment, field)
+    "# ret: the same value, unchanged\n"      # line 3 (doc comment, field)
+    "fun helper(a: i64) i64 { ret a; }\n"     # line 4
+    "fun main() i64 {\n"                      # line 5
+    "    val x: i64 = helper(7);\n"           # line 6
+    "    ret x;\n"                            # line 7
+    "}\n"                                     # line 8
 )
 URI = "file:///feat.mach"
 
@@ -25,19 +36,19 @@ def run():
         req(1, "initialize", {"capabilities": {}}),
         notify("initialized"),
         did_open(URI, SRC),
-        req(10, "textDocument/hover", {"textDocument": {"uri": URI}, "position": pos(4, 17)}),
-        req(11, "textDocument/hover", {"textDocument": {"uri": URI}, "position": pos(5, 8)}),
-        req(20, "textDocument/definition", {"textDocument": {"uri": URI}, "position": pos(4, 17)}),
+        req(10, "textDocument/hover", {"textDocument": {"uri": URI}, "position": pos(6, 17)}),
+        req(11, "textDocument/hover", {"textDocument": {"uri": URI}, "position": pos(7, 8)}),
+        req(20, "textDocument/definition", {"textDocument": {"uri": URI}, "position": pos(6, 17)}),
         req(30, "textDocument/references",
-            {"textDocument": {"uri": URI}, "position": pos(2, 4),
+            {"textDocument": {"uri": URI}, "position": pos(4, 4),
              "context": {"includeDeclaration": True}}),
-        req(40, "textDocument/prepareRename", {"textDocument": {"uri": URI}, "position": pos(4, 8)}),
+        req(40, "textDocument/prepareRename", {"textDocument": {"uri": URI}, "position": pos(6, 8)}),
         req(41, "textDocument/rename",
-            {"textDocument": {"uri": URI}, "position": pos(4, 8), "newName": "y"}),
+            {"textDocument": {"uri": URI}, "position": pos(6, 8), "newName": "y"}),
         req(42, "textDocument/rename",
-            {"textDocument": {"uri": URI}, "position": pos(2, 11), "newName": "arg"}),
+            {"textDocument": {"uri": URI}, "position": pos(4, 11), "newName": "arg"}),
         req(50, "textDocument/documentSymbol", {"textDocument": {"uri": URI}}),
-        req(60, "textDocument/completion", {"textDocument": {"uri": URI}, "position": pos(5, 4)}),
+        req(60, "textDocument/completion", {"textDocument": {"uri": URI}, "position": pos(7, 4)}),
         req(2, "shutdown", None),
         notify("exit"),
     ]
@@ -62,6 +73,10 @@ def run():
             failures.append("hover(helper) value does not mention 'helper'")
         if DOC not in hval:
             failures.append(f"hover(helper) value does not include the doc comment {DOC!r}")
+        # the `# ---` separator renders as a blank-line-fenced HR and each
+        # `ident:` field becomes its own `- **ident** — desc` list item.
+        if STANZA not in hval:
+            failures.append(f"hover(helper) value does not render the field stanza {STANZA!r} (got {hval!r})")
 
     # hover on x -> mentions i64
     hv2 = (by_id(msgs, 11) or {}).get("result")
@@ -70,12 +85,12 @@ def run():
     elif "i64" not in hv2["contents"].get("value", ""):
         failures.append("hover(x) value does not mention type 'i64'")
 
-    # definition of helper -> Location on its decl line (2)
+    # definition of helper -> Location on its decl line (4)
     dv = (by_id(msgs, 20) or {}).get("result")
     if not dv or "range" not in dv:
         failures.append("definition(helper) returned no Location")
-    elif dv["range"]["start"]["line"] != 2:
-        failures.append(f"definition(helper) points to line {dv['range']['start']['line']}, expected 2")
+    elif dv["range"]["start"]["line"] != 4:
+        failures.append(f"definition(helper) points to line {dv['range']['start']['line']}, expected 4")
 
     # references of helper -> decl + call
     rv = (by_id(msgs, 30) or {}).get("result")
@@ -111,7 +126,7 @@ def run():
         elif any(e.get("newText") != "arg" for e in pedits):
             failures.append("rename(param a) edit newText is not 'arg'")
         else:
-            cols = {e["range"]["start"]["character"] for e in pedits if e["range"]["start"]["line"] == 2}
+            cols = {e["range"]["start"]["character"] for e in pedits if e["range"]["start"]["line"] == 4}
             if 11 not in cols:
                 failures.append(f"rename(param a) did not rewrite the binding at col 11 (cols {sorted(cols)})")
 
