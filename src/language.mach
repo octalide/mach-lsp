@@ -25,11 +25,10 @@ use std.types.string.str_len;
 use std.types.string.str_equals;
 use std.types.string.str_starts_with;
 use std.types.option.Option;
+use std.types.option.none;
 use std.types.option.is_some;
 use std.types.option.unwrap;
 use std.types.result.Result;
-use std.types.result.ok;
-use std.types.result.err;
 use std.types.result.is_err;
 use std.types.result.unwrap_ok;
 
@@ -78,9 +77,9 @@ pub fun hover(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Sessio
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val off_r: Result[usize, str] = locate(ws, es, s, alloc, docs, body, uri, ?an);
-    if (is_err[usize, str](off_r)) { reply_null(alloc, id_raw); ret; }
-    val offset: usize = unwrap_ok[usize, str](off_r);
+    val off_o: Option[usize] = locate(ws, es, s, alloc, docs, body, uri, ?an);
+    if (!is_some[usize](off_o)) { reply_null(alloc, id_raw); ret; }
+    val offset: usize = unwrap[usize](off_o);
 
     val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
     if (!is_some[features.SymbolRef](ro)) { reply_null(alloc, id_raw); ret; }
@@ -248,9 +247,9 @@ pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.S
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val off_r: Result[usize, str] = locate(ws, es, s, alloc, docs, body, uri, ?an);
-    if (is_err[usize, str](off_r)) { reply_null(alloc, id_raw); ret; }
-    val offset: usize = unwrap_ok[usize, str](off_r);
+    val off_o: Option[usize] = locate(ws, es, s, alloc, docs, body, uri, ?an);
+    if (!is_some[usize](off_o)) { reply_null(alloc, id_raw); ret; }
+    val offset: usize = unwrap[usize](off_o);
 
     val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
     if (!is_some[features.SymbolRef](ro)) { reply_null(alloc, id_raw); ret; }
@@ -291,9 +290,9 @@ pub fun references(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.S
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val off_r: Result[usize, str] = locate(ws, es, s, alloc, docs, body, uri, ?an);
-    if (is_err[usize, str](off_r)) { reply_empty_array(alloc, id_raw); ret; }
-    val offset: usize = unwrap_ok[usize, str](off_r);
+    val off_o: Option[usize] = locate(ws, es, s, alloc, docs, body, uri, ?an);
+    if (!is_some[usize](off_o)) { reply_empty_array(alloc, id_raw); ret; }
+    val offset: usize = unwrap[usize](off_o);
 
     val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
     if (!is_some[features.SymbolRef](ro)) { reply_empty_array(alloc, id_raw); ret; }
@@ -345,9 +344,9 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Sessi
     if (new_name == nil) { reply_null(alloc, id_raw); ret; }
 
     var an: Analyzed;
-    val off_r: Result[usize, str] = locate(ws, es, s, alloc, docs, body, uri, ?an);
-    if (is_err[usize, str](off_r)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
-    val offset: usize = unwrap_ok[usize, str](off_r);
+    val off_o: Option[usize] = locate(ws, es, s, alloc, docs, body, uri, ?an);
+    if (!is_some[usize](off_o)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
+    val offset: usize = unwrap[usize](off_o);
 
     val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
     if (!is_some[features.SymbolRef](ro)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
@@ -368,9 +367,9 @@ pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, s: *se
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val off_r: Result[usize, str] = locate(ws, es, s, alloc, docs, body, uri, ?an);
-    if (is_err[usize, str](off_r)) { reply_null(alloc, id_raw); ret; }
-    val offset: usize = unwrap_ok[usize, str](off_r);
+    val off_o: Option[usize] = locate(ws, es, s, alloc, docs, body, uri, ?an);
+    if (!is_some[usize](off_o)) { reply_null(alloc, id_raw); ret; }
+    val offset: usize = unwrap[usize](off_o);
 
     val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
     if (!is_some[features.SymbolRef](ro)) { reply_null(alloc, id_raw); ret; }
@@ -456,18 +455,16 @@ fun analyze(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session,
 }
 
 # locate: analyze the target document and resolve the request's cursor position
-# to a byte offset. the error string is unused by callers (they fall back to a
-# null / empty reply) but distinguishes failure from a real offset of 0.
-fun locate(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str, out: *Analyzed) Result[usize, str] {
-    if (!analyze(ws, es, s, docs, uri, out)) { ret r_err("document not analyzable"); }
+# to a byte offset, or none when the document is unknown / unresolvable or the
+# position is invalid (callers fall back to a null / empty reply).
+fun locate(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str, out: *Analyzed) Option[usize] {
+    if (!analyze(ws, es, s, docs, uri, out)) { ret none[usize](); }
 
     val line: i64 = json.extract_number_after(body, "\"position\"", "\"line\"", alloc);
     val ch:   i64 = json.extract_number_after(body, "\"position\"", "\"character\"", alloc);
-    if (line < 0 || ch < 0) { ret r_err("invalid position"); }
+    if (line < 0 || ch < 0) { ret none[usize](); }
 
-    val oo: Option[usize] = positions.offset_at(out.file, line::usize, ch::usize);
-    if (!is_some[usize](oo)) { ret r_err("position out of range"); }
-    ret r_ok(unwrap[usize](oo));
+    ret positions.offset_at(out.file, line::usize, ch::usize);
 }
 
 # emit_locations: send a Location[] result of every reference to `target`. the
@@ -1046,10 +1043,3 @@ fun free4(a: str, b: str, c: str, d: str, alloc: *Allocator) {
     json.free_str(d, alloc);
 }
 
-# r_ok / r_err: Result[usize, str] constructors for `locate`.
-fun r_ok(v: usize) Result[usize, str] {
-    ret ok[usize, str](v);
-}
-fun r_err(m: str) Result[usize, str] {
-    ret err[usize, str](m);
-}

@@ -2,9 +2,7 @@
 """publishDiagnostics scenarios: a broken buffer reports diagnostics with
 ranges; editing it clean clears them; a clean buffer is always empty; closing
 clears."""
-import sys
-
-from harness import drive, req, notify, did_open, by_id
+from harness import drive, req, notify, did_open, by_id, standalone
 
 BROKEN = "fun g(a: i64 { ret a ` ; }\n"
 CLEAN = "fun f(a: i64) i64 { ret a; }\n"
@@ -73,8 +71,4 @@ def run():
 
 
 if __name__ == "__main__":
-    fails = run()
-    for f in fails:
-        print("  -", f)
-    print("diagnostics:", "FAILED" if fails else "PASSED")
-    sys.exit(1 if fails else 0)
+    standalone("diagnostics", run)

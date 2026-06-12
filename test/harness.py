@@ -9,6 +9,7 @@ no scenario duplicates them.
 import json
 import os
 import subprocess
+import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -90,3 +91,12 @@ def by_id(msgs, i):
 def file_uri(path):
     """a file:// URI for an absolute filesystem path."""
     return "file://" + os.path.abspath(path)
+
+
+def standalone(name, run):
+    """run one scenario module standalone: print failures, report, exit non-zero on failure."""
+    fails = run()
+    for f in fails:
+        print("  -", f)
+    print(f"{name}:", "FAILED" if fails else "PASSED")
+    sys.exit(1 if fails else 0)

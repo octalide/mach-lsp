@@ -23,8 +23,9 @@ This server implements the **diagnostics** vertical slice plus the
     symbol at the cursor, as a fenced `mach` code block, with the decl's doc
     comment as trailing prose.
   - `textDocument/definition` — the resolved symbol's declaration `Location`.
-  - `textDocument/references` — every position resolving to the same symbol
-    (declaration plus use-sites).
+  - `textDocument/references` — the symbol's declaration (which may live in a
+    dependency file) plus every use-site **in the requesting buffer**;
+    workspace-wide use-site search is tracked in #47.
   - `textDocument/rename` / `prepareRename` — a `WorkspaceEdit` renaming every
     in-file reference; `prepareRename` returns the name range.
   - `textDocument/documentSymbol` — the module's top-level declarations as a
@@ -50,8 +51,12 @@ a `use` binds to its declaration in a dependency module, and:
 - a document outside any project (no ancestor `mach.toml`) resolves single-file
   with an empty dependency set.
 
-> The vendored `dep/mach` parses the `[targets.<name>]` manifest format; loading
-> a project whose `mach.toml` uses a newer format needs a `dep/mach` bump.
+> **Known limitation (#45):** the vendored `dep/mach` only parses the old
+> `[targets.<name>]` manifest format, so cross-module resolution is currently
+> **non-functional for v1.4.0-manifest projects — including this repo itself**
+> (its own `mach.toml` uses `[target.X]`/`[bin.X]`). Such projects resolve
+> single-file and the server reports the load failure via `window/showMessage`.
+> Fixed by bumping `dep/mach` to a version that parses the new format.
 
 ## Building
 

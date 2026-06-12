@@ -4,9 +4,7 @@ signatures / types / doc comments, definition lands on the decl, references
 finds decl + use-sites, rename emits a WorkspaceEdit (including a parameter
 binding), documentSymbol lists the top-level decls, completion includes the
 file's functions."""
-import sys
-
-from harness import drive, req, notify, did_open, pos, by_id
+from harness import drive, req, notify, did_open, pos, by_id, standalone
 
 DOC = "helper returns its argument unchanged."
 SRC = (
@@ -144,8 +142,4 @@ def run():
 
 
 if __name__ == "__main__":
-    fails = run()
-    for f in fails:
-        print("  -", f)
-    print("features:", "FAILED" if fails else "PASSED")
-    sys.exit(1 if fails else 0)
+    standalone("features", run)
