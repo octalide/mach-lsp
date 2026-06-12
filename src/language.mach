@@ -22,6 +22,7 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
 use std.types.string.str_equals;
+use std.types.string.str_starts_with;
 use std.types.option.Option;
 use std.types.option.is_some;
 use std.types.option.unwrap;
@@ -110,33 +111,103 @@ pub fun hover(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, do
 
 # hover_markdown: a fenced `mach` code block rendering the symbol at hover. for
 # a local symbol it shows the declaration header as written; otherwise the
-# symbol kind and name.
+# symbol kind and name. a local symbol's doc comment, if any, follows the block
+# as prose.
 fun hover_markdown(an: Analyzed, sym: *res.Symbol, alloc: *Allocator) str {
     var sig: str = nil;
+    var doc: str = nil;
     if (sym.origin == an.own && sym.decl != id.DECL_NIL) {
         val sso: Option[token.Span] = features.signature_span(an.a, sym);
         if (is_some[token.Span](sso)) {
             sig = positions.span_text(an.file, unwrap[token.Span](sso), alloc);
         }
+        val dso: Option[token.Span] = features.doc_comment_span(an.a, sym, an.file);
+        if (is_some[token.Span](dso)) { doc = doc_prose(an.file, unwrap[token.Span](dso), alloc); }
     }
     if (sig == nil) {
         sig = compose_kind_name(sym, ?an.s.interner, alloc);
     }
-    if (sig == nil) { ret nil; }
+    if (sig == nil) { json.free_str(doc, alloc); ret nil; }
 
-    val pre: str = "```mach\n";
+    val pre:  str = "```mach\n";
     val post: str = "\n```";
-    val total: usize = str_len(pre) + str_len(sig) + str_len(post);
+    val sep:  str = "\n\n";
+    var total: usize = str_len(pre) + str_len(sig) + str_len(post);
+    if (doc != nil) { total = total + str_len(sep) + str_len(doc); }
     val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](r)) { json.free_str(sig, alloc); ret nil; }
+    if (is_err[*u8, str](r)) { json.free_str(sig, alloc); json.free_str(doc, alloc); ret nil; }
     val buf: *u8 = unwrap_ok[*u8, str](r);
     var off: usize = 0;
     off = append(buf, off, pre);
     off = append(buf, off, sig);
     off = append(buf, off, post);
+    if (doc != nil) {
+        off = append(buf, off, sep);
+        off = append(buf, off, doc);
+    }
     buf[off] = 0;
     json.free_str(sig, alloc);
+    json.free_str(doc, alloc);
     ret buf::str;
+}
+
+# doc_prose: render a doc-comment span (the contiguous `#` run above a decl) as
+# Markdown prose. each line is stripped of its leading `#` and a single
+# following space, a `# ---` separator line renders as a blank line (matching
+# `mach doc`), and lines are joined by newlines. a measure pass sizes the
+# buffer exactly, so the allocation is str_len + 1 as `json.free_str` expects.
+# nil on an empty span, a run carrying no text, or allocation failure.
+fun doc_prose(file: *src.SourceFile, span: token.Span, alloc: *Allocator) str {
+    if (span.len == 0) { ret nil; }
+    val first: usize = src.position(file, span.offset).line;
+    val last:  usize = src.position(file, span.offset + span.len - 1).line;
+
+    var total: usize = 0;
+    var l1: usize = first;
+    for (l1 <= last) {
+        if (l1 > first) { total = total + 1; }
+        total = total + doc_body(file, l1).len;
+        l1 = l1 + 1;
+    }
+    if (total == 0) { ret nil; }
+
+    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
+    if (is_err[*u8, str](r)) { ret nil; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+
+    var off: usize = 0;
+    var l2: usize = first;
+    for (l2 <= last) {
+        if (l2 > first) { buf[off] = '\n'; off = off + 1; }
+        val body: token.Span = doc_body(file, l2);
+        if (body.len > 0) {
+            mem.raw_copy((buf::usize + off)::ptr, (file.text::usize + body.offset)::ptr, body.len);
+            off = off + body.len;
+        }
+        l2 = l2 + 1;
+    }
+    buf[off] = 0;
+    ret buf::str;
+}
+
+# doc_body: the rendered slice of comment line `line` (1-based) as a byte span
+# into the file text — past the leading whitespace, `#`, and a single following
+# space. zero-length for a `# ---` separator row or an out-of-range line.
+fun doc_body(file: *src.SourceFile, line: usize) token.Span {
+    var sp: token.Span;
+    sp.offset = 0;
+    sp.len    = 0;
+    val bo: Option[src.LineSpan] = src.line_bounds(file, line);
+    if (!is_some[src.LineSpan](bo)) { ret sp; }
+    val lb: src.LineSpan = unwrap[src.LineSpan](bo);
+    val s: *u8 = file.text::*u8;
+    var i: usize = features.first_nonspace(s, lb.start, lb.end);
+    if (i < lb.end && s[i] == '#') { i = i + 1; }
+    if (i < lb.end && s[i] == ' ') { i = i + 1; }
+    if (str_starts_with((s::usize + i)::str, "---")) { ret sp; }
+    sp.offset = i;
+    sp.len    = lb.end - i;
+    ret sp;
 }
 
 # compose_kind_name: a `<kind> <name>` rendering for a symbol with no local
