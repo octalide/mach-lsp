@@ -3,10 +3,10 @@ version = 1
 
 [deps.mach-std]
 url = "https://github.com/octalide/mach-std"
-ref = "branch/dev"
-commit = "a86b0285d5567ba4ba444ec7e6e4c9dad123597b"
+ref = "v0.6.0"
+commit = "d497671341b3fe204a4c41ae13c3ad593c79be46"
 
 [deps.mach]
 url = "https://github.com/octalide/mach"
-ref = "v1.4.0"
-commit = "d173077d2d4984e093c92ddb77ac846130daa55f"
+ref = "branch/main"
+commit = "982f611b3190ec39a2777f54408f4ff91b73e995"
