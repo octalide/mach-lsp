@@ -159,49 +159,141 @@ fun hover_markdown(ws: *project.Workspace, an: Analyzed, sym: *res.Symbol, uri: 
     ret buf::str;
 }
 
+# break kinds threaded through doc_render: the join emitted before the next
+# rendered block — nothing, a soft newline, or a blank-line paragraph break.
+val DOC_BREAK_NONE: usize = 0;
+val DOC_BREAK_LINE: usize = 1;
+val DOC_BREAK_PARA: usize = 2;
+
 # doc_prose: render a doc-comment span (the contiguous `#` run above a decl) as
-# Markdown prose. each line is stripped of its leading `#` and a single
-# following space, a `# ---` separator line renders as a blank line (matching
-# `mach doc`), and lines are joined by newlines. a measure pass sizes the
-# buffer exactly, so the allocation is str_len + 1 as `json.free_str` expects.
-# nil on an empty span, a run carrying no text, or allocation failure.
+# Markdown. prose lines before the first `# ---` separator are joined by single
+# newlines; the separator becomes a thematic break (`---` fenced by blank lines
+# so CommonMark reads a horizontal rule, not a setext heading); and each
+# `ident:` line in the trailing field stanza renders as a `- **ident** — desc`
+# list item, with indented continuation lines folded into the open item. one
+# `doc_render` walk both sizes and fills the buffer, so the two passes cannot
+# diverge and the allocation is str_len + 1 as `json.free_str` expects. nil on
+# an empty span, a run carrying no rendered text, or allocation failure.
 fun doc_prose(file: *src.SourceFile, span: token.Span, alloc: *Allocator) str {
     if (span.len == 0) { ret nil; }
     val first: usize = src.position(file, span.offset).line;
     val last:  usize = src.position(file, span.offset + span.len - 1).line;
 
-    var total: usize = 0;
-    var l1: usize = first;
-    for (l1 <= last) {
-        if (l1 > first) { total = total + 1; }
-        total = total + doc_body(file, l1).len;
-        l1 = l1 + 1;
-    }
-    if (total == 0) { ret nil; }
+    var has_text: bool = false;
+    val total: usize = doc_render(file, first, last, nil, ?has_text);
+    if (!has_text) { ret nil; }
 
     val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
     if (is_err[*u8, str](r)) { ret nil; }
     val buf: *u8 = unwrap_ok[*u8, str](r);
 
-    var off: usize = 0;
-    var l2: usize = first;
-    for (l2 <= last) {
-        if (l2 > first) { buf[off] = '\n'; off = off + 1; }
-        val body: token.Span = doc_body(file, l2);
-        if (body.len > 0) {
-            mem.raw_copy((buf::usize + off)::ptr, (file.text::usize + body.offset)::ptr, body.len);
-            off = off + body.len;
-        }
-        l2 = l2 + 1;
-    }
-    buf[off] = 0;
+    doc_render(file, first, last, buf, ?has_text);
+    buf[total] = 0;
     ret buf::str;
 }
 
-# doc_body: the rendered slice of comment line `line` (1-based) as a byte span
-# into the file text — past the leading whitespace, `#`, and a single following
-# space. zero-length for a `# ---` separator row or an out-of-range line.
-fun doc_body(file: *src.SourceFile, line: usize) token.Span {
+# doc_render: walk doc-comment lines `first`..`last` (1-based) once, writing the
+# Markdown rendering into `buf` when it is non-nil and only measuring otherwise.
+# both the measure and fill passes share this walk, so the sized length and the
+# written bytes stay identical. sets `has_text` when any non-separator body byte
+# is rendered. returns the rendered length in bytes.
+fun doc_render(file: *src.SourceFile, first: usize, last: usize, buf: *u8, has_text: *bool) usize {
+    @has_text = false;
+    var off:     usize = 0;
+    var stanza:  bool  = false;
+    var open:    bool  = false;
+    var pending: usize = DOC_BREAK_NONE;
+
+    var line: usize = first;
+    for (line <= last) {
+        if (doc_separator(file, line)) {
+            if (off > 0) { off = doc_break(buf, off, DOC_BREAK_PARA); }
+            off = doc_emit(buf, off, "---");
+            stanza  = true;
+            open    = false;
+            pending = DOC_BREAK_PARA;
+            line = line + 1;
+            cnt;
+        }
+
+        val body: token.Span = doc_line_body(file, line);
+
+        if (stanza) {
+            var name: token.Span;
+            var desc: token.Span;
+            if (doc_field(file, body, ?name, ?desc)) {
+                off = doc_break(buf, off, pending);
+                off = doc_emit(buf, off, "- **");
+                off = doc_copy(buf, off, file, name);
+                off = doc_emit(buf, off, "** \xe2\x80\x94 ");
+                off = doc_copy(buf, off, file, desc);
+                @has_text = true;
+                open    = true;
+                pending = DOC_BREAK_LINE;
+                line = line + 1;
+                cnt;
+            }
+            if (open) {
+                if (body.len > 0) {
+                    off = doc_emit(buf, off, " ");
+                    off = doc_copy(buf, off, file, body);
+                    @has_text = true;
+                }
+                line = line + 1;
+                cnt;
+            }
+            off = doc_break(buf, off, pending);
+            off = doc_copy(buf, off, file, body);
+            if (body.len > 0) { @has_text = true; }
+            pending = DOC_BREAK_LINE;
+            line = line + 1;
+            cnt;
+        }
+
+        off = doc_break(buf, off, pending);
+        off = doc_copy(buf, off, file, body);
+        if (body.len > 0) { @has_text = true; }
+        pending = DOC_BREAK_LINE;
+        line = line + 1;
+    }
+    ret off;
+}
+
+# doc_break: emit the join for break `kind` (none / soft newline / blank-line
+# paragraph) into `buf` when non-nil, returning the advanced offset.
+fun doc_break(buf: *u8, off: usize, kind: usize) usize {
+    if (kind == DOC_BREAK_NONE) { ret off; }
+    if (buf != nil) { buf[off] = '\n'; }
+    off = off + 1;
+    if (kind == DOC_BREAK_PARA) {
+        if (buf != nil) { buf[off] = '\n'; }
+        off = off + 1;
+    }
+    ret off;
+}
+
+# doc_emit: write null-terminated `s` into `buf` at `off` when non-nil, only
+# measuring its length otherwise, returning the advanced offset.
+fun doc_emit(buf: *u8, off: usize, s: str) usize {
+    val n: usize = str_len(s);
+    if (buf != nil && n > 0) { mem.raw_copy((buf::usize + off)::ptr, s::ptr, n); }
+    ret off + n;
+}
+
+# doc_copy: copy byte span `sp` of the file text into `buf` at `off` when
+# non-nil, only measuring its length otherwise, returning the advanced offset.
+fun doc_copy(buf: *u8, off: usize, file: *src.SourceFile, sp: token.Span) usize {
+    if (buf != nil && sp.len > 0) {
+        mem.raw_copy((buf::usize + off)::ptr, (file.text::usize + sp.offset)::ptr, sp.len);
+    }
+    ret off + sp.len;
+}
+
+# doc_line_body: the rendered slice of comment line `line` (1-based) as a byte
+# span into the file text — past the leading whitespace, `#`, and a single
+# following space. zero-length for an out-of-range line. unlike doc_separator
+# this does not special-case a `---` row, so callers see its raw text.
+fun doc_line_body(file: *src.SourceFile, line: usize) token.Span {
     var sp: token.Span;
     sp.offset = 0;
     sp.len    = 0;
@@ -212,10 +304,56 @@ fun doc_body(file: *src.SourceFile, line: usize) token.Span {
     var i: usize = features.first_nonspace(s, lb.start, lb.end);
     if (i < lb.end && s[i] == '#') { i = i + 1; }
     if (i < lb.end && s[i] == ' ') { i = i + 1; }
-    if (str_starts_with((s::usize + i)::str, "---")) { ret sp; }
     sp.offset = i;
     sp.len    = lb.end - i;
     ret sp;
+}
+
+# doc_separator: true when comment `line`'s rendered body begins with `---`,
+# marking a stanza separator that renders as a horizontal rule.
+fun doc_separator(file: *src.SourceFile, line: usize) bool {
+    val body: token.Span = doc_line_body(file, line);
+    val s: *u8 = file.text::*u8;
+    ret str_starts_with((s::usize + body.offset)::str, "---");
+}
+
+# doc_field: when body span `body` is an `ident:` field row (an identifier, a
+# colon, then whitespace or end of line), write the identifier span into `name`
+# and the description span — past the colon and its alignment padding — into
+# `desc`, and return true. false for any non-field row.
+fun doc_field(file: *src.SourceFile, body: token.Span, name: *token.Span, desc: *token.Span) bool {
+    val s: *u8 = file.text::*u8;
+    val start: usize = body.offset;
+    val end:   usize = body.offset + body.len;
+    if (start >= end || !doc_ident_start(s[start])) { ret false; }
+
+    var i: usize = start + 1;
+    for (i < end && doc_ident_char(s[i])) { i = i + 1; }
+    if (i >= end || s[i] != ':') { ret false; }
+    val name_end: usize = i;
+    i = i + 1;
+    if (i < end && s[i] != ' ' && s[i] != '\t') { ret false; }
+
+    val d: usize = features.first_nonspace(s, i, end);
+    var nm: token.Span;
+    nm.offset = start;
+    nm.len    = name_end - start;
+    @name = nm;
+    var ds: token.Span;
+    ds.offset = d;
+    ds.len    = end - d;
+    @desc = ds;
+    ret true;
+}
+
+# doc_ident_start: true when `c` may begin a field identifier.
+fun doc_ident_start(c: u8) bool {
+    ret (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+# doc_ident_char: true when `c` may continue a field identifier.
+fun doc_ident_char(c: u8) bool {
+    ret doc_ident_start(c) || (c >= '0' && c <= '9');
 }
 
 # compose_kind_name: a `<kind> <name>` rendering for a symbol with no local
