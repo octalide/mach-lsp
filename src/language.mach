@@ -110,7 +110,8 @@ pub fun hover(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, do
 
 # hover_markdown: a fenced `mach` code block rendering the symbol at hover. for
 # a local symbol it shows the declaration header as written; otherwise the
-# symbol kind and name.
+# symbol kind and name. a local symbol's doc comment, if any, follows the block
+# as prose.
 fun hover_markdown(an: Analyzed, sym: *res.Symbol, alloc: *Allocator) str {
     var sig: str = nil;
     if (sym.origin == an.own && sym.decl != id.DECL_NIL) {
@@ -124,19 +125,100 @@ fun hover_markdown(an: Analyzed, sym: *res.Symbol, alloc: *Allocator) str {
     }
     if (sig == nil) { ret nil; }
 
-    val pre: str = "```mach\n";
+    var doc: str = nil;
+    if (sym.origin == an.own) {
+        val dso: Option[token.Span] = features.doc_comment_span(an.a, sym, an.file.text);
+        if (is_some[token.Span](dso)) { doc = doc_prose(an.file, unwrap[token.Span](dso), alloc); }
+    }
+
+    val pre:  str = "```mach\n";
     val post: str = "\n```";
-    val total: usize = str_len(pre) + str_len(sig) + str_len(post);
+    val sep:  str = "\n\n";
+    var total: usize = str_len(pre) + str_len(sig) + str_len(post);
+    if (doc != nil) { total = total + str_len(sep) + str_len(doc); }
     val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](r)) { json.free_str(sig, alloc); ret nil; }
+    if (is_err[*u8, str](r)) { json.free_str(sig, alloc); json.free_str(doc, alloc); ret nil; }
     val buf: *u8 = unwrap_ok[*u8, str](r);
     var off: usize = 0;
     off = append(buf, off, pre);
     off = append(buf, off, sig);
     off = append(buf, off, post);
+    if (doc != nil) {
+        off = append(buf, off, sep);
+        off = append(buf, off, doc);
+    }
     buf[off] = 0;
     json.free_str(sig, alloc);
+    json.free_str(doc, alloc);
     ret buf::str;
+}
+
+# doc_prose: render a doc-comment span (the contiguous `#` run above a decl) as
+# Markdown prose. each line is stripped of its leading `#` and a single
+# following space, a `# ---` separator line renders as a blank line (matching
+# `mach doc`), and lines are joined by newlines. nil on an empty span,
+# allocation failure, or a run carrying no text.
+fun doc_prose(file: *src.SourceFile, span: token.Span, alloc: *Allocator) str {
+    if (span.len == 0) { ret nil; }
+    val s: *u8 = file.text::*u8;
+    val end: usize = span.offset + span.len;
+
+    val r: Result[*u8, str] = allocate[u8](alloc, span.len + 1);
+    if (is_err[*u8, str](r)) { ret nil; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+
+    var off: usize = 0;
+    var pos: usize = span.offset;
+    var first: bool = true;
+    for (pos < end) {
+        val hash: usize = first_nonspace(s, pos);
+        var body: usize = hash + 1;
+        if (s[body] == ' ') { body = body + 1; }
+        val le: usize = line_end(s, pos);
+
+        if (!first) { buf[off] = '\n'; off = off + 1; }
+        first = false;
+        if (!starts_with(s, body, "---")) {
+            val n: usize = le - body;
+            if (n > 0) { mem.raw_copy((buf::usize + off)::ptr, (s::usize + body)::ptr, n); off = off + n; }
+        }
+        pos = next_line(s, le);
+    }
+    buf[off] = 0;
+    if (off == 0) { deallocate[u8](alloc, buf, span.len + 1); ret nil; }
+    ret buf::str;
+}
+
+# first_nonspace: index of the first non-space, non-tab byte on the line at
+# `pos`, stopping at the line end.
+fun first_nonspace(s: *u8, pos: usize) usize {
+    var i: usize = pos;
+    for (s[i] == ' ' || s[i] == '\t') { i = i + 1; }
+    ret i;
+}
+
+# line_end: index of the line-ending '\n' (or the terminator) at or after `pos`.
+fun line_end(s: *u8, pos: usize) usize {
+    var i: usize = pos;
+    for (s[i] != 0 && s[i] != '\n') { i = i + 1; }
+    ret i;
+}
+
+# next_line: index of the start of the line following the one whose end is `le`.
+fun next_line(s: *u8, le: usize) usize {
+    if (s[le] == 0) { ret le; }
+    ret le + 1;
+}
+
+# starts_with: true when the bytes at `s[pos..]` begin with the literal `lit`.
+fun starts_with(s: *u8, pos: usize, lit: str) bool {
+    val l: *u8 = lit::*u8;
+    var i: usize = 0;
+    for (l[i] != 0) {
+        if (s[pos + i] != l[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 # compose_kind_name: a `<kind> <name>` rendering for a symbol with no local

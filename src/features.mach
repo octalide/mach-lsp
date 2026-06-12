@@ -377,6 +377,57 @@ fun param_signature_span(a: *ast.Ast, sym: *res.Symbol) Option[token.Span] {
     ret some[token.Span](sp);
 }
 
+# doc_comment_span: the byte span of the contiguous run of `#` comment lines
+# immediately above a local symbol's declaration — its doc comment. the lexer
+# discards comment tokens, so this back-scans the raw source the way `mach doc`
+# does: from the decl's first line it walks backward over comment lines
+# (tolerating leading whitespace before the `#`), stopping at the first
+# non-comment line. none for a param / generic, a decl with no comment run
+# flush above it, or a decl at the file start.
+# ---
+# a:    the Ast owning the decl
+# sym:  the symbol whose doc comment is wanted
+# text: the full source text of the file owning the decl
+# ret:  some(span) covering the comment run (its trailing newline included), or
+#       none
+pub fun doc_comment_span(a: *ast.Ast, sym: *res.Symbol, text: str) Option[token.Span] {
+    if (sym.kind == res.SYM_PARAM || sym.kind == res.SYM_GENERIC) { ret none[token.Span](); }
+    val dso: Option[token.Span] = decl_span_of(a, sym);
+    if (!is_some[token.Span](dso)) { ret none[token.Span](); }
+
+    val s: *u8 = text::*u8;
+    val decl_line: usize = line_start_back(s, unwrap[token.Span](dso).offset);
+
+    var run: usize = decl_line;
+    for (run > 0) {
+        val prev: usize = line_start_back(s, run - 1);
+        if (!is_comment_line(s, prev)) { brk; }
+        run = prev;
+    }
+    if (run == decl_line) { ret none[token.Span](); }
+
+    var sp: token.Span;
+    sp.offset = run;
+    sp.len    = decl_line - run;
+    ret some[token.Span](sp);
+}
+
+# line_start_back: the byte offset of the start of the line containing `pos`,
+# found by scanning back to just past the preceding newline (or the file start).
+fun line_start_back(s: *u8, pos: usize) usize {
+    var i: usize = pos;
+    for (i > 0 && s[i - 1] != '\n') { i = i - 1; }
+    ret i;
+}
+
+# is_comment_line: true when the first significant byte of the line at `pos` is
+# `#`, tolerating leading spaces / tabs.
+fun is_comment_line(s: *u8, pos: usize) bool {
+    var i: usize = pos;
+    for (s[i] == ' ' || s[i] == '\t') { i = i + 1; }
+    ret s[i] == '#';
+}
+
 # kind_label: a human-readable label for a symbol kind, for hover rendering.
 # ---
 # kind: a res.SYM_* value
