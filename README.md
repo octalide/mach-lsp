@@ -51,23 +51,22 @@ editor surface, tracked upstream.
 
 ## Building
 
-The compiler and standard library are vendored as git submodules under `dep/`.
-Build with a Mach compiler binary (v1.0.0 or newer):
+The compiler and standard library are vendored under `dep/` as git dependencies.
+Build with a Mach compiler binary (v1.4.0 or newer):
 
 ```sh
-git submodule update --init
-mach build
+mach dep pull
+mach build .
 ```
 
-The server binary is produced at `out/linux/bin/mach-lsp`.
+The server binary is produced at `out/linux/debug/bin/mls`.
 
 ## How the compiler dependency is wired
 
 `dep/mach` (id `mach`) provides the `mach.lang.*` namespace, including the
 `mach.lang.editor` query surface this server binds to; `dep/mach-std` (id
-`std`) provides `std.*`. Both are git submodules pinned to the `dev` branch of
-their upstream repositories. The `mach.toml` `[deps.*]` entries declare them as
-remote dependencies tracking `branch/dev`.
+`std`) provides `std.*`. Both are declared as git dependencies in `mach.toml`
+and fetched by `mach dep pull`; `mach-std` tracks `branch/dev` and `mach` is pinned to `v1.4.0`.
 
 ## Architecture
 
@@ -97,7 +96,7 @@ Two stdio smoke tests drive the server with framed JSON-RPC:
   functions and the primitives.
 
 ```sh
-mach build && python3 smoke.py && python3 smoke_features.py
+mach build . && python3 smoke.py && python3 smoke_features.py
 ```
 
 ## Deferred
