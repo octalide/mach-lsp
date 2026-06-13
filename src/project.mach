@@ -22,11 +22,15 @@
 #
 # module-id namespacing: `driver.build_project` allocates project-local module
 # ids from 0 and writes them into the session's global module registries, so a
-# second build over the same session clobbers the first there. the LSP never
-# reads those session registries — every cross-module lookup (site_of,
+# second build over the same session clobbers the first there. those clobbered
+# registries are never read for a lookup — every cross-module lookup (site_of,
 # module_view, ...) reads the per-`Root` `driver.Project.modules` array, whose
-# ids are private to that project. each `Root` is therefore its own id space and
-# several projects coexist in one shared session without collision; per-root
+# ids are private to that project — and that boundary is structural, not just
+# convention: the `Workspace` is the sole holder of the `*sess.Session`, and
+# feature code receives only the per-root accessors plus the two safe, never-
+# clobbered session services (`interner` / `sources`), so a stray `sess.module_*`
+# read is unreachable from a feature. each `Root` is therefore its own id space
+# and several projects coexist in one shared session without collision; per-root
 # sessions are unnecessary. a buffer resolves under a synthetic id past its
 # root's `module_len`, so a buffer-local symbol's `origin` never equals a
 # loaded dependency's.
@@ -143,7 +147,9 @@ pub rec Root {
 
 # Workspace: the session's project roots plus the per-buffer resolve cache.
 # ---
-# s:            borrowed compiler session (sources, interner, module registry)
+# s:            the compiler session, held solely here; feature code reaches its
+#               safe services through `interner` / `sources`, never the whole
+#               session (whose per-build module registries a second load clobbers)
 # es:           borrowed editor session (buffer parsing)
 # alloc:        allocator for owned storage
 # roots:        array of Root slots (slots with a path are tracked roots)
@@ -185,6 +191,28 @@ pub fun init(s: *sess.Session, es: *editor.EditorSession, alloc: *Allocator) Wor
     w.cache         = nil;
     w.cache_len     = 0;
     ret w;
+}
+
+# interner: the session's shared string interner — the append-only symbol-name
+# registry feature code resolves StrIds through. exposed narrowly so a feature
+# never holds the whole session, whose per-build module registries a second
+# project load clobbers; the interner and source map are the only session
+# services a feature may safely read.
+# ---
+# w:   the workspace
+# ret: the session's interner
+pub fun interner(w: *Workspace) *intern.Interner {
+    ret ?w.s.interner;
+}
+
+# sources: the session's source-file registry, for resolving a FileId to its
+# SourceFile (text + line index). the other safe-to-read session service feature
+# and diagnostics code needs; see `interner` for why the whole session is held back.
+# ---
+# w:   the workspace
+# ret: the session's source map
+pub fun sources(w: *Workspace) *src.SourceMap {
+    ret ?w.s.sources;
 }
 
 # set_watch_active: record that the client delivers

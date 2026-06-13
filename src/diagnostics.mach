@@ -24,7 +24,6 @@ use std.allocator.deallocate;
 
 use mem: std.memory;
 
-use sess:   mach.lang.session;
 use src:    mach.lang.source;
 use diag:   mach.lang.diagnostic;
 use editor: mach.lang.editor;
@@ -43,12 +42,12 @@ val MAX_DIAGNOSTICS: usize = 200;
 
 # publish: analyze `uri`'s buffer and send its current diagnostics.
 # ---
-# es:    editor session holding the buffer
-# s:     compiler session whose SourceMap resolves spans to positions
-# alloc: allocator for the message buffers
-# uri:   document URI to report on
-# fid:   editor FileId of the document's buffer
-pub fun publish(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, uri: str, fid: src.FileId) {
+# es:      editor session holding the buffer
+# sources: source map whose SourceFiles resolve spans to positions
+# alloc:   allocator for the message buffers
+# uri:     document URI to report on
+# fid:     editor FileId of the document's buffer
+pub fun publish(es: *editor.EditorSession, sources: *src.SourceMap, alloc: *Allocator, uri: str, fid: src.FileId) {
     val dr: Result[*diag.DiagList, str] = editor.diagnostics(es, fid);
     if (is_err[*diag.DiagList, str](dr)) {
         clear(alloc, uri);
@@ -79,7 +78,7 @@ pub fun publish(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, 
         var i: usize = 0;
         for (i < count) {
             val d: *diag.Diagnostic = ?list.items[i];
-            entries[entry_count] = build_entry(s, d, alloc);
+            entries[entry_count] = build_entry(sources, d, alloc);
             entry_count = entry_count + 1;
             i = i + 1;
         }
@@ -152,14 +151,14 @@ pub fun clear(alloc: *Allocator, uri: str) {
 }
 
 # build_entry: render one diagnostic as an LSP Diagnostic JSON object, resolving
-# its span to a 0-based range against the session source map.
-fun build_entry(s: *sess.Session, d: *diag.Diagnostic, alloc: *Allocator) str {
+# its span to a 0-based range against the source map.
+fun build_entry(sources: *src.SourceMap, d: *diag.Diagnostic, alloc: *Allocator) str {
     var start_line: usize = 0;
     var start_char: usize = 0;
     var end_line: usize = 0;
     var end_char: usize = 0;
 
-    val so: Option[*src.SourceFile] = src.get(?s.sources, d.file_id);
+    val so: Option[*src.SourceFile] = src.get(sources, d.file_id);
     if (is_some[*src.SourceFile](so)) {
         val sf: *src.SourceFile = unwrap[*src.SourceFile](so);
         val sp: src.Position = src.position(sf, d.span.offset);
