@@ -161,6 +161,60 @@ def broken_manifest_recovers():
     return failures
 
 
+def reload_rebinds_cached_resolve():
+    """a buffer resolve cached before its root reloads must not be served stale.
+    the other scenarios only shift a declaration's line, which leaves its DeclId
+    intact — so a stale cached cross-module resolve would still read the right
+    declaration off the live (reloaded) graph and pass. here the dep is rewritten
+    to REORDER its declarations, moving `shared`'s DeclId as well as its line: a
+    stale cached resolve carries `shared`'s old DeclId and would now resolve to a
+    different declaration entirely, while a fresh re-resolve lands on `shared`'s
+    new line. asserting the new line proves the cache entry did not survive the
+    reload as a stale hit."""
+    proj, app, lib = _scratch_project()
+    app_uri = file_uri(app)
+    lib_uri = file_uri(lib)
+    failures = []
+    srv = LiveServer()
+    try:
+        srv.send(req(1, "initialize", {"capabilities": {}}))
+        srv.recv_id(1)
+        srv.send(notify("initialized"))
+        srv.send(did_open(app_uri, open(app).read()))
+
+        # warm the cache: this resolve of app is cached against the current build
+        uri1, line1 = _definition_line(srv, app_uri, 30)
+        if uri1 != lib_uri or line1 != DECL_LINE:
+            failures.append(f"definition(shared) before reload: uri {uri1} line {line1}, expected {lib_uri} line {DECL_LINE}")
+
+        new_lib = (
+            "# lib: reordered so shared's declaration id and line both move; a\n"
+            "# cached cross-module resolve served stale would point elsewhere.\n"
+            "pub val LIMIT: i64 = 10;\n"
+            "\n"
+            "\n"
+            "pub fun shared(x: i64) i64 {\n"
+            "    ret x;\n"
+            "}\n"
+        )
+        with open(lib, "w") as f:
+            f.write(new_lib)
+        want_line = new_lib.splitlines().index("pub fun shared(x: i64) i64 {")
+        srv.send(notify("workspace/didChangeWatchedFiles",
+                        {"changes": [{"uri": lib_uri, "type": 2}]}))
+
+        uri2, line2 = _definition_line(srv, app_uri, 31)
+        if uri2 != lib_uri or line2 != want_line:
+            failures.append(f"definition(shared) after reorder reload: uri {uri2} line {line2}, expected {lib_uri} line {want_line} (a stale cached resolve would land elsewhere)")
+
+        srv.send(req(2, "shutdown", None))
+        srv.send(notify("exit"))
+    finally:
+        srv.close()
+        shutil.rmtree(proj, ignore_errors=True)
+    return failures
+
+
 def run():
     """drive the invalidation scenarios; return a list of failure strings."""
     if not os.path.exists(os.path.join(WS, "src", "app.mach")):
@@ -169,6 +223,7 @@ def run():
     failures += watched_files_trigger()
     failures += mtime_fallback_trigger()
     failures += broken_manifest_recovers()
+    failures += reload_rebinds_cached_resolve()
     return failures
 
 
