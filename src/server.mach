@@ -326,10 +326,13 @@ fun handle_did_change(srv: *Server, body: str) {
     json.free_str(uri, srv.alloc);
 }
 
-# handle_did_close: retire the document and clear its diagnostics.
+# handle_did_close: retire the document, reclaim its cached resolve result, and
+# clear its diagnostics.
 fun handle_did_close(srv: *Server, body: str) {
     val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
     if (uri == nil) { ret; }
+    val doc: *documents.Document = documents.find(?srv.docs, uri);
+    if (doc != nil) { project.free_cached(?srv.ws, doc.file_id); }
     documents.close(?srv.docs, uri);
     diagnostics.clear(srv.alloc, uri);
     json.free_str(uri, srv.alloc);

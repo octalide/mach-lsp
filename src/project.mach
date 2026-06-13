@@ -1167,7 +1167,13 @@ fun release_entry(w: *Workspace, c: *Cached) {
 }
 
 # free_cached: release and clear the cached ResolveResult for `fid`, if any.
-fun free_cached(w: *Workspace, fid: src.FileId) {
+# called before a re-resolve replaces the entry, and by the server on didClose
+# so a retired document's result is reclaimed immediately instead of lingering
+# until its FileId is reused or its root reloads.
+# ---
+# w:   the workspace
+# fid: the buffer whose cached result to drop
+pub fun free_cached(w: *Workspace, fid: src.FileId) {
     if (w.cache == nil || fid::u32 >= w.cache_len) { ret; }
     val c: *Cached = ?w.cache[fid::u32];
     if (c.rr != nil) { release_entry(w, c); }
