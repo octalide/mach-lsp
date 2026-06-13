@@ -600,12 +600,14 @@ fun binding_span(an: Analyzed, sid: res.SymbolId, out: *token.Span) bool {
 # is only renameable when the buffer itself is the editor's to rewrite: its
 # on-disk twin (when the buffer is a loaded module's file — e.g. a dependency
 # source opened via go-to-definition, whose symbols all resolve buffer-locally)
-# must also be project-owned. a buffer with no twin (a scratch file, or one
-# outside the loaded graph) renames buffer-local.
+# must also be project-owned. a buffer with no twin renames buffer-local — unless
+# its governing root is a vendored dependency project, whose every file is
+# read-only even outside that root's own graph closure (a vendored dep source the
+# outer project never imports still routes to its own vendored root).
 fun renameable(ws: *project.Workspace, root: *project.Root, uri: str, sym: *res.Symbol, sr: features.SymbolRef) bool {
     if (!sr.local) { ret project.is_project_module(ws, root, sym.origin); }
     val twin_o: Option[sess.ModuleId] = project.module_for_uri(ws, root, uri);
-    if (!is_some[sess.ModuleId](twin_o)) { ret true; }
+    if (!is_some[sess.ModuleId](twin_o)) { ret !project.root_vendored(root); }
     ret project.is_project_module(ws, root, unwrap[sess.ModuleId](twin_o));
 }
 
