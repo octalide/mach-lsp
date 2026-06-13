@@ -13,6 +13,7 @@ import test_crossmodule
 import test_workspace
 import test_multiroot
 import test_invalidation
+import test_encoding
 
 SUITES = [
     ("diagnostics", test_diagnostics.run),
@@ -21,6 +22,7 @@ SUITES = [
     ("workspace", test_workspace.run),
     ("multiroot", test_multiroot.run),
     ("invalidation", test_invalidation.run),
+    ("encoding", test_encoding.run),
 ]
 
 
