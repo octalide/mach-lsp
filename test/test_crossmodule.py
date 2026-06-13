@@ -33,6 +33,9 @@ SCRATCH_SRC = "fun lone() i64 { ret 1; }\n"
 NESTED = os.path.join(REPO, "test", "fixture-nested")
 NESTED_LEAF = os.path.join(NESTED, "dep", "mid", "dep", "leaf", "src", "lib.mach")
 NESTED_MID_API = os.path.join(NESTED, "dep", "mid", "src", "api.mach")
+# mid's entry module: in mid's own closure but NOT in `outer`'s (outer imports
+# only mid.api), so no outer graph ever holds it.
+NESTED_MID_LIB = os.path.join(NESTED, "dep", "mid", "src", "lib.mach")
 
 
 def check_dep_definition(failures, msg, dv):
@@ -323,6 +326,53 @@ def nested_dep_first_scenario():
     return failures
 
 
+def nested_outside_closure_scenario():
+    """a vendored dependency's source that no outer project's graph ever holds —
+    mid's entry (lib.mach) is in mid's own closure but outside `outer`'s, which
+    imports only mid.api — must still refuse rename: mid's own root is discovered
+    under `outer`'s declared vendor dir, so it loads as a read-only vendored
+    project rather than a renameable one (regression #62: such a file routed to
+    its own dep root and wrongly offered a rename)."""
+    if not os.path.exists(NESTED):
+        return [f"nested fixture not found at {NESTED}"]
+    lib_text, lib_pos = _decl_pos(NESTED_MID_LIB, "mid_main")
+    if lib_text is None:
+        return ["mid_main declaration not found in fixture-nested"]
+
+    lib_uri = file_uri(NESTED_MID_LIB)
+    frames = [
+        req(1, "initialize", {"capabilities": {}}),
+        notify("initialized"),
+        # opened cold, before any project document
+        did_open(lib_uri, lib_text),
+        req(20, "textDocument/prepareRename",
+            {"textDocument": {"uri": lib_uri}, "position": lib_pos}),
+        req(21, "textDocument/rename",
+            {"textDocument": {"uri": lib_uri}, "position": lib_pos, "newName": "nope"}),
+        # references must keep working on the vendored source
+        req(22, "textDocument/references",
+            {"textDocument": {"uri": lib_uri}, "position": lib_pos,
+             "context": {"includeDeclaration": True}}),
+        req(2, "shutdown", None),
+        notify("exit"),
+    ]
+    code, msgs = drive(frames)
+
+    failures = []
+    prv = (by_id(msgs, 20) or {}).get("result", "missing")
+    if prv is not None:
+        failures.append(f"prepareRename(mid_main, outside outer's closure) should be null, got {prv!r}")
+    rnv = (by_id(msgs, 21) or {}).get("result")
+    if not isinstance(rnv, dict) or rnv.get("changes") != {}:
+        failures.append(f"rename(mid_main, outside outer's closure) should be an empty WorkspaceEdit, got {rnv!r}")
+    rfv = (by_id(msgs, 22) or {}).get("result")
+    if not isinstance(rfv, list) or not any(e.get("uri") == lib_uri for e in rfv):
+        failures.append(f"references(mid_main) should still find the in-buffer decl, got {rfv!r}")
+    if code != 0:
+        failures.append("non-zero exit code after clean shutdown")
+    return failures
+
+
 def run():
     """drive the cross-module scenarios; return a list of failure strings."""
     if not os.path.exists(APP):
@@ -334,6 +384,7 @@ def run():
     failures += dep_buffer_rename_scenario()
     failures += dep_buffer_first_scenario()
     failures += nested_dep_first_scenario()
+    failures += nested_outside_closure_scenario()
     return failures
 
 

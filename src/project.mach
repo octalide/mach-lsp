@@ -153,6 +153,12 @@ rec Cached {
 #                 claimed on each successful load, 0 (reserved) while unloaded;
 #                 resolve cache entries carry it, so a reload or free makes the
 #                 prior build's entries unhittable and per-root evictable
+# vendored:       whether this root's own directory lies under some outer
+#                 project's declared vendor dir — i.e. the whole root is a
+#                 vendored dependency project, so none of its files are the
+#                 editor's to rewrite, regardless of any loaded graph's closure.
+#                 intrinsic to the path (computed at load_root from the ancestor
+#                 manifests), not to the routing that materialized the root
 pub rec Root {
     path:           str;
     loaded:         bool;
@@ -164,6 +170,7 @@ pub rec Root {
     man_mtime:      i64;
     lock_mtime:     i64;
     gen:            u32;
+    vendored:       bool;
 }
 
 # Workspace: the session's project roots plus the per-buffer resolve cache.
@@ -549,14 +556,48 @@ fun containing_root(w: *Workspace, uri: str, doc_root: str) *Root {
 }
 
 # load_root: claim a slot for `root_path` (taking ownership of the string) and
-# build its graph. on failure the slot is kept as a remembered failed load and
-# nil is returned; on success the loaded Root pointer is returned.
+# build its graph. the vendored flag is stamped once here — intrinsic to the
+# path, so every root-creating path (root_for's fresh-root load, ancestor_root's
+# speculative loads) gets it correct, and it survives in-place reloads (which keep
+# the slot). on failure the slot is kept as a remembered failed load and nil is
+# returned; on success the loaded Root pointer is returned.
 fun load_root(w: *Workspace, root_path: str) *Root {
     val slot: *Root = alloc_slot(w);
     if (slot == nil) { strutil.str_free(w.alloc, root_path); ret nil; }
-    slot.path = root_path;
+    slot.path     = root_path;
+    slot.vendored = vendored_under_ancestor(w, root_path);
     if (try_load(w, slot)) { ret slot; }
     ret nil;
+}
+
+# vendored_under_ancestor: whether `root_path`'s own directory lies under some
+# strict-ancestor project's declared vendor dir — i.e. this root is a vendored
+# dependency of an outer project. climbs the chain of ancestor manifest dirs
+# strictly above `root_path` (the same dirs ancestor_root walks), asking
+# vendors_enclosing of each; true on the first whose declared dep vendor dir
+# encloses `root_path`. this is a property of the path, not of how the root was
+# reached: a root materialized as an outer vendoring project for a deeper dep is
+# still flagged when it itself sits under a grandparent's vendor dir, which is
+# correct — its own sources remain a vendored dependency. a root with no such
+# ancestor (a top-level project, even one that loads dep modules) is not vendored.
+fun vendored_under_ancestor(w: *Workspace, root_path: str) bool {
+    var cur: str = root_path;
+    var result: bool = false;
+    var done: bool = false;
+    for (!done) {
+        val anc: str = project_root_for(w.alloc, cur);
+        if (cur != root_path) { strutil.str_free(w.alloc, cur); }
+        if (anc == nil) { done = true; }
+        or {
+            if (vendors_enclosing(w, anc, root_path)) {
+                strutil.str_free(w.alloc, anc);
+                result = true;
+                done   = true;
+            }
+            or { cur = anc; }
+        }
+    }
+    ret result;
 }
 
 # reset_slot: zero a Root slot's fields, marking it dead and reusable. owned
@@ -573,6 +614,7 @@ fun reset_slot(r: *Root) {
     r.man_mtime      = 0;
     r.lock_mtime     = 0;
     r.gen            = 0;
+    r.vendored       = false;
 }
 
 # alloc_slot: a reusable dead slot, growing the array when every slot is
@@ -954,10 +996,25 @@ fun module_for_norm(root: *Root, norm: str) Option[sess.ModuleId] {
     ret none[sess.ModuleId]();
 }
 
+# root_vendored: whether `root`'s whole tree is a vendored dependency project
+# (its directory lies under an outer project's declared vendor dir), so none of
+# its files are the editor's to rewrite. nil root is not vendored. the per-root
+# read-only signal the rename gate consults for a buffer with no loaded twin,
+# where the per-module is_project_module check has nothing to key on.
+# ---
+# root: the root governing the request, or nil
+# ret:  true when the root is a vendored dependency project
+pub fun root_vendored(root: *Root) bool {
+    if (root == nil) { ret false; }
+    ret root.vendored;
+}
+
 # is_project_module: whether loaded module `mid` in `root` belongs to the user's
-# own project rather than a vendored dependency — true iff its fully-qualified
-# path's head segment is the project id. rename gates cross-file edits on it so a
-# dependency's declaration (e.g. a std symbol) is never rewritten.
+# own editable project rather than a vendored dependency — false outright when
+# the whole root is a vendored dependency project (root_vendored), otherwise true
+# iff the module's fully-qualified path's head segment is the project id. rename
+# gates cross-file edits on it so a dependency's declaration (e.g. a std symbol,
+# or any file of a vendored project) is never rewritten.
 # ---
 # w:    the workspace
 # root: the root governing the request, or nil
@@ -966,6 +1023,7 @@ fun module_for_norm(root: *Root, norm: str) Option[sess.ModuleId] {
 pub fun is_project_module(w: *Workspace, root: *Root, mid: sess.ModuleId) bool {
     val m: *driver.ModuleEntry = module_entry(root, mid);
     if (m == nil) { ret false; }
+    if (root.vendored) { ret false; }
     val id_opt:  Option[str] = intern.lookup(?w.s.interner, root.p.config.id);
     val fqn_opt: Option[str] = intern.lookup(?w.s.interner, m.fqn);
     if (!is_some[str](id_opt) || !is_some[str](fqn_opt)) { ret false; }
