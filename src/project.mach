@@ -22,21 +22,33 @@
 #
 # module-id namespacing: `driver.build_project` allocates project-local module
 # ids from 0 and writes them into the session's global module registries, so a
-# second build over the same session clobbers the first there. the LSP never
-# reads those session registries — every cross-module lookup (site_of,
+# second build over the same session clobbers the first there. those clobbered
+# registries are never read for a lookup — every cross-module lookup (site_of,
 # module_view, ...) reads the per-`Root` `driver.Project.modules` array, whose
-# ids are private to that project. each `Root` is therefore its own id space and
-# several projects coexist in one shared session without collision; per-root
-# sessions are unnecessary. a buffer resolves under a synthetic id past its
-# root's `module_len`, so a buffer-local symbol's `origin` never equals a
-# loaded dependency's.
+# ids are private to that project. the seam guarding that invariant is a
+# narrowed surface, not a language seal: no feature signature carries a
+# `*sess.Session` — feature code is handed only the per-root accessors plus the
+# two never-clobbered session services (`interner` / `sources`) — so reading a
+# session module registry takes deliberately reaching through `Workspace.s` or
+# the vendored `EditorSession.s`, both of which stay readable because mach's
+# `pub` publishes whole recs (no field-level visibility). each `Root` is
+# therefore its own id space and several projects coexist in one shared session
+# without collision; per-root sessions are unnecessary. a buffer resolves under
+# a synthetic id past its root's `module_len`, so a buffer-local symbol's
+# `origin` never equals a loaded dependency's.
 #
 # invalidation: a root's graph is a load-time snapshot. `invalidate_uri` (driven
 # by `workspace/didChangeWatchedFiles`) drops every root whose tree contains the
 # changed file, so the next request rebuilds it from disk. when the client does
 # not deliver watch notifications, a conservative manifest/lockfile mtime check
 # on each access reloads a stale root and retries a previously failed one (a
-# since-fixed manifest); with watching active the check is skipped.
+# since-fixed manifest); with watching active the check is skipped. the resolve
+# cache stamps each entry with the generation of the root build it resolved
+# against (`Root.gen`, a fresh value per successful build; 0 reserved for a
+# single-file resolve), so a build's teardown makes every entry from it
+# structurally unhittable — no entry survives its root's reload as a stale hit —
+# while a freed root's entries are evicted per-root rather than by clearing the
+# whole cache.
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -100,13 +112,21 @@ pub rec Site {
     owned: bool;
 }
 
-# Cached: one buffer's dep-aware resolve result, keyed by the Ast it was
-# resolved from. the editor replaces a buffer's `*ast.Ast` on every text update
-# (`drop_analysis`), so pointer identity of the Ast is the staleness check —
-# the same contract `editor.resolve` uses for its own cached result.
+# Cached: one buffer's dep-aware resolve result, stamped with the Ast it was
+# resolved from and the generation of the root build it resolved against. the
+# editor replaces a buffer's `*ast.Ast` on every text update (`drop_analysis`),
+# so Ast pointer identity catches a text edit — the same contract
+# `editor.resolve` uses for its own cached result; `gen` catches a cross-root or
+# post-reload staleness, since a result resolved against one build never matches
+# a different build's stamp.
+# ---
+# rr:  the cached dep-aware ResolveResult, owned by the cache
+# a:   the Ast the result was resolved from (text-edit staleness check)
+# gen: generation of the root build it resolved against, or 0 for single-file
 rec Cached {
-    rr: *res.ResolveResult;
-    a:  *ast.Ast;
+    rr:  *res.ResolveResult;
+    a:   *ast.Ast;
+    gen: u32;
 }
 
 # Root: one project root open in the session and the dependency graph built from
@@ -129,6 +149,10 @@ rec Cached {
 # man_mtime:      `mach.toml` mtime at the last load attempt, for the
 #                 conservative reload / retry check
 # lock_mtime:     `mach.lock` mtime at the last load attempt (0 when absent)
+# gen:            generation stamp of the current loaded build — a fresh value
+#                 claimed on each successful load, 0 (reserved) while unloaded;
+#                 resolve cache entries carry it, so a reload or free makes the
+#                 prior build's entries unhittable and per-root evictable
 pub rec Root {
     path:           str;
     loaded:         bool;
@@ -139,11 +163,16 @@ pub rec Root {
     own_base:       u32;
     man_mtime:      i64;
     lock_mtime:     i64;
+    gen:            u32;
 }
 
 # Workspace: the session's project roots plus the per-buffer resolve cache.
 # ---
-# s:            borrowed compiler session (sources, interner, module registry)
+# s:            the compiler session. feature code must reach its safe services
+#               through `interner` / `sources` and never read this field: its
+#               per-build module registries are clobbered on every project load,
+#               and mach's whole-rec `pub` means the field cannot be sealed —
+#               keeping it out of feature paths is the contract
 # es:           borrowed editor session (buffer parsing)
 # alloc:        allocator for owned storage
 # roots:        array of Root slots (slots with a path are tracked roots)
@@ -154,6 +183,8 @@ pub rec Root {
 # empty:        the empty dep set used for documents outside any project
 # cache:        per-FileId cache of each buffer's dep-aware ResolveResult
 # cache_len:    number of slots in `cache`
+# gen_seq:      next generation stamp to hand out; each successful root build
+#               claims one, pinning a cache entry's gen to an exact build
 pub rec Workspace {
     s:            *sess.Session;
     es:           *editor.EditorSession;
@@ -164,6 +195,7 @@ pub rec Workspace {
     empty:        res.ResolveDeps;
     cache:        *Cached;
     cache_len:    u32;
+    gen_seq:      u32;
 }
 
 # init: construct an empty workspace over the server's sessions.
@@ -184,7 +216,33 @@ pub fun init(s: *sess.Session, es: *editor.EditorSession, alloc: *Allocator) Wor
     w.empty.count   = 0;
     w.cache         = nil;
     w.cache_len     = 0;
+    w.gen_seq       = 1;
     ret w;
+}
+
+# interner: the session's shared string interner — the append-only symbol-name
+# registry feature code resolves StrIds through. handed out instead of the whole
+# session so no feature signature carries one: the session's per-build module
+# registries are clobbered on every project load, and the interner and source
+# map are the only session services a feature may safely read. (mach's whole-rec
+# `pub` leaves `Workspace.s` technically reachable; the narrowed surface is the
+# guard, not a language seal.)
+# ---
+# w:   the workspace
+# ret: the session's interner
+pub fun interner(w: *Workspace) *intern.Interner {
+    ret ?w.s.interner;
+}
+
+# sources: the session's source-file registry, for resolving a FileId to its
+# SourceFile (text + line index). the other safe-to-read session service feature
+# and diagnostics code needs; see `interner` for why the whole session is kept
+# out of feature signatures.
+# ---
+# w:   the workspace
+# ret: the session's source map
+pub fun sources(w: *Workspace) *src.SourceMap {
+    ret ?w.s.sources;
 }
 
 # set_watch_active: record that the client delivers
@@ -202,7 +260,7 @@ pub fun set_watch_active(w: *Workspace, on: bool) {
 # ---
 # w: workspace to tear down; all owned fields are zeroed
 pub fun dnit(w: *Workspace) {
-    clear_cache(w);
+    free_all_cached(w);
     if (w.cache != nil && w.cache_len > 0) {
         deallocate[Cached](w.alloc, w.cache, w.cache_len::usize);
     }
@@ -232,7 +290,7 @@ pub fun dnit(w: *Workspace) {
 pub fun resolve_doc(w: *Workspace, root: *Root, fid: src.FileId) Result[*res.ResolveResult, str] {
     var a: *ast.Ast = editor.ast_of(w.es, fid);
     if (a != nil) {
-        val hit: *res.ResolveResult = cache_hit(w, fid, a);
+        val hit: *res.ResolveResult = cache_hit(w, fid, a, root);
         if (hit != nil) { ret ok[*res.ResolveResult, str](hit); }
     }
     if (a == nil) {
@@ -272,7 +330,7 @@ pub fun resolve_doc(w: *Workspace, root: *Root, fid: src.FileId) Result[*res.Res
     val slot: *res.ResolveResult = unwrap_ok[*res.ResolveResult, str](slot_r);
     @slot = unwrap_ok[res.ResolveResult, str](rr_r);
 
-    if (!cache_put(w, fid, slot, a)) {
+    if (!cache_put(w, fid, slot, a, root_gen(root))) {
         res.dnit_result(slot);
         deallocate[res.ResolveResult](w.alloc, slot, 1);
         ret err[*res.ResolveResult, str]("project: resolve cache allocation failed");
@@ -292,6 +350,15 @@ pub fun own_module(root: *Root, fid: src.FileId) sess.ModuleId {
     var base: u32 = 0;
     if (root != nil) { base = root.own_base; }
     ret (base + fid::u32)::sess.ModuleId;
+}
+
+# root_gen: the generation stamp a buffer's resolve carries under `root` — the
+# root's current build generation, or the reserved 0 for a single-file document
+# (root nil). the single source of the stamp rule, shared by cache_put's write
+# and cache_hit's check so the two sides cannot drift.
+fun root_gen(root: *Root) u32 {
+    if (root == nil) { ret 0; }
+    ret root.gen;
 }
 
 # root_for: the root governing the document at `uri`, loading it on first use,
@@ -505,6 +572,7 @@ fun reset_slot(r: *Root) {
     r.own_base       = 0;
     r.man_mtime      = 0;
     r.lock_mtime     = 0;
+    r.gen            = 0;
 }
 
 # alloc_slot: a reusable dead slot, growing the array when every slot is
@@ -542,9 +610,10 @@ fun alloc_slot(w: *Workspace) *Root {
 # the manifest / lockfile mtimes are recorded at the start of the attempt
 # whether it succeeds or fails, so maybe_reload retries a failed root once those
 # files change instead of pinning the failure for the session. a failure is
-# surfaced (trace log + window/showMessage); on success the whole resolve cache
-# is cleared: results resolved before the load used the empty dep set and the
-# pre-load own_base.
+# surfaced (trace log + window/showMessage); on success the root claims a fresh
+# generation stamp, so any result resolved before the load (against the empty dep
+# set and the pre-load own_base, stamped a different generation) misses the cache
+# rather than being served stale.
 fun try_load(w: *Workspace, r: *Root) bool {
     record_mtimes(w, r);
 
@@ -563,10 +632,21 @@ fun try_load(w: *Workspace, r: *Root) bool {
     r.p        = unwrap_ok[driver.Project, str](pr);
     r.loaded   = true;
     r.own_base = r.p.module_len;
-    clear_cache(w);
+    r.gen      = next_gen(w);
     build_mod_paths(w, r);
     build_deps(w, r);
     ret true;
+}
+
+# next_gen: hand out a fresh generation stamp. each successful build claims one,
+# so a cache entry's generation identifies its exact build and a reloaded or
+# freed root's stale entries can never match a later build. 0 is the reserved
+# unloaded / single-file sentinel and is skipped if the sequence ever wraps.
+fun next_gen(w: *Workspace) u32 {
+    if (w.gen_seq == 0) { w.gen_seq = 1; }
+    val g: u32 = w.gen_seq;
+    w.gen_seq = w.gen_seq + 1;
+    ret g;
 }
 
 # build_mod_paths: snapshot every loaded module's normalized source path into
@@ -620,7 +700,6 @@ fun maybe_reload(w: *Workspace, r: *Root) {
     stat_mtimes(w, r.path, ?man, ?lock);
     if (man == r.man_mtime && lock == r.lock_mtime) { ret; }
     free_root_graph(w, r);
-    clear_cache(w);
     try_load(w, r);
 }
 
@@ -628,7 +707,7 @@ fun maybe_reload(w: *Workspace, r: *Root) {
 # the next request rebuilds it from disk. the LSP trigger is
 # `workspace/didChangeWatchedFiles`; a changed `mach.toml` / `mach.lock` or any
 # source under a root (including a vendored dependency under `dep/`) invalidates
-# that root. the resolve cache is cleared when any root is dropped.
+# that root. each dropped root's cached results are evicted per-root by free_root.
 # ---
 # w:   the workspace
 # uri: the URI of the changed file
@@ -637,18 +716,15 @@ pub fun invalidate_uri(w: *Workspace, uri: str) {
     val norm: str = uri_to_norm(w.alloc, uri);
     if (norm == nil) { ret; }
 
-    var changed: bool = false;
     var i: u32 = 0;
     for (i < w.root_cap) {
         val r: *Root = ?w.roots[i];
         if (r.path != nil && root_covers(w, norm, r.path)) {
             free_root(w, r);
-            changed = true;
         }
         i = i + 1;
     }
     strutil.str_free(w.alloc, norm);
-    if (changed) { clear_cache(w); }
 }
 
 # root_covers: whether `file_norm` (a normalized absolute path) lies within the
@@ -681,14 +757,18 @@ fun free_root(w: *Workspace, r: *Root) {
 
 # free_root_graph: release a root's dep snapshot, module-path snapshot, and
 # loaded project, leaving the slot tracked with its path so it can reload in
-# place.
+# place. the build's cached resolve results are evicted first (so a teardown
+# reclaims them rather than leaving them for the whole-cache sweep), and the
+# generation is cleared so a later build claims a fresh, non-matching one.
 fun free_root_graph(w: *Workspace, r: *Root) {
+    evict_root(w, r);
     free_deps(w, ?r.deps);
     free_mod_paths(w, r);
     if (r.loaded) {
         driver.dnit_project(?r.p);
         r.loaded = false;
     }
+    r.gen = 0;
 }
 
 # record_mtimes: snapshot the root's manifest / lockfile mtimes for the
@@ -1033,18 +1113,23 @@ fun free_deps(w: *Workspace, deps: *res.ResolveDeps) {
 
 # cache_hit: the cached ResolveResult for `fid` when it was resolved from the
 # exact Ast `a` (the editor replaces the Ast pointer on every text update, so
-# pointer identity proves the result is current), or nil.
-fun cache_hit(w: *Workspace, fid: src.FileId, a: *ast.Ast) *res.ResolveResult {
+# pointer identity proves the text is current) and against the same build as
+# `root` (the entry's generation must equal the root's current `gen`, or 0 when
+# resolving single-file), or nil. the generation match is what makes a result
+# from a since-reloaded or different root structurally unhittable.
+fun cache_hit(w: *Workspace, fid: src.FileId, a: *ast.Ast, root: *Root) *res.ResolveResult {
     if (w.cache == nil || fid::u32 >= w.cache_len) { ret nil; }
     val c: *Cached = ?w.cache[fid::u32];
     if (c.rr == nil || c.a != a) { ret nil; }
+    if (c.gen != root_gen(root)) { ret nil; }
     ret c.rr;
 }
 
-# cache_put: store `rr` (resolved from Ast `a`) as the cached result for `fid`,
-# growing the cache to cover the FileId and zero-filling any gap. false when
-# the grow allocation fails — the caller owns `rr` and must free it.
-fun cache_put(w: *Workspace, fid: src.FileId, rr: *res.ResolveResult, a: *ast.Ast) bool {
+# cache_put: store `rr` (resolved from Ast `a` against the build stamped `gen`,
+# or 0 for single-file) as the cached result for `fid`, growing the cache to
+# cover the FileId and zero-filling any gap. false when the grow allocation fails
+# — the caller owns `rr` and must free it.
+fun cache_put(w: *Workspace, fid: src.FileId, rr: *res.ResolveResult, a: *ast.Ast, gen: u32) bool {
     val needed: u32 = fid::u32 + 1;
     if (needed > w.cache_len) {
         var new_len: u32 = w.cache_len;
@@ -1061,37 +1146,63 @@ fun cache_put(w: *Workspace, fid: src.FileId, rr: *res.ResolveResult, a: *ast.As
             w.cache = unwrap_ok[*Cached, str](r);
         }
         var z: u32 = w.cache_len;
-        for (z < new_len) { w.cache[z].rr = nil; w.cache[z].a = nil; z = z + 1; }
+        for (z < new_len) { w.cache[z].rr = nil; w.cache[z].a = nil; w.cache[z].gen = 0; z = z + 1; }
         w.cache_len = new_len;
     }
-    w.cache[fid::u32].rr = rr;
-    w.cache[fid::u32].a  = a;
+    w.cache[fid::u32].rr  = rr;
+    w.cache[fid::u32].a   = a;
+    w.cache[fid::u32].gen = gen;
     ret true;
 }
 
-# free_cached: release and clear the cached ResolveResult for `fid`, if any.
-fun free_cached(w: *Workspace, fid: src.FileId) {
-    if (w.cache == nil || fid::u32 >= w.cache_len) { ret; }
-    val c: *Cached = ?w.cache[fid::u32];
-    if (c.rr == nil) { ret; }
+# release_entry: free a cache slot's owned ResolveResult and zero the slot —
+# the one teardown for a Cached entry, shared by every reclamation path.
+# callers guard `c.rr != nil`.
+fun release_entry(w: *Workspace, c: *Cached) {
     res.dnit_result(c.rr);
     deallocate[res.ResolveResult](w.alloc, c.rr, 1);
-    c.rr = nil;
-    c.a  = nil;
+    c.rr  = nil;
+    c.a   = nil;
+    c.gen = 0;
 }
 
-# clear_cache: release every cached ResolveResult, keeping the slot array.
-fun clear_cache(w: *Workspace) {
+# free_cached: release and clear the cached ResolveResult for `fid`, if any.
+# called before a re-resolve replaces the entry, and by the server on didClose
+# so a retired document's result is reclaimed immediately instead of lingering
+# until its FileId is reused or its root reloads.
+# ---
+# w:   the workspace
+# fid: the buffer whose cached result to drop
+pub fun free_cached(w: *Workspace, fid: src.FileId) {
+    if (w.cache == nil || fid::u32 >= w.cache_len) { ret; }
+    val c: *Cached = ?w.cache[fid::u32];
+    if (c.rr != nil) { release_entry(w, c); }
+}
+
+# evict_root: release every cached result resolved against root `r`'s current
+# build (matched by generation), reclaiming the entries a graph teardown
+# invalidates. a no-op for an unloaded slot (gen 0, no build of its own — and
+# never the single-file entries that also carry gen 0, since those belong to no
+# root). called by free_root_graph at every reload / free, replacing the blanket
+# whole-cache clear.
+fun evict_root(w: *Workspace, r: *Root) {
+    if (w.cache == nil || r.gen == 0) { ret; }
+    var i: u32 = 0;
+    for (i < w.cache_len) {
+        val c: *Cached = ?w.cache[i];
+        if (c.rr != nil && c.gen == r.gen) { release_entry(w, c); }
+        i = i + 1;
+    }
+}
+
+# free_all_cached: release every cached ResolveResult, keeping the slot array.
+# the teardown sweep used by dnit; per-build invalidation goes through evict_root.
+fun free_all_cached(w: *Workspace) {
     if (w.cache == nil) { ret; }
     var i: u32 = 0;
     for (i < w.cache_len) {
         val c: *Cached = ?w.cache[i];
-        if (c.rr != nil) {
-            res.dnit_result(c.rr);
-            deallocate[res.ResolveResult](w.alloc, c.rr, 1);
-            c.rr = nil;
-            c.a  = nil;
-        }
+        if (c.rr != nil) { release_entry(w, c); }
         i = i + 1;
     }
 }

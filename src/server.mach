@@ -326,10 +326,13 @@ fun handle_did_change(srv: *Server, body: str) {
     json.free_str(uri, srv.alloc);
 }
 
-# handle_did_close: retire the document and clear its diagnostics.
+# handle_did_close: retire the document, reclaim its cached resolve result, and
+# clear its diagnostics.
 fun handle_did_close(srv: *Server, body: str) {
     val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
     if (uri == nil) { ret; }
+    val doc: *documents.Document = documents.find(?srv.docs, uri);
+    if (doc != nil) { project.free_cached(?srv.ws, doc.file_id); }
     documents.close(?srv.docs, uri);
     diagnostics.clear(srv.alloc, uri);
     json.free_str(uri, srv.alloc);
@@ -344,13 +347,13 @@ fun handle_did_close(srv: *Server, body: str) {
 fun handle_feature(srv: *Server, body: str, which: i64) {
     val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
 
-    if (which == 0) { language.hover(?srv.ws, ?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 1) { language.definition(?srv.ws, ?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 2) { language.references(?srv.ws, ?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 3) { language.rename(?srv.ws, ?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 4) { language.prepare_rename(?srv.ws, ?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 5) { language.document_symbol(?srv.ws, ?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 6) { language.completion(?srv.ws, ?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
+    if (which == 0) { language.hover(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 1) { language.definition(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 2) { language.references(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 3) { language.rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 4) { language.prepare_rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 5) { language.document_symbol(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 6) { language.completion(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
 
     if (uri != nil) { json.free_str(uri, srv.alloc); }
 }
@@ -369,7 +372,7 @@ fun publish_for(srv: *Server, uri: str, text: str, is_open: bool) {
         ret;
     }
     val doc: *documents.Document = unwrap_ok[*documents.Document, str](dr);
-    diagnostics.publish(?srv.es, ?srv.s, srv.alloc, uri, doc.file_id);
+    diagnostics.publish(?srv.es, project.sources(?srv.ws), srv.alloc, uri, doc.file_id);
 }
 
 # reply_error: send a JSON-RPC error response for a request that carries an id;

@@ -61,29 +61,29 @@ use project:   mls.project;
 
 # Analyzed: the resolved analysis of one request's target document.
 # ---
-# s:    the compiler session (interner for symbol names, sources)
-# file: the document's SourceFile (text + line index for offset/position)
-# a:    the buffer's parsed Ast
-# rr:   the buffer's ResolveResult side tables
-# own:  this buffer's module id (Symbol.origin equals it for local symbols)
-# root: the project root the buffer resolved against, or nil for single-file
+# interner: the session's string interner, for resolving symbol-name StrIds
+# file:     the document's SourceFile (text + line index for offset/position)
+# a:        the buffer's parsed Ast
+# rr:       the buffer's ResolveResult side tables
+# own:      this buffer's module id (Symbol.origin equals it for local symbols)
+# root:     the project root the buffer resolved against, or nil for single-file
 rec Analyzed {
-    s:    *sess.Session;
-    file: *src.SourceFile;
-    a:    *ast.Ast;
-    rr:   *res.ResolveResult;
-    own:  sess.ModuleId;
-    root: *project.Root;
+    interner: *intern.Interner;
+    file:     *src.SourceFile;
+    a:        *ast.Ast;
+    rr:       *res.ResolveResult;
+    own:      sess.ModuleId;
+    root:     *project.Root;
 }
 
 # hover: answer textDocument/hover with the type / declaration of the symbol at
 # the cursor, or null when the position is not on a resolved symbol.
-pub fun hover(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
+pub fun hover(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
     val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, s, alloc, docs, body, uri, ?an);
+    val off_o: Option[usize] = locate(ws, es, alloc, docs, body, uri, ?an);
     if (!is_some[usize](off_o)) { reply_null(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
@@ -139,7 +139,7 @@ fun hover_markdown(ws: *project.Workspace, an: Analyzed, sym: *res.Symbol, uri: 
         project.free_site(ws, ?site);
     }
     if (sig == nil) {
-        sig = compose_kind_name(sym, ?an.s.interner, alloc);
+        sig = compose_kind_name(sym, an.interner, alloc);
     }
     if (sig == nil) { json.free_str(doc, alloc); ret nil; }
 
@@ -386,12 +386,12 @@ fun compose_kind_name(sym: *res.Symbol, interner: *intern.Interner, alloc: *Allo
 # symbol's declaration. lands in the buffer for a local symbol and in the
 # defining dependency module's on-disk file for a cross-module one; null when
 # the position is not on a resolved symbol or its declaration cannot be located.
-pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
+pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
     val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, s, alloc, docs, body, uri, ?an);
+    val off_o: Option[usize] = locate(ws, es, alloc, docs, body, uri, ?an);
     if (!is_some[usize](off_o)) { reply_null(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
@@ -428,12 +428,12 @@ pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.S
 # the symbol at the cursor — its declaration plus every use-site across the
 # loaded project graph (the requesting buffer and every other module that
 # references the symbol). empty when the position is not on a resolved symbol.
-pub fun references(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
+pub fun references(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
     val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, s, alloc, docs, body, uri, ?an);
+    val off_o: Option[usize] = locate(ws, es, alloc, docs, body, uri, ?an);
     if (!is_some[usize](off_o)) { reply_empty_array(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
@@ -471,7 +471,7 @@ pub fun references(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.S
 # itself), so those yield an empty edit. an empty edit is also returned when a
 # module-scope pub symbol's cross-file identity cannot be recovered from its
 # stale on-disk twin — a buffer-local edit there would be a partial rename.
-pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
+pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
     val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
     if (id_raw == nil) { ret; }
 
@@ -479,7 +479,7 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Sessi
     if (new_name == nil) { reply_null(alloc, id_raw); ret; }
 
     var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, s, alloc, docs, body, uri, ?an);
+    val off_o: Option[usize] = locate(ws, es, alloc, docs, body, uri, ?an);
     if (!is_some[usize](off_o)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
     val offset: usize = unwrap[usize](off_o);
 
@@ -494,7 +494,7 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Sessi
 
     # the declared name guards the cross-file walk: only occurrences spelled with
     # it are rewritten, so an aliased import's references are left untouched.
-    val no: Option[str] = intern.lookup(?s.interner, sym.name);
+    val no: Option[str] = intern.lookup(an.interner, sym.name);
     if (!is_some[str](no)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
     val name: str = unwrap[str](no);
 
@@ -526,12 +526,12 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Sessi
 # prepare_rename: answer textDocument/prepareRename with the range of the name
 # token at the cursor when it is a renameable symbol (a buffer-local symbol, or a
 # project-owned cross-module one), or null when it is not the editor's to rename.
-pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
+pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
     val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, s, alloc, docs, body, uri, ?an);
+    val off_o: Option[usize] = locate(ws, es, alloc, docs, body, uri, ?an);
     if (!is_some[usize](off_o)) { reply_null(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
@@ -558,28 +558,28 @@ pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, s: *se
 # document_symbol: answer textDocument/documentSymbol with a flat list of the
 # file's top-level declarations as DocumentSymbol nodes (name, kind, range,
 # selectionRange).
-pub fun document_symbol(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
+pub fun document_symbol(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
     val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val okd: bool = analyze(ws, es, s, docs, uri, ?an);
+    val okd: bool = analyze(ws, es, docs, uri, ?an);
     if (!okd) { reply_empty_array(alloc, id_raw); ret; }
 
-    emit_document_symbols(an, s, alloc, id_raw);
+    emit_document_symbols(an, alloc, id_raw);
 }
 
 # completion: answer textDocument/completion with the in-scope top-level names
 # (module decls, `use` aliases / imports, primitives) as CompletionItems.
-pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
+pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
     val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val okc: bool = analyze(ws, es, s, docs, uri, ?an);
+    val okc: bool = analyze(ws, es, docs, uri, ?an);
     if (!okc) { reply_empty_array(alloc, id_raw); ret; }
 
-    emit_completions(an, s, alloc, id_raw);
+    emit_completions(an, alloc, id_raw);
 }
 
 # binding_span: write the binding name span of a param / generic symbol into
@@ -725,12 +725,12 @@ fun free_refs(ws: *project.Workspace, refs: *XRef, n: usize) {
 }
 
 # analyze: resolve the document named by `uri` against the dependency graph of
-# the project root that governs it and populate `out` with its session, file,
+# the project root that governs it and populate `out` with its interner, file,
 # Ast, ResolveResult, governing root, and module id. false when the document is
 # unknown or resolution fails. the module id is the root's synthetic buffer id,
 # matching the one resolution bound local symbols under, so the local /
 # cross-module distinction holds.
-fun analyze(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, docs: *documents.Store, uri: str, out: *Analyzed) bool {
+fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *documents.Store, uri: str, out: *Analyzed) bool {
     if (uri == nil) { ret false; }
     val doc: *documents.Document = documents.find(docs, uri);
     if (doc == nil) { ret false; }
@@ -742,20 +742,20 @@ fun analyze(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session,
     out.a  = editor.ast_of(es, doc.file_id);
     if (out.a == nil) { ret false; }
 
-    val fo: Option[*src.SourceFile] = src.get(?s.sources, doc.file_id);
+    val fo: Option[*src.SourceFile] = src.get(project.sources(ws), doc.file_id);
     if (!is_some[*src.SourceFile](fo)) { ret false; }
-    out.s    = s;
-    out.file = unwrap[*src.SourceFile](fo);
-    out.root = root;
-    out.own  = project.own_module(root, doc.file_id);
+    out.interner = project.interner(ws);
+    out.file     = unwrap[*src.SourceFile](fo);
+    out.root     = root;
+    out.own      = project.own_module(root, doc.file_id);
     ret true;
 }
 
 # locate: analyze the target document and resolve the request's cursor position
 # to a byte offset, or none when the document is unknown / unresolvable or the
 # position is invalid (callers fall back to a null / empty reply).
-fun locate(ws: *project.Workspace, es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, docs: *documents.Store, body: str, uri: str, out: *Analyzed) Option[usize] {
-    if (!analyze(ws, es, s, docs, uri, out)) { ret none[usize](); }
+fun locate(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str, out: *Analyzed) Option[usize] {
+    if (!analyze(ws, es, docs, uri, out)) { ret none[usize](); }
 
     val line: i64 = json.extract_number_after(body, "\"position\"", "\"line\"", alloc);
     val ch:   i64 = json.extract_number_after(body, "\"position\"", "\"character\"", alloc);
@@ -989,7 +989,7 @@ fun free_groups(groups: *str, n: usize, alloc: *Allocator) {
 
 # emit_document_symbols: send a DocumentSymbol[] of the file's top-level decls.
 # takes ownership of `id_raw` and frees it.
-fun emit_document_symbols(an: Analyzed, s: *sess.Session, alloc: *Allocator, id_raw: str) {
+fun emit_document_symbols(an: Analyzed, alloc: *Allocator, id_raw: str) {
     val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
     val mid:    str = ",\"result\":[";
     val suffix: str = "]}";
@@ -1001,7 +1001,7 @@ fun emit_document_symbols(an: Analyzed, s: *sess.Session, alloc: *Allocator, id_
 
     var d1: u32 = 0;
     for (d1 < n) {
-        val entry: str = doc_symbol_json(an, s, features.top_level_decl(an.a, d1), alloc);
+        val entry: str = doc_symbol_json(an, features.top_level_decl(an.a, d1), alloc);
         if (entry != nil) {
             if (count > 0) { total = total + 1; }
             total = total + str_len(entry);
@@ -1023,7 +1023,7 @@ fun emit_document_symbols(an: Analyzed, s: *sess.Session, alloc: *Allocator, id_
     var emitted: usize = 0;
     var d2: u32 = 0;
     for (d2 < n) {
-        val entry: str = doc_symbol_json(an, s, features.top_level_decl(an.a, d2), alloc);
+        val entry: str = doc_symbol_json(an, features.top_level_decl(an.a, d2), alloc);
         if (entry != nil) {
             if (emitted > 0) { buf[off] = ','; off = off + 1; }
             off = append(buf, off, entry);
@@ -1042,7 +1042,7 @@ fun emit_document_symbols(an: Analyzed, s: *sess.Session, alloc: *Allocator, id_
 
 # doc_symbol_json: render decl `did` as a DocumentSymbol object, or nil when the
 # decl has no nameable symbol (use / fwd / test / comptime / error).
-fun doc_symbol_json(an: Analyzed, s: *sess.Session, did: id.DeclId, alloc: *Allocator) str {
+fun doc_symbol_json(an: Analyzed, did: id.DeclId, alloc: *Allocator) str {
     val d_opt: Option[*decl.Decl] = ast.get_decl(an.a, did);
     if (!is_some[*decl.Decl](d_opt)) { ret nil; }
     val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
@@ -1109,7 +1109,7 @@ fun decl_lsp_kind(kind: decl.DeclKind) i64 {
 # emit_completions: send a CompletionItem[] of the file's top-level names, each
 # deduped by spelling so a name declared once appears once. takes ownership of
 # `id_raw` and frees it.
-fun emit_completions(an: Analyzed, s: *sess.Session, alloc: *Allocator, id_raw: str) {
+fun emit_completions(an: Analyzed, alloc: *Allocator, id_raw: str) {
     val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
     val mid:    str = ",\"result\":{\"isIncomplete\":false,\"items\":[";
     val suffix: str = "]}}";
@@ -1120,7 +1120,7 @@ fun emit_completions(an: Analyzed, s: *sess.Session, alloc: *Allocator, id_raw: 
     var i1: u32 = 0;
     for (i1 < an.rr.symbol_count) {
         if (completion_first(an, i1)) {
-            val entry: str = completion_json(an, s, i1, alloc);
+            val entry: str = completion_json(an, i1, alloc);
             if (entry != nil) {
                 if (count > 0) { total = total + 1; }
                 total = total + str_len(entry);
@@ -1144,7 +1144,7 @@ fun emit_completions(an: Analyzed, s: *sess.Session, alloc: *Allocator, id_raw: 
     var i2: u32 = 0;
     for (i2 < an.rr.symbol_count) {
         if (completion_first(an, i2)) {
-            val entry: str = completion_json(an, s, i2, alloc);
+            val entry: str = completion_json(an, i2, alloc);
             if (entry != nil) {
                 if (emitted > 0) { buf[off] = ','; off = off + 1; }
                 off = append(buf, off, entry);
@@ -1176,9 +1176,9 @@ fun completion_first(an: Analyzed, sid: res.SymbolId) bool {
 }
 
 # completion_json: render symbol `sid` as a CompletionItem, or nil.
-fun completion_json(an: Analyzed, s: *sess.Session, sid: res.SymbolId, alloc: *Allocator) str {
+fun completion_json(an: Analyzed, sid: res.SymbolId, alloc: *Allocator) str {
     val sym: *res.Symbol = ?an.rr.symbols[sid];
-    val no: Option[str] = intern.lookup(?s.interner, sym.name);
+    val no: Option[str] = intern.lookup(an.interner, sym.name);
     if (!is_some[str](no)) { ret nil; }
     val qname: str = json.quote(unwrap[str](no), alloc);
     if (qname == nil) { ret nil; }
