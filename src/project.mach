@@ -330,9 +330,7 @@ pub fun resolve_doc(w: *Workspace, root: *Root, fid: src.FileId) Result[*res.Res
     val slot: *res.ResolveResult = unwrap_ok[*res.ResolveResult, str](slot_r);
     @slot = unwrap_ok[res.ResolveResult, str](rr_r);
 
-    var stamp: u32 = 0;
-    if (root != nil) { stamp = root.gen; }
-    if (!cache_put(w, fid, slot, a, stamp)) {
+    if (!cache_put(w, fid, slot, a, root_gen(root))) {
         res.dnit_result(slot);
         deallocate[res.ResolveResult](w.alloc, slot, 1);
         ret err[*res.ResolveResult, str]("project: resolve cache allocation failed");
@@ -352,6 +350,15 @@ pub fun own_module(root: *Root, fid: src.FileId) sess.ModuleId {
     var base: u32 = 0;
     if (root != nil) { base = root.own_base; }
     ret (base + fid::u32)::sess.ModuleId;
+}
+
+# root_gen: the generation stamp a buffer's resolve carries under `root` — the
+# root's current build generation, or the reserved 0 for a single-file document
+# (root nil). the single source of the stamp rule, shared by cache_put's write
+# and cache_hit's check so the two sides cannot drift.
+fun root_gen(root: *Root) u32 {
+    if (root == nil) { ret 0; }
+    ret root.gen;
 }
 
 # root_for: the root governing the document at `uri`, loading it on first use,
@@ -1114,9 +1121,7 @@ fun cache_hit(w: *Workspace, fid: src.FileId, a: *ast.Ast, root: *Root) *res.Res
     if (w.cache == nil || fid::u32 >= w.cache_len) { ret nil; }
     val c: *Cached = ?w.cache[fid::u32];
     if (c.rr == nil || c.a != a) { ret nil; }
-    var want: u32 = 0;
-    if (root != nil) { want = root.gen; }
-    if (c.gen != want) { ret nil; }
+    if (c.gen != root_gen(root)) { ret nil; }
     ret c.rr;
 }
 
@@ -1150,16 +1155,22 @@ fun cache_put(w: *Workspace, fid: src.FileId, rr: *res.ResolveResult, a: *ast.As
     ret true;
 }
 
-# free_cached: release and clear the cached ResolveResult for `fid`, if any.
-fun free_cached(w: *Workspace, fid: src.FileId) {
-    if (w.cache == nil || fid::u32 >= w.cache_len) { ret; }
-    val c: *Cached = ?w.cache[fid::u32];
-    if (c.rr == nil) { ret; }
+# release_entry: free a cache slot's owned ResolveResult and zero the slot —
+# the one teardown for a Cached entry, shared by every reclamation path.
+# callers guard `c.rr != nil`.
+fun release_entry(w: *Workspace, c: *Cached) {
     res.dnit_result(c.rr);
     deallocate[res.ResolveResult](w.alloc, c.rr, 1);
     c.rr  = nil;
     c.a   = nil;
     c.gen = 0;
+}
+
+# free_cached: release and clear the cached ResolveResult for `fid`, if any.
+fun free_cached(w: *Workspace, fid: src.FileId) {
+    if (w.cache == nil || fid::u32 >= w.cache_len) { ret; }
+    val c: *Cached = ?w.cache[fid::u32];
+    if (c.rr != nil) { release_entry(w, c); }
 }
 
 # evict_root: release every cached result resolved against root `r`'s current
@@ -1173,13 +1184,7 @@ fun evict_root(w: *Workspace, r: *Root) {
     var i: u32 = 0;
     for (i < w.cache_len) {
         val c: *Cached = ?w.cache[i];
-        if (c.rr != nil && c.gen == r.gen) {
-            res.dnit_result(c.rr);
-            deallocate[res.ResolveResult](w.alloc, c.rr, 1);
-            c.rr  = nil;
-            c.a   = nil;
-            c.gen = 0;
-        }
+        if (c.rr != nil && c.gen == r.gen) { release_entry(w, c); }
         i = i + 1;
     }
 }
@@ -1191,13 +1196,7 @@ fun free_all_cached(w: *Workspace) {
     var i: u32 = 0;
     for (i < w.cache_len) {
         val c: *Cached = ?w.cache[i];
-        if (c.rr != nil) {
-            res.dnit_result(c.rr);
-            deallocate[res.ResolveResult](w.alloc, c.rr, 1);
-            c.rr  = nil;
-            c.a   = nil;
-            c.gen = 0;
-        }
+        if (c.rr != nil) { release_entry(w, c); }
         i = i + 1;
     }
 }
