@@ -16,8 +16,8 @@ This server implements the **diagnostics** vertical slice plus the
   affected project root's graph, registered via `client/registerCapability`.
 - Diagnostics: on open/change the buffer text is fed to `mach.lang.editor`
   (`open` / `update` / `diagnostics`); every reported `diagnostic.Diagnostic`
-  is mapped — its byte span through `source.position` to a 0-based LSP range,
-  its severity to the LSP scale — and published via
+  is mapped — its byte span through `positions.range_of` to a 0-based LSP range
+  (UTF-16 columns), its severity to the LSP scale — and published via
   `textDocument/publishDiagnostics`.
 - Language features over the buffer's resolved analysis (`project.resolve_doc`
   + `ast.offset_to_*` + the `resolve.ResolveResult` side tables):
@@ -133,7 +133,7 @@ tracks `branch/main`.
 | `json` | minimal JSON field extraction and response assembly |
 | `documents` | URI ⇄ editor `FileId` registry |
 | `diagnostics` | run `editor.diagnostics`, map spans, publish |
-| `positions` | byte offset ⇄ LSP `(line, character)` and span text |
+| `positions` | byte offset ⇄ LSP `(line, character)` (UTF-16 columns ⇄ bytes) and span text — the single conversion point |
 | `features` | offset → id → symbol query core over the resolve side tables |
 | `project` | per-root project graphs: route a document to its governing root, load each root's module graph, re-resolve a buffer against its root's dependency set, map a symbol to its declaring file's `file://` URI, expose a root's loaded modules for the use-site walk, and invalidate a root on a watched-file change |
 | `language` | hover / definition / references / rename / documentSymbol / completion request bodies |
@@ -174,6 +174,10 @@ each scenario module asserts one surface:
   bumping the manifest mtime for the fallback path) makes the next definition
   serve the shifted declaration line, proving the root's graph reloaded; a
   broken manifest fixed on disk is retried rather than pinned failed.
+- `test_encoding.py` — a buffer with an em dash (3 UTF-8 bytes, 1 UTF-16 unit)
+  before a `g()` call: a definition request at the call's UTF-16 column resolves
+  it (inbound UTF-16→byte) and references reports the use-site at the UTF-16
+  column, not the byte column (outbound byte→UTF-16).
 
 ```sh
 make test          # builds, then runs test/run.py
