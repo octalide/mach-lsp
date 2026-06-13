@@ -25,15 +25,17 @@
 # second build over the same session clobbers the first there. those clobbered
 # registries are never read for a lookup — every cross-module lookup (site_of,
 # module_view, ...) reads the per-`Root` `driver.Project.modules` array, whose
-# ids are private to that project — and that boundary is structural, not just
-# convention: the `Workspace` is the sole holder of the `*sess.Session`, and
-# feature code receives only the per-root accessors plus the two safe, never-
-# clobbered session services (`interner` / `sources`), so a stray `sess.module_*`
-# read is unreachable from a feature. each `Root` is therefore its own id space
-# and several projects coexist in one shared session without collision; per-root
-# sessions are unnecessary. a buffer resolves under a synthetic id past its
-# root's `module_len`, so a buffer-local symbol's `origin` never equals a
-# loaded dependency's.
+# ids are private to that project. the seam guarding that invariant is a
+# narrowed surface, not a language seal: no feature signature carries a
+# `*sess.Session` — feature code is handed only the per-root accessors plus the
+# two never-clobbered session services (`interner` / `sources`) — so reading a
+# session module registry takes deliberately reaching through `Workspace.s` or
+# the vendored `EditorSession.s`, both of which stay readable because mach's
+# `pub` publishes whole recs (no field-level visibility). each `Root` is
+# therefore its own id space and several projects coexist in one shared session
+# without collision; per-root sessions are unnecessary. a buffer resolves under
+# a synthetic id past its root's `module_len`, so a buffer-local symbol's
+# `origin` never equals a loaded dependency's.
 #
 # invalidation: a root's graph is a load-time snapshot. `invalidate_uri` (driven
 # by `workspace/didChangeWatchedFiles`) drops every root whose tree contains the
@@ -166,9 +168,11 @@ pub rec Root {
 
 # Workspace: the session's project roots plus the per-buffer resolve cache.
 # ---
-# s:            the compiler session, held solely here; feature code reaches its
-#               safe services through `interner` / `sources`, never the whole
-#               session (whose per-build module registries a second load clobbers)
+# s:            the compiler session. feature code must reach its safe services
+#               through `interner` / `sources` and never read this field: its
+#               per-build module registries are clobbered on every project load,
+#               and mach's whole-rec `pub` means the field cannot be sealed —
+#               keeping it out of feature paths is the contract
 # es:           borrowed editor session (buffer parsing)
 # alloc:        allocator for owned storage
 # roots:        array of Root slots (slots with a path are tracked roots)
@@ -217,10 +221,12 @@ pub fun init(s: *sess.Session, es: *editor.EditorSession, alloc: *Allocator) Wor
 }
 
 # interner: the session's shared string interner — the append-only symbol-name
-# registry feature code resolves StrIds through. exposed narrowly so a feature
-# never holds the whole session, whose per-build module registries a second
-# project load clobbers; the interner and source map are the only session
-# services a feature may safely read.
+# registry feature code resolves StrIds through. handed out instead of the whole
+# session so no feature signature carries one: the session's per-build module
+# registries are clobbered on every project load, and the interner and source
+# map are the only session services a feature may safely read. (mach's whole-rec
+# `pub` leaves `Workspace.s` technically reachable; the narrowed surface is the
+# guard, not a language seal.)
 # ---
 # w:   the workspace
 # ret: the session's interner
@@ -230,7 +236,8 @@ pub fun interner(w: *Workspace) *intern.Interner {
 
 # sources: the session's source-file registry, for resolving a FileId to its
 # SourceFile (text + line index). the other safe-to-read session service feature
-# and diagnostics code needs; see `interner` for why the whole session is held back.
+# and diagnostics code needs; see `interner` for why the whole session is kept
+# out of feature signatures.
 # ---
 # w:   the workspace
 # ret: the session's source map
