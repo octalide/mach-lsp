@@ -120,7 +120,8 @@ The server binary is produced at `out/linux/debug/bin/mls`.
 `dep/mach` (id `mach`) provides the `mach.lang.*` namespace, including the
 `mach.lang.editor` query surface this server binds to; `dep/mach-std` (id
 `std`) provides `std.*`. Both are declared as git dependencies in `mach.toml`
-and fetched by `mach dep pull`; `mach-std` tracks `branch/dev` and `mach` is pinned to `v1.4.0`.
+and fetched by `mach dep pull`; `mach-std` is pinned to `v0.6.0` and `mach`
+tracks `branch/main`.
 
 ## Architecture
 
