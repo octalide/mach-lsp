@@ -44,7 +44,7 @@
 # on each access reloads a stale root and retries a previously failed one (a
 # since-fixed manifest); with watching active the check is skipped. the resolve
 # cache stamps each entry with the generation of the root build it resolved
-# against (`Root.gen`, a fresh never-reused value per successful build; 0 for a
+# against (`Root.gen`, a fresh value per successful build; 0 reserved for a
 # single-file resolve), so a build's teardown makes every entry from it
 # structurally unhittable — no entry survives its root's reload as a stale hit —
 # while a freed root's entries are evicted per-root rather than by clearing the
@@ -149,8 +149,8 @@ rec Cached {
 # man_mtime:      `mach.toml` mtime at the last load attempt, for the
 #                 conservative reload / retry check
 # lock_mtime:     `mach.lock` mtime at the last load attempt (0 when absent)
-# gen:            generation stamp of the current loaded build — a fresh, never-
-#                 reused value claimed on each successful load, 0 while unloaded;
+# gen:            generation stamp of the current loaded build — a fresh value
+#                 claimed on each successful load, 0 (reserved) while unloaded;
 #                 resolve cache entries carry it, so a reload or free makes the
 #                 prior build's entries unhittable and per-root evictable
 pub rec Root {
@@ -631,10 +631,12 @@ fun try_load(w: *Workspace, r: *Root) bool {
     ret true;
 }
 
-# next_gen: hand out a fresh, never-reused generation stamp. each successful
-# build claims one, so a cache entry's generation identifies its exact build and
-# a reloaded or freed root's stale entries can never match a later build.
+# next_gen: hand out a fresh generation stamp. each successful build claims one,
+# so a cache entry's generation identifies its exact build and a reloaded or
+# freed root's stale entries can never match a later build. 0 is the reserved
+# unloaded / single-file sentinel and is skipped if the sequence ever wraps.
 fun next_gen(w: *Workspace) u32 {
+    if (w.gen_seq == 0) { w.gen_seq = 1; }
     val g: u32 = w.gen_seq;
     w.gen_seq = w.gen_seq + 1;
     ret g;
