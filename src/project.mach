@@ -4,8 +4,10 @@
 # an empty dependency set, so any symbol imported through a `use` binds to
 # SYMBOL_NIL and go-to-definition / references / hover cannot reach it. this
 # module closes that gap: for each project root open in the session it loads a
-# module graph from disk through the compiler's own `driver.build_project`
-# (manifest + lockfile + the `dep/` tree), snapshots every loaded module's
+# module graph from disk through the compiler's own `driver.build_project_union`
+# (manifest + lockfile + the `dep/` tree — the union of every declared target's
+# import closure, so modules reachable only via a non-default target are present),
+# snapshots every loaded module's
 # public surface into a `res.ResolveDeps`, and re-resolves an open buffer
 # against that dep set with `res.resolve` directly — the lower-level API the
 # editor's `resolve` wraps.
@@ -20,9 +22,9 @@
 # under no `mach.toml` resolves single-file (empty dep set). the legacy "one
 # project per session" behaviour is just the one-Root case.
 #
-# module-id namespacing: `driver.build_project` allocates project-local module
-# ids from 0 and writes them into the session's global module registries, so a
-# second build over the same session clobbers the first there. those clobbered
+# module-id namespacing: `driver.build_project_union` allocates project-local
+# module ids from 0 and writes them into the session's global module registries,
+# so a second build over the same session clobbers the first there. those clobbered
 # registries are never read for a lookup — every cross-module lookup (site_of,
 # module_view, ...) reads the per-`Root` `driver.Project.modules` array, whose
 # ids are private to that project. the seam guarding that invariant is a
@@ -648,7 +650,9 @@ fun alloc_slot(w: *Workspace) *Root {
     ret ?w.roots[old_cap];
 }
 
-# try_load: run build_project for `r.path` and snapshot the dep set into `r`.
+# try_load: run build_project_union for `r.path` and snapshot the dep set into
+# `r` (the union of every declared target's closure, so cross-file features cover
+# modules reachable only via a non-default target).
 # the manifest / lockfile mtimes are recorded at the start of the attempt
 # whether it succeeds or fails, so maybe_reload retries a failed root once those
 # files change instead of pinning the failure for the session. a failure is
@@ -665,7 +669,7 @@ fun try_load(w: *Workspace, r: *Root) bool {
         ret false;
     }
 
-    val pr: Result[driver.Project, str] = driver.build_project(w.s, r.path, "");
+    val pr: Result[driver.Project, str] = driver.build_project_union(w.s, r.path);
     if (is_err[driver.Project, str](pr)) {
         report_load_failure(w, r.path, unwrap_err[driver.Project, str](pr));
         ret false;
