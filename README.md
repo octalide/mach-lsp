@@ -43,9 +43,9 @@ This server implements the **diagnostics** vertical slice plus the
 The server keeps a **per-root** map of project graphs: each open document is
 routed to the project root that governs its path (the nearest ancestor
 `mach.toml`), and that root's module graph is loaded from disk on first use
-(`mls.project` runs the compiler's own `driver.build_project` over the manifest
-and `dep/` tree, snapshotting every loaded module's exports into a dependency
-set). The buffer is then re-resolved against its root's dep set, so several
+(`mls.project` runs the compiler's own `driver.build_project_union` over the
+manifest and `dep/` tree — the union of every declared target's import closure —
+snapshotting every loaded module's exports into a dependency set). The buffer is then re-resolved against its root's dep set, so several
 projects open in one session resolve independently. A document that is a
 dependency module of another root — one already loaded (e.g. a dep source opened
 via go-to-definition), or the project whose manifest declares the document's own
@@ -95,21 +95,22 @@ the session's per-build registries, so a long-lived session with frequent saves
 does not grow without bound. Each reload still re-parses and re-resolves the
 whole closure; incremental (per-module) rebuild is an upstream follow-up.
 
-> **Module-id namespacing:** `driver.build_project` numbers modules from 0 and
-> writes them into the session's global module registries, so a second build
+> **Module-id namespacing:** `driver.build_project_union` numbers modules from 0
+> and writes them into the session's global module registries, so a second build
 > over the same session clobbers the first there. The server sidesteps this by
 > never reading those session registries — every cross-module lookup reads the
 > per-root `driver.Project.modules` array, whose ids are private to that project
 > — so several graphs coexist in one shared session (and one source map /
 > interner) without collision, and no per-root sessions are needed.
 
-> **Scope note:** each root's graph is the import-reachable module closure of the
-> manifest's default target (the compiler's own DFS load), so project files
-> outside that closure — secondary `bin` targets, modules nothing imports — are
-> still not in the graph: references cannot see their use-sites and rename
-> silently leaves them untouched. Loading every declared target per root would
-> need path-deduplicated multi-graph merging (to avoid duplicate edits for
-> modules shared between targets) and is deferred.
+> **Scope note:** each root's graph is the **union of every declared target's**
+> import closure (`driver.build_project_union`), so a module reachable only under
+> a non-default target's `$if` gate — a windows-only import while the host builds
+> for linux, say — is in the graph, and references / rename cover its use-sites
+> (modules are deduplicated by FQN, so one shared between targets yields no
+> duplicate locations or edits). The union resolves under the default target's
+> comptime context. A module reachable from no declared target at all — imported
+> by nothing — stays outside, having no entry to analyze it through.
 
 ## Building
 
