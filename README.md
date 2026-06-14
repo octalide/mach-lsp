@@ -108,9 +108,12 @@ whole closure; incremental (per-module) rebuild is an upstream follow-up.
 > a non-default target's `$if` gate — a windows-only import while the host builds
 > for linux, say — is in the graph, and references / rename cover its use-sites
 > (modules are deduplicated by FQN, so one shared between targets yields no
-> duplicate locations or edits). The union resolves under the default target's
-> comptime context. A module reachable from no declared target at all — imported
-> by nothing — stays outside, having no entry to analyze it through.
+> duplicate locations or edits). Two residual limits: resolution runs under the
+> **default** target's comptime context, so a use-site behind a *non-default*
+> target's `$if` *inside* a module is present but not in the resolve index until
+> per-target resolution lands upstream; and a module reachable from no declared
+> target at all — imported by nothing — stays outside, having no entry to
+> analyze it through.
 
 ## Building
 
