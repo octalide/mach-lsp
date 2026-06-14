@@ -659,7 +659,7 @@ fun alloc_slot(w: *Workspace) *Root {
 fun try_load(w: *Workspace, r: *Root) bool {
     record_mtimes(w, r);
 
-    val reg_r: Result[bool, str] = tgt.register_all(?w.s.interner);
+    val reg_r: Result[bool, str] = tgt.register_all(?w.s.registry);
     if (is_err[bool, str](reg_r)) {
         report_load_failure(w, r.path, unwrap_err[bool, str](reg_r));
         ret false;
