@@ -106,7 +106,7 @@ lockfile touch).
 ## Building
 
 The compiler and standard library are vendored under `dep/` as git dependencies.
-Build with a Mach compiler binary (v1.4.0 or newer):
+Build with a Mach compiler binary (v1.5.5 or newer):
 
 ```sh
 mach dep pull
@@ -120,8 +120,7 @@ The server binary is produced at `out/linux/debug/bin/mls`.
 `dep/mach` (id `mach`) provides the `mach.lang.*` namespace, including the
 `mach.lang.editor` query surface this server binds to; `dep/mach-std` (id
 `std`) provides `std.*`. Both are declared as git dependencies in `mach.toml`
-and fetched by `mach dep pull`; `mach-std` is pinned to `v0.6.0` and `mach`
-tracks `branch/main`.
+and fetched by `mach dep pull`; both track `branch/main`.
 
 ## Architecture
 
