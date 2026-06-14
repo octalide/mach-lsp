@@ -87,6 +87,14 @@ and retries a previously failed load once the manifest is fixed — but bare
 source edits are only picked up through a watch notification (or a manifest /
 lockfile touch).
 
+Reloads are **bounded**: one compiler session is reused for the whole editor
+session, and each rebuild follows the driver's reload contract — sources dedup
+by path (re-reading a root's closure reuses `FileId`s instead of growing the
+session source map) and `driver.dnit_project` frees the dropped graph and resets
+the session's per-build registries, so a long-lived session with frequent saves
+does not grow without bound. Each reload still re-parses and re-resolves the
+whole closure; incremental (per-module) rebuild is an upstream follow-up.
+
 > **Module-id namespacing:** `driver.build_project` numbers modules from 0 and
 > writes them into the session's global module registries, so a second build
 > over the same session clobbers the first there. The server sidesteps this by
