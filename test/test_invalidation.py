@@ -215,6 +215,46 @@ def reload_rebinds_cached_resolve():
     return failures
 
 
+def reload_repeats_stay_correct():
+    """the reload contract is per-save and long-lived: one Session is reused
+    across every rebuild (build_project -> dnit_project -> rebuild), with sources
+    deduped by path so the SourceMap does not grow (#55). drive many successive
+    edit+reload rounds on one session and assert each serves the freshly shifted
+    declaration — exercising the dnit_project/rebuild cycle repeatedly, which a
+    teardown that corrupted or leaked the session across reloads would fail."""
+    proj, app, lib = _scratch_project()
+    app_uri = file_uri(app)
+    lib_uri = file_uri(lib)
+    rounds = 5
+    failures = []
+    srv = LiveServer()
+    try:
+        srv.send(req(1, "initialize", {"capabilities": {}}))
+        srv.recv_id(1)
+        srv.send(notify("initialized"))
+        srv.send(did_open(app_uri, open(app).read()))
+
+        uri0, line0 = _definition_line(srv, app_uri, 20)
+        if uri0 != lib_uri or line0 != DECL_LINE:
+            failures.append(f"definition(shared) before reloads: uri {uri0} line {line0}, expected {lib_uri} line {DECL_LINE}")
+
+        for i in range(rounds):
+            _shift_decl(lib)
+            srv.send(notify("workspace/didChangeWatchedFiles",
+                            {"changes": [{"uri": lib_uri, "type": 2}]}))
+            want = DECL_LINE + SHIFT * (i + 1)
+            uri, line = _definition_line(srv, app_uri, 100 + i)
+            if uri != lib_uri or line != want:
+                failures.append(f"definition(shared) after reload {i + 1}/{rounds}: uri {uri} line {line}, expected {lib_uri} line {want}")
+
+        srv.send(req(2, "shutdown", None))
+        srv.send(notify("exit"))
+    finally:
+        srv.close()
+        shutil.rmtree(proj, ignore_errors=True)
+    return failures
+
+
 def run():
     """drive the invalidation scenarios; return a list of failure strings."""
     if not os.path.exists(os.path.join(WS, "src", "app.mach")):
@@ -224,6 +264,7 @@ def run():
     failures += mtime_fallback_trigger()
     failures += broken_manifest_recovers()
     failures += reload_rebinds_cached_resolve()
+    failures += reload_repeats_stay_correct()
     return failures
 
 
