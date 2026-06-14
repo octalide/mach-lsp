@@ -27,7 +27,7 @@ opt = 2
 
 [deps.mach-std]
 git = "https://github.com/octalide/mach-std"
-ref = "v0.6.0"
+ref = "branch/main"
 
 [deps.mach]
 git = "https://github.com/octalide/mach"
