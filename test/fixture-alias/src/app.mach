@@ -1,14 +1,17 @@
 # aliased-import member resolution fixture (#75): `use strmod: std.types.string;`
-# binds the std string module under an alias, and `strmod.str_len` is a
-# qualified member access whose go-to-definition must reach str_len's
-# declaration inside dep/mach-std.
+# binds the std string module under an alias, and a qualified member access must
+# reach the member's declaration inside dep/mach-std. covers the three distinct
+# resolution paths: a function member (`strmod.str_len`, via expr_resolved), a
+# type member (`strmod.str`, via type_resolved), and a value member (`bln.true`).
 
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.bool.bool;
 
 use strmod: std.types.string;
+use bln:    std.types.bool;
 
-# length: calls the aliased module's str_len via qualified member access.
+# length: calls the aliased module's str_len via a qualified member access.
 fun length(s: str) usize {
     ret strmod.str_len(s);
 }
@@ -17,4 +20,15 @@ fun length(s: str) usize {
 # one in-buffer occurrence.
 fun twice(s: str) usize {
     ret strmod.str_len(s) + strmod.str_len(s);
+}
+
+# typed: references the aliased module's pub type `str` as a qualified type
+# member (the type_resolved path) in the parameter position.
+fun typed(s: strmod.str) usize {
+    ret strmod.str_len(s);
+}
+
+# flag: references the aliased bool module's `true` value as a value member.
+fun flag() bool {
+    ret bln.true;
 }
