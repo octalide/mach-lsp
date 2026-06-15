@@ -10,6 +10,7 @@ import sys
 import test_diagnostics
 import test_features
 import test_crossmodule
+import test_alias
 import test_workspace
 import test_multiroot
 import test_invalidation
@@ -20,6 +21,7 @@ SUITES = [
     ("diagnostics", test_diagnostics.run),
     ("features", test_features.run),
     ("crossmodule", test_crossmodule.run),
+    ("alias", test_alias.run),
     ("workspace", test_workspace.run),
     ("multiroot", test_multiroot.run),
     ("invalidation", test_invalidation.run),
