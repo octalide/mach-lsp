@@ -1,0 +1,20 @@
+# aliased-import member resolution fixture (#75): `use strmod: std.types.string;`
+# binds the std string module under an alias, and `strmod.str_len` is a
+# qualified member access whose go-to-definition must reach str_len's
+# declaration inside dep/mach-std.
+
+use std.types.size.usize;
+use std.types.string.str;
+
+use strmod: std.types.string;
+
+# length: calls the aliased module's str_len via qualified member access.
+fun length(s: str) usize {
+    ret strmod.str_len(s);
+}
+
+# twice: a second use-site of the aliased member, so references finds more than
+# one in-buffer occurrence.
+fun twice(s: str) usize {
+    ret strmod.str_len(s) + strmod.str_len(s);
+}
