@@ -1,0 +1,6 @@
+# api: mid's outer-facing module, imported by the `outer` project. it does not
+# import `leaf`, so `outer`'s closure can include it without pulling the nested
+# leaf dependency that `outer` never declares.
+pub fun a_thing() i64 {
+    ret 7;
+}

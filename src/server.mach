@@ -35,6 +35,7 @@ use json:      mls.json;
 use documents: mls.documents;
 use diagnostics: mls.diagnostics;
 use language:  mls.language;
+use project:   mls.project;
 use trace:     mls.trace;
 
 # lifecycle statuses.
@@ -45,19 +46,24 @@ pub val STATUS_EXITED:        u8 = 3;
 
 # Server: the long-lived server state.
 # ---
-# status:    current lifecycle phase
-# exit_code: process exit code to return from `run`
-# alloc:     allocator backing all server-owned memory
-# s:         compiler session (SourceMap + DiagList)
-# es:        editor session over `s` (per-buffer analysis)
-# docs:      URI -> editor buffer registry
+# status:        current lifecycle phase
+# exit_code:     process exit code to return from `run`
+# alloc:         allocator backing all server-owned memory
+# s:             compiler session (SourceMap + DiagList)
+# es:            editor session over `s` (per-buffer analysis)
+# docs:          URI -> editor buffer registry
+# ws:            per-root project graphs backing cross-module analysis
+# watch_dynamic: whether the client supports dynamic file-watch registration
+#                (`workspace/didChangeWatchedFiles`), advertised at initialize
 pub rec Server {
-    status:    u8;
-    exit_code: i64;
-    alloc:     *Allocator;
-    s:         sess.Session;
-    es:        editor.EditorSession;
-    docs:      documents.Store;
+    status:        u8;
+    exit_code:     i64;
+    alloc:         *Allocator;
+    s:             sess.Session;
+    es:            editor.EditorSession;
+    docs:          documents.Store;
+    ws:            project.Workspace;
+    watch_dynamic: bool;
 }
 
 # init: build a server over the given allocator.
@@ -69,6 +75,7 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
     srv.status = STATUS_UNINITIALIZED;
     srv.exit_code = 0;
     srv.alloc = alloc;
+    srv.watch_dynamic = false;
 
     val sr: Result[sess.Session, str] = sess.init(alloc);
     if (is_err[sess.Session, str](sr)) { ret false; }
@@ -76,6 +83,7 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
 
     srv.es = editor.init(?srv.s);
     srv.docs = documents.init(?srv.es, alloc);
+    srv.ws = project.init(?srv.s, ?srv.es, alloc);
     ret true;
 }
 
@@ -84,6 +92,7 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
 # srv: server to tear down
 pub fun dnit(srv: *Server) {
     documents.dnit(?srv.docs);
+    project.dnit(?srv.ws);
     editor.dnit(?srv.es);
     sess.dnit(?srv.s);
     srv.status = STATUS_EXITED;
@@ -135,6 +144,7 @@ fun dispatch(srv: *Server, msg: *transport.Message) {
     }
     if (str_equals(method, "initialized")) {
         json.free_str(method, srv.alloc);
+        handle_initialized(srv);
         ret;
     }
     if (str_equals(method, "shutdown")) {
@@ -171,6 +181,15 @@ fun dispatch(srv: *Server, msg: *transport.Message) {
     }
     if (str_equals(method, "textDocument/didSave")) {
         json.free_str(method, srv.alloc);
+        ret;
+    }
+    if (str_equals(method, "workspace/didChangeConfiguration")) {
+        json.free_str(method, srv.alloc);
+        ret;
+    }
+    if (str_equals(method, "workspace/didChangeWatchedFiles")) {
+        json.free_str(method, srv.alloc);
+        handle_did_change_watched_files(srv, body);
         ret;
     }
 
@@ -223,6 +242,10 @@ fun handle_initialize(srv: *Server, body: str) {
     val id: str = json.extract_raw(body, "\"id\"", srv.alloc);
     if (id == nil) { ret; }
 
+    # remember whether the client can accept a dynamic watch registration, so
+    # `initialized` only sends one when it will be honoured.
+    srv.watch_dynamic = json.extract_bool_after(body, "\"didChangeWatchedFiles\"", "\"dynamicRegistration\"", srv.alloc);
+
     val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
     val result: str = ",\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\"}}}";
     send_concat2(srv, prefix, id, result);
@@ -230,6 +253,34 @@ fun handle_initialize(srv: *Server, body: str) {
 
     srv.status = STATUS_RUNNING;
     trace.log("initialized\n");
+}
+
+# handle_initialized: once the client signals it is ready, register file
+# watchers for the manifest, lockfile, and source trees so a dep-graph change
+# (pulling deps, editing a dep source) triggers `workspace/didChangeWatchedFiles`
+# and the affected project root is rebuilt. only sent when the client advertised
+# dynamic registration; clients without it fall back to the server's mtime check.
+fun handle_initialized(srv: *Server) {
+    if (!srv.watch_dynamic) { ret; }
+    val reg: str = "{\"jsonrpc\":\"2.0\",\"id\":\"mls/registerWatchers\",\"method\":\"client/registerCapability\",\"params\":{\"registrations\":[{\"id\":\"mls-watched-files\",\"method\":\"workspace/didChangeWatchedFiles\",\"registerOptions\":{\"watchers\":[{\"globPattern\":\"**/mach.toml\"},{\"globPattern\":\"**/mach.lock\"},{\"globPattern\":\"**/*.mach\"}]}}]}}";
+    transport.send_message(reg, srv.alloc);
+    # the watcher now covers manifest / lockfile changes; skip the per-request
+    # mtime fallback check.
+    project.set_watch_active(?srv.ws, true);
+}
+
+# handle_did_change_watched_files: invalidate every project root whose tree
+# contains a changed file, so the next request rebuilds it from disk. each
+# `uri` in the notification's `changes` array is invalidated in turn.
+fun handle_did_change_watched_files(srv: *Server, body: str) {
+    var i: u32 = 0;
+    for (true) {
+        val uri: str = json.extract_string_seq(body, "\"uri\"", i, srv.alloc);
+        if (uri == nil) { brk; }
+        project.invalidate_uri(?srv.ws, uri);
+        json.free_str(uri, srv.alloc);
+        i = i + 1;
+    }
 }
 
 # handle_shutdown: acknowledge a shutdown request and enter the shutting-down phase.
@@ -279,10 +330,13 @@ fun handle_did_change(srv: *Server, body: str) {
     json.free_str(uri, srv.alloc);
 }
 
-# handle_did_close: retire the document and clear its diagnostics.
+# handle_did_close: retire the document, reclaim its cached resolve result, and
+# clear its diagnostics.
 fun handle_did_close(srv: *Server, body: str) {
     val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
     if (uri == nil) { ret; }
+    val doc: *documents.Document = documents.find(?srv.docs, uri);
+    if (doc != nil) { project.free_cached(?srv.ws, doc.file_id); }
     documents.close(?srv.docs, uri);
     diagnostics.clear(srv.alloc, uri);
     json.free_str(uri, srv.alloc);
@@ -297,13 +351,13 @@ fun handle_did_close(srv: *Server, body: str) {
 fun handle_feature(srv: *Server, body: str, which: i64) {
     val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
 
-    if (which == 0) { language.hover(?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 1) { language.definition(?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 2) { language.references(?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 3) { language.rename(?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 4) { language.prepare_rename(?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 5) { language.document_symbol(?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 6) { language.completion(?srv.es, ?srv.s, srv.alloc, ?srv.docs, body, uri); }
+    if (which == 0) { language.hover(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 1) { language.definition(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 2) { language.references(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 3) { language.rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 4) { language.prepare_rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 5) { language.document_symbol(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 6) { language.completion(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
 
     if (uri != nil) { json.free_str(uri, srv.alloc); }
 }
@@ -322,7 +376,7 @@ fun publish_for(srv: *Server, uri: str, text: str, is_open: bool) {
         ret;
     }
     val doc: *documents.Document = unwrap_ok[*documents.Document, str](dr);
-    diagnostics.publish(?srv.es, ?srv.s, srv.alloc, uri, doc.file_id);
+    diagnostics.publish(?srv.es, project.sources(?srv.ws), srv.alloc, uri, doc.file_id);
 }
 
 # reply_error: send a JSON-RPC error response for a request that carries an id;

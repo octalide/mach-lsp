@@ -1,0 +1,6 @@
+# lib: the innermost dependency's module. opened cold — before any project
+# document — it must route read-only to the project that vendors it, never
+# become its own renameable project.
+pub fun b_thing() i64 {
+    ret 9;
+}

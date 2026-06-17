@@ -22,6 +22,7 @@ use std.types.bool.true;
 use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 use std.types.option.Option;
 use std.types.option.some;
 use std.types.option.none;
@@ -29,6 +30,7 @@ use std.types.option.is_some;
 use std.types.option.unwrap;
 
 use sess:   mach.lang.session;
+use src:    mach.lang.source;
 use intern: mach.lang.intern;
 use token:  mach.lang.fe.token;
 use ast:    mach.lang.fe.ast;
@@ -225,6 +227,53 @@ pub fun symbol_is_local(rr: *res.ResolveResult, own: sess.ModuleId, sid: res.Sym
     ret sym.origin == own;
 }
 
+# symbol_by_decl: the SymbolId in `rr` whose declaration is the module-scoped
+# pair (origin, decl) — the identity the same logical symbol shares across every
+# module's resolve result, since an imported reference copies its referent's
+# origin ModuleId and DeclId. lets the workspace-wide references / rename walk
+# find a module's own id for a symbol declared elsewhere. param / generic
+# bindings (whose decl is their owning function) are skipped so a module-scope
+# decl resolves to its declaration, not one of its parameters. SYMBOL_NIL when
+# no symbol in `rr` resolves to that declaration.
+# ---
+# rr:     the module's resolve side tables
+# origin: ModuleId owning the declaration
+# decl:   DeclId of the declaration in `origin`'s Ast
+# ret:    the local SymbolId, or SYMBOL_NIL
+pub fun symbol_by_decl(rr: *res.ResolveResult, origin: sess.ModuleId, decl: id.DeclId) res.SymbolId {
+    if (decl == id.DECL_NIL) { ret res.SYMBOL_NIL; }
+    var i: u32 = 0;
+    for (i < rr.symbol_count) {
+        val sym: *res.Symbol = ?rr.symbols[i];
+        if (sym.kind != res.SYM_PARAM && sym.kind != res.SYM_GENERIC
+            && sym.decl == decl && sym.origin == origin) { ret i::res.SymbolId; }
+        i = i + 1;
+    }
+    ret res.SYMBOL_NIL;
+}
+
+# export_decl_of: the DeclId of the pub symbol in `rr` named `name` with kind
+# `kind`, or DECL_NIL. translates a buffer-local pub declaration to the canonical
+# (origin, decl) identity in the on-disk module the buffer mirrors, so the
+# workspace walk can locate importers of that symbol. pub symbols occupy the
+# front of the table ([0, pub_count)); a non-pub symbol has no cross-file
+# use-sites and yields DECL_NIL.
+# ---
+# rr:   the on-disk module's resolve side tables
+# name: interned identifier of the declaration
+# kind: the declaration's symbol kind
+# ret:  the declaration's DeclId, or DECL_NIL
+pub fun export_decl_of(rr: *res.ResolveResult, name: intern.StrId, kind: res.SymKind) id.DeclId {
+    if (name == intern.STR_NIL) { ret id.DECL_NIL; }
+    var i: u32 = 0;
+    for (i < rr.pub_count) {
+        val sym: *res.Symbol = ?rr.symbols[i];
+        if (sym.name == name && sym.kind == kind && sym.decl != id.DECL_NIL) { ret sym.decl; }
+        i = i + 1;
+    }
+    ret id.DECL_NIL;
+}
+
 # top_level_count: the number of declarations at the buffer's module scope —
 # the count documentSymbol enumerates. zero when the Ast has no root module.
 # ---
@@ -377,6 +426,56 @@ fun param_signature_span(a: *ast.Ast, sym: *res.Symbol) Option[token.Span] {
     ret some[token.Span](sp);
 }
 
+# doc_comment_span: the byte span of the contiguous run of `#` comment lines
+# immediately above a local symbol's declaration — its doc comment. the lexer
+# discards comment tokens, so this back-scans the file's line index the way
+# `mach doc` scans raw text: from the decl's line it walks backward over
+# comment lines (tolerating leading whitespace before the `#`), stopping at
+# the first non-comment line. none for a param / generic, a decl with no
+# comment run flush above it, or a decl on the first line.
+# ---
+# a:    the Ast owning the decl
+# sym:  the symbol whose doc comment is wanted
+# file: the source file owning the decl
+# ret:  some(span) covering the comment run (its line endings included), or none
+pub fun doc_comment_span(a: *ast.Ast, sym: *res.Symbol, file: *src.SourceFile) Option[token.Span] {
+    if (sym.kind == res.SYM_PARAM || sym.kind == res.SYM_GENERIC) { ret none[token.Span](); }
+    val dso: Option[token.Span] = decl_span_of(a, sym);
+    if (!is_some[token.Span](dso)) { ret none[token.Span](); }
+    val decl_line: usize = src.position(file, unwrap[token.Span](dso).offset).line;
+
+    var first: usize = decl_line;
+    for (first > 1 && comment_line(file, first - 1)) { first = first - 1; }
+    if (first == decl_line) { ret none[token.Span](); }
+
+    val so: Option[usize] = src.line_start(file, first);
+    val eo: Option[usize] = src.line_start(file, decl_line);
+    if (!is_some[usize](so) || !is_some[usize](eo)) { ret none[token.Span](); }
+
+    var sp: token.Span;
+    sp.offset = unwrap[usize](so);
+    sp.len    = unwrap[usize](eo) - sp.offset;
+    ret some[token.Span](sp);
+}
+
+# first_nonspace: index of the first non-space, non-tab byte in `s` at or after
+# `pos`, clamped to `end`. shared by the doc-comment scan and its renderer.
+pub fun first_nonspace(s: *u8, pos: usize, end: usize) usize {
+    var i: usize = pos;
+    for (i < end && (s[i] == ' ' || s[i] == '\t')) { i = i + 1; }
+    ret i;
+}
+
+# comment_line: true when the 1-based `line`'s first significant byte is `#`.
+fun comment_line(file: *src.SourceFile, line: usize) bool {
+    val bo: Option[src.LineSpan] = src.line_bounds(file, line);
+    if (!is_some[src.LineSpan](bo)) { ret false; }
+    val lb: src.LineSpan = unwrap[src.LineSpan](bo);
+    val s: *u8 = file.text::*u8;
+    val i: usize = first_nonspace(s, lb.start, lb.end);
+    ret i < lb.end && s[i] == '#';
+}
+
 # kind_label: a human-readable label for a symbol kind, for hover rendering.
 # ---
 # kind: a res.SYM_* value
@@ -480,6 +579,8 @@ pub fun type_ref_span(a: *ast.Ast, rr: *res.ResolveResult, tid: id.TypeId, targe
 # ret: true when the symbol is a top-level completion candidate
 pub fun completion_candidate(rr: *res.ResolveResult, sid: res.SymbolId) bool {
     if (sid >= rr.symbol_count) { ret false; }
+    # resolver can emit count > 0 with a nil table on malformed input
+    if (rr.symbols == nil) { ret false; }
     val sym: *res.Symbol = ?rr.symbols[sid];
     if (sym.name == intern.STR_NIL) { ret false; }
     if (sym.kind == res.SYM_PARAM)   { ret false; }
@@ -504,6 +605,78 @@ pub fun decl_ref_span(a: *ast.Ast, rr: *res.ResolveResult, did: id.DeclId, targe
     val d_opt: Option[*decl.Decl] = ast.get_decl(a, did);
     if (!is_some[*decl.Decl](d_opt)) { ret none[token.Span](); }
     ret decl_name_span(unwrap[*decl.Decl](d_opt));
+}
+
+# import_leaf_span: the byte span of the final dotted segment of import `path`
+# (the leaf component that names the imported symbol), or the whole span for a
+# single-segment path. mirrors the resolver's own leaf computation so a
+# cross-file rename can rewrite an imported name inside a `use` / `fwd` path
+# without touching its module prefix or an alias.
+# ---
+# file: the source file backing the path span
+# path: byte span covering the dotted import path
+# ret:  the leaf segment span
+pub fun import_leaf_span(file: *src.SourceFile, path: token.Span) token.Span {
+    val s: *u8 = file.text::*u8;
+    val start: usize = path.offset;
+    val end:   usize = path.offset + path.len;
+    var dot:   usize = start;
+    var found: bool  = false;
+    var i:     usize = start;
+    for (i < end) {
+        if (s[i] == '.') { dot = i; found = true; }
+        i = i + 1;
+    }
+    var out: token.Span;
+    if (!found) { out.offset = path.offset; out.len = path.len; ret out; }
+    out.offset = dot + 1;
+    out.len    = end - (dot + 1);
+    ret out;
+}
+
+# import_ref_span: the leaf-name span of import decl `did` (a `use` or `fwd`)
+# when it imports `target`, or none. the resolver binds a single-symbol import
+# under the path's leaf and records the imported symbol in `decl_symbol`, but
+# `decl_name_span` has no name for an import decl, so this recovers the leaf the
+# references / rename walk must include to keep an importer compiling.
+# ---
+# a:      the Ast holding the decl
+# rr:     the ResolveResult side tables
+# did:    decl id to test
+# target: the symbol the import must bind
+# file:   the source file backing the import path
+# ret:    some(leaf span) when did imports target, or none
+pub fun import_ref_span(a: *ast.Ast, rr: *res.ResolveResult, did: id.DeclId, target: res.SymbolId, file: *src.SourceFile) Option[token.Span] {
+    if (rr.decl_symbol == nil || did::u32 >= rr.decl_count) { ret none[token.Span](); }
+    if (rr.decl_symbol[did] != target) { ret none[token.Span](); }
+    val d_opt: Option[*decl.Decl] = ast.get_decl(a, did);
+    if (!is_some[*decl.Decl](d_opt)) { ret none[token.Span](); }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+    if (d.kind == decl.DECL_KIND_USE) { ret some[token.Span](import_leaf_span(file, d.data.use_.path)); }
+    if (d.kind == decl.DECL_KIND_FWD) { ret some[token.Span](import_leaf_span(file, d.data.fwd_.path)); }
+    ret none[token.Span]();
+}
+
+# span_text_equals: true when the bytes of `span` in `file` exactly equal the
+# identifier `name`. the rename walk guards body references with it so a symbol
+# bound under an alias — whose references are spelled with the alias, not the
+# declared name — is not rewritten when the declaration is renamed.
+# ---
+# file: the source file backing the span
+# span: byte span to compare
+# name: identifier text to match
+# ret:  true on an exact byte match
+pub fun span_text_equals(file: *src.SourceFile, span: token.Span, name: str) bool {
+    if (name == nil) { ret false; }
+    val nlen: usize = str_len(name);
+    if (span.len != nlen) { ret false; }
+    val s: *u8 = file.text::*u8;
+    var i: usize = 0;
+    for (i < nlen) {
+        if (s[span.offset + i] != name[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 # name_span_of_expr: the span identifying an expression's referenced name. for

@@ -3,7 +3,7 @@
 # the diagnostics vertical slice end-to-end: feed a document's buffer to the
 # editor surface (`editor.diagnostics`), translate every reported
 # `diagnostic.Diagnostic` into an LSP `Diagnostic` — mapping its byte `span`
-# through `source.position` to a 0-based line/character range and its severity
+# through `positions.range_of` to a 0-based UTF-16 range and its severity
 # to the LSP scale — and emit a `textDocument/publishDiagnostics` notification.
 # clearing is the same notification with an empty array.
 
@@ -24,13 +24,13 @@ use std.allocator.deallocate;
 
 use mem: std.memory;
 
-use sess:   mach.lang.session;
 use src:    mach.lang.source;
 use diag:   mach.lang.diagnostic;
 use editor: mach.lang.editor;
 
 use transport: mls.transport;
 use json:      mls.json;
+use positions: mls.positions;
 
 # LSP diagnostic severities (1 = Error … 4 = Hint).
 val LSP_ERROR:   i64 = 1;
@@ -43,12 +43,12 @@ val MAX_DIAGNOSTICS: usize = 200;
 
 # publish: analyze `uri`'s buffer and send its current diagnostics.
 # ---
-# es:    editor session holding the buffer
-# s:     compiler session whose SourceMap resolves spans to positions
-# alloc: allocator for the message buffers
-# uri:   document URI to report on
-# fid:   editor FileId of the document's buffer
-pub fun publish(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, uri: str, fid: src.FileId) {
+# es:      editor session holding the buffer
+# sources: source map whose SourceFiles resolve spans to positions
+# alloc:   allocator for the message buffers
+# uri:     document URI to report on
+# fid:     editor FileId of the document's buffer
+pub fun publish(es: *editor.EditorSession, sources: *src.SourceMap, alloc: *Allocator, uri: str, fid: src.FileId) {
     val dr: Result[*diag.DiagList, str] = editor.diagnostics(es, fid);
     if (is_err[*diag.DiagList, str](dr)) {
         clear(alloc, uri);
@@ -79,7 +79,7 @@ pub fun publish(es: *editor.EditorSession, s: *sess.Session, alloc: *Allocator, 
         var i: usize = 0;
         for (i < count) {
             val d: *diag.Diagnostic = ?list.items[i];
-            entries[entry_count] = build_entry(s, d, alloc);
+            entries[entry_count] = build_entry(sources, d, alloc);
             entry_count = entry_count + 1;
             i = i + 1;
         }
@@ -152,26 +152,21 @@ pub fun clear(alloc: *Allocator, uri: str) {
 }
 
 # build_entry: render one diagnostic as an LSP Diagnostic JSON object, resolving
-# its span to a 0-based range against the session source map.
-fun build_entry(s: *sess.Session, d: *diag.Diagnostic, alloc: *Allocator) str {
+# its span to a 0-based range against the source map.
+fun build_entry(sources: *src.SourceMap, d: *diag.Diagnostic, alloc: *Allocator) str {
     var start_line: usize = 0;
     var start_char: usize = 0;
     var end_line: usize = 0;
     var end_char: usize = 0;
 
-    val so: Option[*src.SourceFile] = src.get(?s.sources, d.file_id);
+    val so: Option[*src.SourceFile] = src.get(sources, d.file_id);
     if (is_some[*src.SourceFile](so)) {
         val sf: *src.SourceFile = unwrap[*src.SourceFile](so);
-        val sp: src.Position = src.position(sf, d.span.offset);
-        start_line = dec(sp.line);
-        start_char = dec(sp.col);
-
-        var end_off: usize = d.span.offset + d.span.len;
-        if (d.span.len == 0) { end_off = d.span.offset; }
-        val ep: src.Position = src.position(sf, end_off);
-        end_line = dec(ep.line);
-        end_char = dec(ep.col);
-        if (end_line == start_line && end_char < start_char) { end_char = start_char; }
+        val r: positions.LspRange = positions.range_of(sf, d.span);
+        start_line = r.start_line;
+        start_char = r.start_char;
+        end_line = r.end_line;
+        end_char = r.end_char;
     }
 
     val severity: i64 = map_severity(d.severity);
@@ -236,12 +231,6 @@ fun build_diagnostic_json(
 
     free_parts(sl, sc, el, ec, sev, qmsg, alloc);
     ret buf::str;
-}
-
-# dec: clamp `n - 1` at 0 (1-based compiler position -> 0-based LSP position).
-fun dec(n: usize) usize {
-    if (n == 0) { ret 0; }
-    ret n - 1;
 }
 
 # slen: length of `s`, treating nil as 0.

@@ -1,0 +1,23 @@
+# fixture project for the aliased-import member go-to-definition test (#75). it
+# depends on the repo's vendored mach-std (reached via `dep = "../../dep"`) so
+# the language server can resolve a module-alias qualified member to its
+# declaration on disk. it is read by the server's own build_project, never by
+# the installed `mach` toolchain.
+[project]
+id      = "aliasfix"
+version = "0.0.0"
+src     = "src"
+dep     = "../../dep"
+target  = "native"
+
+[target.linux]
+isa = "x86_64"
+os  = "linux"
+abi = "sysv64"
+
+[bin.aliasfix]
+entry = "app.mach"
+
+[deps.mach-std]
+git = "https://github.com/octalide/mach-std"
+ref = "v0.6.0"

@@ -1,0 +1,8 @@
+# app: the entry module; imports lib.shared (used twice) and lib.LIMIT, so
+# workspace references / rename on either reach both this file and lib.mach.
+use wsfix.lib.shared;
+use wsfix.lib.LIMIT;
+
+fun main() i64 {
+    ret shared(1) + shared(2) + LIMIT;
+}

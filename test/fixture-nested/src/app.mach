@@ -1,0 +1,8 @@
+# entry module of the `outer` project: imports mid.api so the project's graph
+# closes over the nested dependency's outer-facing module, but not over mid's
+# leaf-importing modules (which `outer` does not declare a path to).
+use mid.api.a_thing;
+
+fun use_a() i64 {
+    ret a_thing();
+}
