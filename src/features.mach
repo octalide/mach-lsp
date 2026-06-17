@@ -579,6 +579,8 @@ pub fun type_ref_span(a: *ast.Ast, rr: *res.ResolveResult, tid: id.TypeId, targe
 # ret: true when the symbol is a top-level completion candidate
 pub fun completion_candidate(rr: *res.ResolveResult, sid: res.SymbolId) bool {
     if (sid >= rr.symbol_count) { ret false; }
+    # resolver can emit count > 0 with a nil table on malformed input
+    if (rr.symbols == nil) { ret false; }
     val sym: *res.Symbol = ?rr.symbols[sid];
     if (sym.name == intern.STR_NIL) { ret false; }
     if (sym.kind == res.SYM_PARAM)   { ret false; }

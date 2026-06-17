@@ -1112,6 +1112,9 @@ fun decl_lsp_kind(kind: decl.DeclKind) i64 {
 # deduped by spelling so a name declared once appears once. takes ownership of
 # `id_raw` and frees it.
 fun emit_completions(an: Analyzed, alloc: *Allocator, id_raw: str) {
+    # resolver can emit symbol_count > 0 with a nil table on malformed input
+    if (an.rr.symbols == nil) { reply_empty_array(alloc, id_raw); ret; }
+
     val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
     val mid:    str = ",\"result\":{\"isIncomplete\":false,\"items\":[";
     val suffix: str = "]}}";
