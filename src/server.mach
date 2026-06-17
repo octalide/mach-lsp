@@ -183,6 +183,10 @@ fun dispatch(srv: *Server, msg: *transport.Message) {
         json.free_str(method, srv.alloc);
         ret;
     }
+    if (str_equals(method, "workspace/didChangeConfiguration")) {
+        json.free_str(method, srv.alloc);
+        ret;
+    }
     if (str_equals(method, "workspace/didChangeWatchedFiles")) {
         json.free_str(method, srv.alloc);
         handle_did_change_watched_files(srv, body);
