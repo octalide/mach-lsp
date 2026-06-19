@@ -412,6 +412,30 @@ pub fun root_for(w: *Workspace, uri: str) *Root {
     ret load_root(w, doc_root);
 }
 
+# load_workspace_root: eagerly load the project governing the workspace root
+# directory at `dir_uri`, so the slow whole-closure graph build happens once at
+# startup off the request path rather than lazily on the first cross-module
+# feature request (the freeze of #79). finds the nearest project root at or above
+# the directory and, when it is not already tracked, builds it through the same
+# `load_root` path a first request would take, so a later request find_roots the
+# warmed slot instead of rebuilding it. best-effort: a load failure is reported
+# from within try_load and left as a remembered failed slot, exactly as a lazy
+# load's would be. a no-op when the URI is non-file, the directory lies outside
+# any project (single-file mode), or the root is already tracked.
+# ---
+# w:       the workspace
+# dir_uri: the workspace root directory's `file://` URI
+pub fun load_workspace_root(w: *Workspace, dir_uri: str) {
+    if (dir_uri == nil) { ret; }
+    val dir: str = uri_to_path(w.alloc, dir_uri);
+    if (dir == nil) { ret; }
+    val root: str = project_root_at(w.alloc, dir);
+    strutil.str_free(w.alloc, dir);
+    if (root == nil) { ret; }
+    if (find_root(w, root) != nil) { strutil.str_free(w.alloc, root); ret; }
+    load_root(w, root);
+}
+
 # ancestor_root: load-and-prefer the outermost project that vendors the document
 # at `uri` (whose own fresh root is `doc_root`) and whose loaded graph holds it.
 # walks the chain of ancestor manifest dirs strictly above `dir` (`doc_root` on
@@ -1348,6 +1372,40 @@ fun project_root_for(alloc: *Allocator, file_path: str) str {
         }
         strutil.str_free(alloc, dir);
         dir = up;
+    }
+    ret nil;
+}
+
+# project_root_at: the nearest directory at or above `dir` that holds a
+# `mach.toml`, as an owned string, or nil when none exists. unlike
+# `project_root_for` — which treats its argument as a file and begins the search
+# at its parent — this checks `dir` itself first, so a workspace-root directory
+# whose own `mach.toml` roots the project is found (the eager-load entry takes a
+# directory URI, not a file). walks up to the filesystem root with `path.parent`
+# / `path.join`.
+fun project_root_at(alloc: *Allocator, dir: str) str {
+    val dup_r: Result[str, str] = strutil.str_dup(alloc, dir);
+    if (is_err[str, str](dup_r)) { ret nil; }
+    var cur: str = unwrap_ok[str, str](dup_r);
+
+    for (true) {
+        val cand_r: Result[pathlib.Path, str] = pathlib.join(alloc, cur, "mach.toml");
+        if (is_err[pathlib.Path, str](cand_r)) { strutil.str_free(alloc, cur); ret nil; }
+        val cand: str = unwrap_ok[pathlib.Path, str](cand_r);
+        val found: bool = fs.is_file(cand);
+        strutil.str_free(alloc, cand);
+        if (found) { ret cur; }
+
+        val up_r: Result[pathlib.Path, str] = pathlib.parent(alloc, cur);
+        if (is_err[pathlib.Path, str](up_r)) { strutil.str_free(alloc, cur); ret nil; }
+        val up: str = unwrap_ok[pathlib.Path, str](up_r);
+        if (str_equals(up, cur)) {
+            strutil.str_free(alloc, up);
+            strutil.str_free(alloc, cur);
+            ret nil;
+        }
+        strutil.str_free(alloc, cur);
+        cur = up;
     }
     ret nil;
 }
