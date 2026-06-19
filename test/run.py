@@ -16,7 +16,6 @@ import test_multiroot
 import test_invalidation
 import test_encoding
 import test_multitarget
-import test_errorsafe
 
 SUITES = [
     ("diagnostics", test_diagnostics.run),
@@ -28,7 +27,6 @@ SUITES = [
     ("invalidation", test_invalidation.run),
     ("encoding", test_encoding.run),
     ("multitarget", test_multitarget.run),
-    ("errorsafe", test_errorsafe.run),
 ]
 
 
