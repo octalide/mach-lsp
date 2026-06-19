@@ -162,6 +162,32 @@ class LiveServer:
                 return None
             self.buf += chunk
 
+    def collect_until(self, want_id, timeout=60):
+        """read and return every message up to and including the response with id
+        `want_id` — server-initiated requests ($/progress, workDoneProgress/create)
+        and notifications included, in arrival order — or the messages seen so far
+        on timeout. lets a scenario observe what the server emits around a request
+        rather than discarding it like recv_id."""
+        out = []
+        deadline = time.time() + timeout
+        while True:
+            msg = self._pop()
+            if msg is not None:
+                out.append(msg)
+                if msg.get("id") == want_id:
+                    return out
+                continue
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return out
+            r, _, _ = select.select([self.proc.stdout], [], [], remaining)
+            if not r:
+                return out
+            chunk = os.read(self.proc.stdout.fileno(), 65536)
+            if not chunk:
+                return out
+            self.buf += chunk
+
     def close(self, timeout=10):
         """close stdin and wait for the server to exit; returns the exit code."""
         try:
