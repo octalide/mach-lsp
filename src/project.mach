@@ -89,6 +89,7 @@ use src:      mach.lang.source;
 use editor:   mach.lang.editor;
 use intern:   mach.lang.intern;
 use ast:      mach.lang.fe.ast;
+use diag:     mach.lang.diagnostic;
 use res:      mach.lang.fe.resolve;
 use comptime: mach.lang.fe.comptime;
 use driver:   mach.lang.driver;
@@ -307,7 +308,22 @@ pub fun resolve_doc(w: *Workspace, root: *Root, fid: src.FileId) Result[*res.Res
         if (is_err[*ast.Ast, str](pr)) { ret err[*res.ResolveResult, str](unwrap_err[*ast.Ast, str](pr)); }
         a = unwrap_ok[*ast.Ast, str](pr);
     }
+    ret resolve_fresh(w, root, fid, a);
+}
 
+# resolve_fresh: re-resolve buffer `a` (FileId `fid`) against `root`'s dep set
+# unconditionally — the cache-miss core shared by `resolve_doc` (after its cache
+# check) and `diagnose_doc` (which forces a fresh parse to repopulate the session
+# DiagList). drops any prior cached result for `fid`, resolves with `res.resolve`,
+# and caches the new result. the resolve's diagnostics land on the session
+# DiagList, which `diagnose_doc` then publishes.
+# ---
+# w:    the workspace
+# root: the root governing the document, or nil for a single-file document
+# fid:  FileId of the open buffer
+# a:    the buffer's current parsed Ast
+# ret:  a borrowed pointer to the cached ResolveResult, or an error
+fun resolve_fresh(w: *Workspace, root: *Root, fid: src.FileId, a: *ast.Ast) Result[*res.ResolveResult, str] {
     free_cached(w, fid);
 
     # resolve under the same comptime environment the project's own modules
@@ -345,6 +361,35 @@ pub fun resolve_doc(w: *Workspace, root: *Root, fid: src.FileId) Result[*res.Res
         ret err[*res.ResolveResult, str]("project: resolve cache allocation failed");
     }
     ret ok[*res.ResolveResult, str](slot);
+}
+
+# diagnose_doc: parse and dep-aware-resolve the buffer governed by `root`,
+# returning the session DiagList populated with both its syntactic and its
+# name-resolution diagnostics. resolving against `root.deps` — the same dep set
+# go-to-definition uses — is what makes an import of a module outside the
+# project's dep closure surface its `imported module is not in the dep set`
+# diagnostic instead of binding silently to SYMBOL_NIL, so the published
+# diagnostics and what the features can resolve no longer disagree (#78). the
+# dep-aware ResolveResult is cached as a side effect, so a feature request on the
+# same unedited buffer reuses it. the fresh parse resets the session DiagList and
+# emits this buffer's lex / parse diagnostics; the resolve appends its own.
+# `root` must be non-nil: a single-file document keeps the editor's parse-only
+# diagnostics so its cross-module `use`s are not flagged against an empty dep set.
+# ---
+# w:    the workspace
+# root: the root governing the document (non-nil)
+# fid:  FileId of the open buffer
+# ret:  a borrowed pointer to the session DiagList, or an error
+pub fun diagnose_doc(w: *Workspace, root: *Root, fid: src.FileId) Result[*diag.DiagList, str] {
+    val pr: Result[*ast.Ast, str] = editor.parse(w.es, fid);
+    if (is_err[*ast.Ast, str](pr)) { ret err[*diag.DiagList, str](unwrap_err[*ast.Ast, str](pr)); }
+    val a: *ast.Ast = unwrap_ok[*ast.Ast, str](pr);
+
+    val rr: Result[*res.ResolveResult, str] = resolve_fresh(w, root, fid, a);
+    if (is_err[*res.ResolveResult, str](rr)) {
+        ret err[*diag.DiagList, str](unwrap_err[*res.ResolveResult, str](rr));
+    }
+    ret ok[*diag.DiagList, str](?w.s.diags);
 }
 
 # own_module: the synthetic module id a buffer resolves under for `root`. offset
