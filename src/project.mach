@@ -89,6 +89,7 @@ use src:      mach.lang.source;
 use editor:   mach.lang.editor;
 use intern:   mach.lang.intern;
 use ast:      mach.lang.fe.ast;
+use diag:     mach.lang.diagnostic;
 use res:      mach.lang.fe.resolve;
 use comptime: mach.lang.fe.comptime;
 use driver:   mach.lang.driver;
@@ -194,6 +195,9 @@ pub rec Root {
 # cache_len:    number of slots in `cache`
 # gen_seq:      next generation stamp to hand out; each successful root build
 #               claims one, pinning a cache entry's gen to an exact build
+# load_epoch:   monotonic counter bumped on every successful root build, so the
+#               server can tell a feature request triggered a lazy load and
+#               re-publish diagnostics for the now-loaded buffers (#96)
 pub rec Workspace {
     s:            *sess.Session;
     es:           *editor.EditorSession;
@@ -205,6 +209,7 @@ pub rec Workspace {
     cache:        *Cached;
     cache_len:    u32;
     gen_seq:      u32;
+    load_epoch:   u32;
 }
 
 # init: construct an empty workspace over the server's sessions.
@@ -226,6 +231,7 @@ pub fun init(s: *sess.Session, es: *editor.EditorSession, alloc: *Allocator) Wor
     w.cache         = nil;
     w.cache_len     = 0;
     w.gen_seq       = 1;
+    w.load_epoch    = 0;
     ret w;
 }
 
@@ -263,6 +269,18 @@ pub fun sources(w: *Workspace) *src.SourceMap {
 # on: whether file watching is active
 pub fun set_watch_active(w: *Workspace, on: bool) {
     w.watch_active = on;
+}
+
+# load_epoch: the workspace's current load epoch — a counter bumped on every
+# successful root build. the server snapshots it around a feature request; a
+# change means a lazy project load completed, so the open buffers it now governs
+# can have their diagnostics re-published with semantic (dep-aware) results
+# without waiting for an edit (#96).
+# ---
+# w:   the workspace
+# ret: the current load epoch
+pub fun load_epoch(w: *Workspace) u32 {
+    ret w.load_epoch;
 }
 
 # dnit: release the resolve cache and every loaded root.
@@ -307,7 +325,22 @@ pub fun resolve_doc(w: *Workspace, root: *Root, fid: src.FileId) Result[*res.Res
         if (is_err[*ast.Ast, str](pr)) { ret err[*res.ResolveResult, str](unwrap_err[*ast.Ast, str](pr)); }
         a = unwrap_ok[*ast.Ast, str](pr);
     }
+    ret resolve_fresh(w, root, fid, a);
+}
 
+# resolve_fresh: re-resolve buffer `a` (FileId `fid`) against `root`'s dep set
+# unconditionally — the cache-miss core shared by `resolve_doc` (after its cache
+# check) and `diagnose_doc` (which forces a fresh parse to repopulate the session
+# DiagList). drops any prior cached result for `fid`, resolves with `res.resolve`,
+# and caches the new result. the resolve's diagnostics land on the session
+# DiagList, which `diagnose_doc` then publishes.
+# ---
+# w:    the workspace
+# root: the root governing the document, or nil for a single-file document
+# fid:  FileId of the open buffer
+# a:    the buffer's current parsed Ast
+# ret:  a borrowed pointer to the cached ResolveResult, or an error
+fun resolve_fresh(w: *Workspace, root: *Root, fid: src.FileId, a: *ast.Ast) Result[*res.ResolveResult, str] {
     free_cached(w, fid);
 
     # resolve under the same comptime environment the project's own modules
@@ -345,6 +378,35 @@ pub fun resolve_doc(w: *Workspace, root: *Root, fid: src.FileId) Result[*res.Res
         ret err[*res.ResolveResult, str]("project: resolve cache allocation failed");
     }
     ret ok[*res.ResolveResult, str](slot);
+}
+
+# diagnose_doc: parse and dep-aware-resolve the buffer governed by `root`,
+# returning the session DiagList populated with both its syntactic and its
+# name-resolution diagnostics. resolving against `root.deps` — the same dep set
+# go-to-definition uses — is what makes an import of a module outside the
+# project's dep closure surface its `imported module is not in the dep set`
+# diagnostic instead of binding silently to SYMBOL_NIL, so the published
+# diagnostics and what the features can resolve no longer disagree (#78). the
+# dep-aware ResolveResult is cached as a side effect, so a feature request on the
+# same unedited buffer reuses it. the fresh parse resets the session DiagList and
+# emits this buffer's lex / parse diagnostics; the resolve appends its own.
+# `root` must be non-nil: a single-file document keeps the editor's parse-only
+# diagnostics so its cross-module `use`s are not flagged against an empty dep set.
+# ---
+# w:    the workspace
+# root: the root governing the document (non-nil)
+# fid:  FileId of the open buffer
+# ret:  a borrowed pointer to the session DiagList, or an error
+pub fun diagnose_doc(w: *Workspace, root: *Root, fid: src.FileId) Result[*diag.DiagList, str] {
+    val pr: Result[*ast.Ast, str] = editor.parse(w.es, fid);
+    if (is_err[*ast.Ast, str](pr)) { ret err[*diag.DiagList, str](unwrap_err[*ast.Ast, str](pr)); }
+    val a: *ast.Ast = unwrap_ok[*ast.Ast, str](pr);
+
+    val rr: Result[*res.ResolveResult, str] = resolve_fresh(w, root, fid, a);
+    if (is_err[*res.ResolveResult, str](rr)) {
+        ret err[*diag.DiagList, str](unwrap_err[*res.ResolveResult, str](rr));
+    }
+    ret ok[*diag.DiagList, str](?w.s.diags);
 }
 
 # own_module: the synthetic module id a buffer resolves under for `root`. offset
@@ -410,6 +472,36 @@ pub fun root_for(w: *Workspace, uri: str) *Root {
     if (outer != nil) { strutil.str_free(w.alloc, doc_root); ret outer; }
 
     ret load_root(w, doc_root);
+}
+
+# root_for_loaded: the root governing the document at `uri` ONLY when it is
+# already loaded — never triggering a build. unlike `root_for`, this neither
+# loads a fresh root nor speculatively loads a vendoring ancestor nor reloads a
+# stale one; it returns nil when no loaded root holds the document. the
+# diagnostics publish path uses this so opening or editing a buffer publishes
+# instantly (parse-only) instead of blocking on a ~tens-of-seconds project build
+# (#96); the project still loads lazily on the first feature request, where
+# `root_for` runs. a document already governed by a loaded root resolves
+# dep-aware as before (#78). matches `root_for`'s routing: a loaded twin rooted
+# elsewhere wins, else the document's own root when it is loaded.
+# ---
+# w:   the workspace
+# uri: the document's URI
+# ret: a borrowed pointer to the governing loaded Root, or nil
+pub fun root_for_loaded(w: *Workspace, uri: str) *Root {
+    if (uri == nil) { ret nil; }
+
+    # a loaded root rooted elsewhere holding the document governs it read-only,
+    # exactly as in root_for — checked without reloading.
+    val twin: *Root = containing_root_loaded(w, uri);
+    if (twin != nil) { ret twin; }
+
+    val doc_root: str = document_root(w, uri);
+    if (doc_root == nil) { ret nil; }
+    val existing: *Root = find_root(w, doc_root);
+    strutil.str_free(w.alloc, doc_root);
+    if (existing != nil && existing.loaded) { ret existing; }
+    ret nil;
 }
 
 # ancestor_root: load-and-prefer the outermost project that vendors the document
@@ -557,6 +649,32 @@ fun containing_root(w: *Workspace, uri: str, doc_root: str) *Root {
     ret found;
 }
 
+# containing_root_loaded: the load-free counterpart of `containing_root` for the
+# diagnostics publish path — the outermost already-loaded root whose graph holds
+# the document at `uri`, without the per-candidate `maybe_reload` (which would
+# rebuild a stale root). selection is identical otherwise: the shortest holding
+# root path wins, so a vendored module routes to the project that vendors it. nil
+# when no loaded root holds the document. staleness is reconciled on the feature
+# path's `root_for`, never on publish.
+fun containing_root_loaded(w: *Workspace, uri: str) *Root {
+    if (w.roots == nil) { ret nil; }
+    val norm: str = uri_to_norm(w.alloc, uri);
+    if (norm == nil) { ret nil; }
+    var found: *Root = nil;
+    var i: u32 = 0;
+    for (i < w.root_cap) {
+        val r: *Root = ?w.roots[i];
+        if (r.path != nil && r.loaded
+            && is_some[sess.ModuleId](module_for_norm(r, norm))
+            && (found == nil || str_len(r.path) < str_len(found.path))) {
+            found = r;
+        }
+        i = i + 1;
+    }
+    strutil.str_free(w.alloc, norm);
+    ret found;
+}
+
 # load_root: claim a slot for `root_path` (taking ownership of the string) and
 # build its graph. the vendored flag is stamped once here — intrinsic to the
 # path, so every root-creating path (root_for's fresh-root load, ancestor_root's
@@ -679,6 +797,7 @@ fun try_load(w: *Workspace, r: *Root) bool {
     r.loaded   = true;
     r.own_base = r.p.module_len;
     r.gen      = next_gen(w);
+    w.load_epoch = w.load_epoch + 1;
     build_mod_paths(w, r);
     build_deps(w, r);
     ret true;
