@@ -317,10 +317,10 @@ pub fun resolve_doc(w: *Workspace, root: *Root, fid: src.FileId) Result[*res.Res
     var ctx: comptime.ComptimeCtx;
     if (root != nil) {
         deps = ?root.deps;
-        ctx = comptime.init(w.alloc, root.p.target.os_id, root.p.target.arch_id, root.p.target.arch.pointer_width, root.p.compiler_name, root.p.compiler_ver);
+        ctx = comptime.init(w.alloc, root.p.target.os_id, root.p.target.arch_id, root.p.target.abi_id, comptime.MODE_DEBUG, root.p.target.arch.pointer_width, root.p.compiler_name, root.p.compiler_ver);
     }
     or {
-        ctx = comptime.init(w.alloc, 0, 0, 8, intern.STR_NIL, intern.STR_NIL);
+        ctx = comptime.init(w.alloc, 0, 0, 0, comptime.MODE_DEBUG, 8, intern.STR_NIL, intern.STR_NIL);
     }
 
     val own: sess.ModuleId = own_module(root, fid);

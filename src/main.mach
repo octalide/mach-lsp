@@ -17,7 +17,7 @@ use page: std.allocator.page;
 
 use server: mls.server;
 
-$main.symbol = "main";
+#[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
     var alloc: Allocator;
     val pe: Option[str] = page.make(?alloc);
