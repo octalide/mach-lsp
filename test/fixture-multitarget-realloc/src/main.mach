@@ -1,0 +1,40 @@
+# main: a 2-branch target-gated $if. the windows branch imports 24 leaf modules
+# (w00..w23) — crossing the compiler's INITIAL_MODULE_CAP (16) so loading it grows
+# `p.modules` mid-walk; the linux branch imports one more leaf (lx). under the
+# union build both branches are taken (windows and the two linux targets), so the
+# load-walk visits the linux branch after the windows realloc — the use-after-
+# realloc that crashed pre-fix (#91 / mach#1540). lx.mach is loaded only via the
+# linux branch, so a cross-module request reaching it proves the union loaded and
+# the server survived the walk.
+$if ($mach.build.os == $mach.os.windows) {
+    use rtfix.w00;
+    use rtfix.w01;
+    use rtfix.w02;
+    use rtfix.w03;
+    use rtfix.w04;
+    use rtfix.w05;
+    use rtfix.w06;
+    use rtfix.w07;
+    use rtfix.w08;
+    use rtfix.w09;
+    use rtfix.w10;
+    use rtfix.w11;
+    use rtfix.w12;
+    use rtfix.w13;
+    use rtfix.w14;
+    use rtfix.w15;
+    use rtfix.w16;
+    use rtfix.w17;
+    use rtfix.w18;
+    use rtfix.w19;
+    use rtfix.w20;
+    use rtfix.w21;
+    use rtfix.w22;
+    use rtfix.w23;
+} $or ($mach.build.os == $mach.os.linux) {
+    use rtfix.lx;
+}
+
+fun main() i32 {
+    ret 0;
+}
