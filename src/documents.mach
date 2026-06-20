@@ -148,6 +148,28 @@ pub fun close(st: *Store, uri: str) {
     d.in_use = false;
 }
 
+# slot_count: the number of Document slots in the store. paired with `at` to
+# walk every live document — the re-publish-after-load sweep iterates
+# [0, slot_count) and skips slots whose `in_use` is false.
+# ---
+# st:  the store
+# ret: the slot-array length
+pub fun slot_count(st: *Store) usize {
+    ret st.len;
+}
+
+# at: the Document in slot `idx`, or nil when out of range. the slot may be
+# retired (`in_use` false) — callers check that. for the open-document sweep
+# that re-publishes diagnostics once a project finishes loading.
+# ---
+# st:  the store
+# idx: slot index in [0, slot_count)
+# ret: the slot's Document, or nil
+pub fun at(st: *Store, idx: usize) *Document {
+    if (st.docs == nil || idx >= st.len) { ret nil; }
+    ret ?st.docs[idx];
+}
+
 # find: the tracked Document for `uri`, or nil when not open.
 # ---
 # st:  the store
