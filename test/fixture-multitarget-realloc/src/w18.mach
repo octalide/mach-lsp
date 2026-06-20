@@ -1,0 +1,3 @@
+# w18: a windows-branch leaf in the realloc fixture. trivial body; its only
+# job is to be one of the 24 modules whose load crosses INITIAL_MODULE_CAP.
+pub fun f18() i32 { ret 18; }
