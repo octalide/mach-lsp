@@ -376,7 +376,7 @@ fun publish_for(srv: *Server, uri: str, text: str, is_open: bool) {
         ret;
     }
     val doc: *documents.Document = unwrap_ok[*documents.Document, str](dr);
-    diagnostics.publish(?srv.es, project.sources(?srv.ws), srv.alloc, uri, doc.file_id);
+    diagnostics.publish(?srv.ws, ?srv.es, project.sources(?srv.ws), srv.alloc, uri, doc.file_id);
 }
 
 # reply_error: send a JSON-RPC error response for a request that carries an id;
