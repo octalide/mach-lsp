@@ -1,0 +1,24 @@
+# multi-artifact fixture for build_project_union (#84): `toolonly` is reachable
+# only through the secondary `tool` binary's entry, outside the primary `app`
+# artifact's closure. a single-artifact load (the union's resolution ctx) omits
+# it; the union over every declared artifact's closure includes it, so workspace
+# references on `core.shared` reach its use-site in toolonly.
+[project]
+id      = "mbfix"
+version = "0.0.0"
+src     = "src"
+target  = "native"
+
+[target.linux]
+isa = "x86_64"
+os  = "linux"
+abi = "sysv64"
+
+[bin.app]
+entry = "app.mach"
+
+[lib.core]
+entry = "core.mach"
+
+[bin.tool]
+entry = "tool.mach"

@@ -1,0 +1,7 @@
+# core: the library artifact's entry; declares the symbol shared across the app
+# and tool artifacts, so references on it must reach use-sites in both closures.
+
+# shared: a value imported and used across the primary and non-primary closures.
+pub fun shared() i64 {
+    ret 42;
+}

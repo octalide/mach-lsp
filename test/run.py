@@ -17,6 +17,7 @@ import test_invalidation
 import test_encoding
 import test_multitarget
 import test_multitarget_realloc
+import test_multibinary
 
 SUITES = [
     ("diagnostics", test_diagnostics.run),
@@ -29,6 +30,7 @@ SUITES = [
     ("encoding", test_encoding.run),
     ("multitarget", test_multitarget.run),
     ("multitarget-realloc", test_multitarget_realloc.run),
+    ("multibinary", test_multibinary.run),
 ]
 
 
