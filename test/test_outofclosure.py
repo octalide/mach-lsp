@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
-"""out-of-closure import diagnostics (#78).
+"""out-of-closure import diagnostics (#78), re-published after a lazy load (#96).
 
 a project whose entry imports only std.types.size never loads std.types.option
 into its dep closure. opening a buffer under that root which imports
-std.types.option must now PUBLISH a diagnostic ("imported module is not in the
-dep set") instead of resolving silently to nothing — keeping the published
+std.types.option must PUBLISH a diagnostic ("imported module is not in the dep
+set") instead of resolving silently to nothing — keeping the published
 diagnostics consistent with go-to-definition's inability to bind the symbol. a
 control buffer importing only the in-closure std.types.size must stay clean (no
-false positives from the dep-aware diagnostics pass)."""
+false positives from the dep-aware diagnostics pass).
+
+since #96 the project no longer loads on didOpen (that put the full build on the
+hot path and froze the server); the open buffers publish parse-only until a
+feature request loads the project, after which the server re-publishes their
+diagnostics dep-aware. so this drives a `definition` (which triggers the load)
+between the opens and shutdown, then asserts the re-published diagnostic."""
 import os
 
-from harness import drive, req, notify, did_open, by_id, file_uri, standalone, REPO
+from harness import drive, req, notify, did_open, pos, by_id, file_uri, standalone, REPO
 
 FIXTURE = os.path.join(REPO, "test", "fixture-outofclosure")
 OOC = os.path.join(FIXTURE, "src", "outofclosure.mach")
@@ -36,12 +42,18 @@ def run():
 
     ooc_text = open(OOC).read()
     app_text = open(APP).read()
+    # a definition request on the entry buffer's `usize` triggers the lazy
+    # project load (#96 moved the load off the didOpen hot path); the server
+    # then re-publishes the open buffers' diagnostics dep-aware, surfacing the
+    # out-of-closure import without an edit.
     frames = [
         req(1, "initialize", {"capabilities": {}}),
         notify("initialized"),
         did_open(OOC_URI, ooc_text),
         did_open(APP_URI, app_text),
-        req(2, "shutdown", None),
+        req(2, "textDocument/definition",
+            {"textDocument": {"uri": APP_URI}, "position": pos(8, 11)}),
+        req(3, "shutdown", None),
         notify("exit"),
     ]
     code, msgs = drive(frames)
@@ -76,7 +88,7 @@ def run():
     elif app:
         failures.append(f"in-closure control buffer produced diagnostics: {app!r}")
 
-    sh = by_id(msgs, 2)
+    sh = by_id(msgs, 3)
     if not sh or "result" not in sh:
         failures.append("missing shutdown result")
     if code != 0:
