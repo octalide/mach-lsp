@@ -55,6 +55,12 @@ pub val STATUS_EXITED:        u8 = 3;
 # ws:            per-root project graphs backing cross-module analysis
 # watch_dynamic: whether the client supports dynamic file-watch registration
 #                (`workspace/didChangeWatchedFiles`), advertised at initialize
+# progress:      whether the client supports `window/workDoneProgress`, so the
+#                eager project load is wrapped in a progress span rather than a
+#                single fallback notification
+# root_uri:      owned `file://` URI of the workspace root captured at initialize
+#                (rootUri / first workspaceFolder / rootPath), eagerly loaded at
+#                `initialized`; nil in single-file mode
 pub rec Server {
     status:        u8;
     exit_code:     i64;
@@ -64,6 +70,8 @@ pub rec Server {
     docs:          documents.Store;
     ws:            project.Workspace;
     watch_dynamic: bool;
+    progress:      bool;
+    root_uri:      str;
 }
 
 # init: build a server over the given allocator.
@@ -76,6 +84,8 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
     srv.exit_code = 0;
     srv.alloc = alloc;
     srv.watch_dynamic = false;
+    srv.progress = false;
+    srv.root_uri = nil;
 
     val sr: Result[sess.Session, str] = sess.init(alloc);
     if (is_err[sess.Session, str](sr)) { ret false; }
@@ -91,6 +101,7 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
 # ---
 # srv: server to tear down
 pub fun dnit(srv: *Server) {
+    if (srv.root_uri != nil) { json.free_str(srv.root_uri, srv.alloc); srv.root_uri = nil; }
     documents.dnit(?srv.docs);
     project.dnit(?srv.ws);
     editor.dnit(?srv.es);
@@ -246,6 +257,16 @@ fun handle_initialize(srv: *Server, body: str) {
     # `initialized` only sends one when it will be honoured.
     srv.watch_dynamic = json.extract_bool_after(body, "\"didChangeWatchedFiles\"", "\"dynamicRegistration\"", srv.alloc);
 
+    # remember whether the client supports work-done progress, so the eager load
+    # at `initialized` can report a live, long-running operation instead of a
+    # single fallback notification.
+    srv.progress = json.extract_bool_after(body, "\"window\"", "\"workDoneProgress\"", srv.alloc);
+
+    # capture the workspace root for the eager load at `initialized`: prefer the
+    # rootUri, then the first workspaceFolder, then the deprecated rootPath
+    # (rewritten as a file:// URI). nil leaves the server in single-file mode.
+    srv.root_uri = capture_root(srv, body);
+
     val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
     val result: str = ",\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\"}}}";
     send_concat2(srv, prefix, id, result);
@@ -255,18 +276,83 @@ fun handle_initialize(srv: *Server, body: str) {
     trace.log("initialized\n");
 }
 
-# handle_initialized: once the client signals it is ready, register file
-# watchers for the manifest, lockfile, and source trees so a dep-graph change
-# (pulling deps, editing a dep source) triggers `workspace/didChangeWatchedFiles`
-# and the affected project root is rebuilt. only sent when the client advertised
-# dynamic registration; clients without it fall back to the server's mtime check.
+# handle_initialized: once the client signals it is ready, register file watchers
+# for the manifest, lockfile, and source trees so a dep-graph change (pulling
+# deps, editing a dep source) triggers `workspace/didChangeWatchedFiles` and the
+# affected project root is rebuilt (only when the client advertised dynamic
+# registration; clients without it fall back to the server's mtime check), then
+# eagerly build the captured workspace project so the slow whole-closure load
+# happens here, off the request path, rather than freezing the first feature
+# request (#79).
 fun handle_initialized(srv: *Server) {
-    if (!srv.watch_dynamic) { ret; }
-    val reg: str = "{\"jsonrpc\":\"2.0\",\"id\":\"mls/registerWatchers\",\"method\":\"client/registerCapability\",\"params\":{\"registrations\":[{\"id\":\"mls-watched-files\",\"method\":\"workspace/didChangeWatchedFiles\",\"registerOptions\":{\"watchers\":[{\"globPattern\":\"**/mach.toml\"},{\"globPattern\":\"**/mach.lock\"},{\"globPattern\":\"**/*.mach\"}]}}]}}";
-    transport.send_message(reg, srv.alloc);
-    # the watcher now covers manifest / lockfile changes; skip the per-request
-    # mtime fallback check.
-    project.set_watch_active(?srv.ws, true);
+    if (srv.watch_dynamic) {
+        val reg: str = "{\"jsonrpc\":\"2.0\",\"id\":\"mls/registerWatchers\",\"method\":\"client/registerCapability\",\"params\":{\"registrations\":[{\"id\":\"mls-watched-files\",\"method\":\"workspace/didChangeWatchedFiles\",\"registerOptions\":{\"watchers\":[{\"globPattern\":\"**/mach.toml\"},{\"globPattern\":\"**/mach.lock\"},{\"globPattern\":\"**/*.mach\"}]}}]}}";
+        transport.send_message(reg, srv.alloc);
+        # the watcher now covers manifest / lockfile changes; skip the per-request
+        # mtime fallback check.
+        project.set_watch_active(?srv.ws, true);
+    }
+    eager_load(srv);
+}
+
+# eager_load: build the captured workspace project now, at startup, instead of on
+# the first cross-module feature request, so no client request is ever left
+# hanging on the slow whole-closure build (#79). the load still blocks the
+# single-threaded message loop for its full duration — unavoidable without
+# threads — but it happens once, off the request path, and is wrapped in a
+# work-done-progress span so a client that supports it sees a live, long-running
+# operation rather than an unresponsive server. because the loop is blocked, no
+# `report` update can be sent mid-build; only `begin` (before) and `end` (after).
+# clients without `window.workDoneProgress` get a single showMessage instead. a
+# no-op in single-file mode (no workspace root captured at initialize).
+fun eager_load(srv: *Server) {
+    if (srv.root_uri == nil) { ret; }
+
+    if (srv.progress) {
+        transport.send_message("{\"jsonrpc\":\"2.0\",\"id\":\"mls/loadProgress\",\"method\":\"window/workDoneProgress/create\",\"params\":{\"token\":\"mls/load\"}}", srv.alloc);
+        transport.send_message("{\"jsonrpc\":\"2.0\",\"method\":\"$/progress\",\"params\":{\"token\":\"mls/load\",\"value\":{\"kind\":\"begin\",\"title\":\"Loading Mach project\"}}}", srv.alloc);
+    }
+    or {
+        transport.send_message("{\"jsonrpc\":\"2.0\",\"method\":\"window/showMessage\",\"params\":{\"type\":3,\"message\":\"mach-lsp: loading project...\"}}", srv.alloc);
+    }
+
+    project.load_workspace_root(?srv.ws, srv.root_uri);
+
+    if (srv.progress) {
+        transport.send_message("{\"jsonrpc\":\"2.0\",\"method\":\"$/progress\",\"params\":{\"token\":\"mls/load\",\"value\":{\"kind\":\"end\"}}}", srv.alloc);
+    }
+}
+
+# capture_root: the workspace root `file://` URI from the initialize params, as an
+# owned string, or nil for a single-file session. prefers `rootUri`, then the
+# first `workspaceFolders` entry's `uri`, then the deprecated `rootPath` rewritten
+# as a `file://` URI.
+fun capture_root(srv: *Server, body: str) str {
+    var uri: str = json.extract_string(body, "\"rootUri\"", srv.alloc);
+    if (uri != nil) { ret uri; }
+    uri = json.extract_after(body, "\"workspaceFolders\"", "\"uri\"", srv.alloc);
+    if (uri != nil) { ret uri; }
+    val path: str = json.extract_string(body, "\"rootPath\"", srv.alloc);
+    if (path == nil) { ret nil; }
+    val out: str = path_to_uri(srv, path);
+    json.free_str(path, srv.alloc);
+    ret out;
+}
+
+# path_to_uri: a `file://` URI for an absolute filesystem `path`, owned by the
+# caller, or nil on allocation failure. the minimal inverse used for the
+# deprecated rootPath fallback; project-side decoding (`uri_to_path`) reverses it.
+fun path_to_uri(srv: *Server, path: str) str {
+    val scheme: str = "file://";
+    val total: usize = flen(scheme) + flen(path);
+    val r: Result[*u8, str] = allocate[u8](srv.alloc, total + 1);
+    if (is_err[*u8, str](r)) { ret nil; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+    var off: usize = 0;
+    off = fappend(buf, off, scheme);
+    off = fappend(buf, off, path);
+    buf[off] = 0;
+    ret buf::str;
 }
 
 # handle_did_change_watched_files: invalidate every project root whose tree
