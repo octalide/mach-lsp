@@ -3,7 +3,7 @@
 # closure but present in the union build.
 use mtfix.common.shared;
 
-$if ($mach.target.os == $mach.os.windows) {
+$if ($mach.build.os == $mach.os.windows) {
     use mtfix.winonly;
 }
 
