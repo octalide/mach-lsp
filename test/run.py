@@ -19,6 +19,7 @@ import test_multitarget
 import test_multitarget_realloc
 import test_multibinary
 import test_outofclosure
+import test_hotpath
 
 SUITES = [
     ("diagnostics", test_diagnostics.run),
@@ -33,6 +34,7 @@ SUITES = [
     ("multitarget-realloc", test_multitarget_realloc.run),
     ("multibinary", test_multibinary.run),
     ("outofclosure", test_outofclosure.run),
+    ("hotpath", test_hotpath.run),
 ]
 
 

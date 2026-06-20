@@ -351,6 +351,11 @@ fun handle_did_close(srv: *Server, body: str) {
 fun handle_feature(srv: *Server, body: str, which: i64) {
     val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
 
+    # a feature request resolves dep-aware via project.root_for, which loads the
+    # governing project lazily on first use. snapshot the load epoch so a load
+    # triggered here re-publishes the now-loaded buffers' diagnostics (#96).
+    val epoch_before: u32 = project.load_epoch(?srv.ws);
+
     if (which == 0) { language.hover(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
     or (which == 1) { language.definition(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
     or (which == 2) { language.references(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
@@ -360,6 +365,27 @@ fun handle_feature(srv: *Server, body: str, which: i64) {
     or (which == 6) { language.completion(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
 
     if (uri != nil) { json.free_str(uri, srv.alloc); }
+
+    if (project.load_epoch(?srv.ws) != epoch_before) { republish_loaded(srv); }
+}
+
+# republish_loaded: re-publish diagnostics for every open document now governed
+# by a loaded project root. run after a feature request triggers a lazy load
+# (#96): the buffers under the freshly-loaded root were published parse-only on
+# open, so this upgrades them to dep-aware semantic diagnostics — including any
+# out-of-closure import the load now flags — without the user touching the file.
+# the publish path is load-free, so a buffer under no loaded root simply
+# re-publishes its parse-only diagnostics (unchanged), and nothing new is built.
+fun republish_loaded(srv: *Server) {
+    val n: usize = documents.slot_count(?srv.docs);
+    var i: usize = 0;
+    for (i < n) {
+        val d: *documents.Document = documents.at(?srv.docs, i);
+        if (d != nil && d.in_use && d.uri != nil) {
+            diagnostics.publish(?srv.ws, ?srv.es, project.sources(?srv.ws), srv.alloc, d.uri, d.file_id);
+        }
+        i = i + 1;
+    }
 }
 
 # publish_for: register/update `uri`'s buffer and publish its diagnostics.

@@ -43,12 +43,17 @@ val LSP_HINT:    i64 = 4;
 val MAX_DIAGNOSTICS: usize = 200;
 
 # publish: analyze `uri`'s buffer and send its current diagnostics. a document
-# governed by a project root is analyzed dep-aware (`project.diagnose_doc`) so
-# its name-resolution diagnostics — including an import of a module outside the
-# project's dep closure — are surfaced, keeping the published diagnostics
-# consistent with what go-to-definition can resolve (#78). a document under no
-# project resolves single-file (`editor.diagnostics`, parse-only), so its
-# cross-module `use`s are not flagged against an empty dep set.
+# governed by an already-loaded project root is analyzed dep-aware
+# (`project.diagnose_doc`) so its name-resolution diagnostics — including an
+# import of a module outside the project's dep closure — are surfaced, keeping
+# the published diagnostics consistent with what go-to-definition can resolve
+# (#78). a document under no loaded project resolves single-file
+# (`editor.diagnostics`, parse-only), so its cross-module `use`s are not flagged
+# against an empty dep set. the governing-root lookup is load-free
+# (`root_for_loaded`): publishing must never trigger a project build, so opening
+# or editing a buffer stays instant — the project loads lazily on the first
+# feature request, after which the server re-publishes the now-loaded buffers
+# (#96).
 # ---
 # w:       the workspace, for routing the document to its governing root
 # es:      editor session holding the buffer
@@ -57,7 +62,7 @@ val MAX_DIAGNOSTICS: usize = 200;
 # uri:     document URI to report on
 # fid:     editor FileId of the document's buffer
 pub fun publish(w: *project.Workspace, es: *editor.EditorSession, sources: *src.SourceMap, alloc: *Allocator, uri: str, fid: src.FileId) {
-    val root: *project.Root = project.root_for(w, uri);
+    val root: *project.Root = project.root_for_loaded(w, uri);
     var dr: Result[*diag.DiagList, str];
     if (root != nil) { dr = project.diagnose_doc(w, root, fid); }
     or              { dr = editor.diagnostics(es, fid); }
