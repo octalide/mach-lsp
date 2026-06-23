@@ -1,7 +1,0 @@
-# winonly: imported by main only under the windows target. its use of
-# common.shared is in the graph only when the union covers non-default targets.
-use mtfix.common.shared;
-
-pub fun winentry() i64 {
-    ret shared();
-}

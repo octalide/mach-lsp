@@ -1,4 +1,0 @@
-# lx: the linux-branch leaf, loaded after the windows branch's realloc. the
-# test resolves a request onto `lxval` to prove the union loaded it and the
-# server survived the post-realloc walk.
-pub fun lxval() i32 { ret 99; }

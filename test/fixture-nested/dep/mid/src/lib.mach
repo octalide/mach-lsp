@@ -1,7 +1,0 @@
-# lib: mid's entry module; imports the vendored `leaf` dependency so mid's own
-# project graph closes over it. the `outer` project never loads this module.
-use leaf.lib.b_thing;
-
-pub fun mid_main() i64 {
-    ret b_thing();
-}
