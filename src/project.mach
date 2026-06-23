@@ -64,6 +64,7 @@ use std.types.option.Option;
 use std.types.option.some;
 use std.types.option.none;
 use std.types.option.is_some;
+use std.types.option.is_none;
 use std.types.option.unwrap;
 use std.types.result.Result;
 use std.types.result.ok;
@@ -89,8 +90,12 @@ use src:      mach.lang.source;
 use editor:   mach.lang.editor;
 use intern:   mach.lang.intern;
 use ast:      mach.lang.fe.ast;
+use id:       mach.lang.fe.ast.id;
+use adecl:    mach.lang.fe.ast.decl;
 use diag:     mach.lang.diagnostic;
 use res:      mach.lang.fe.resolve;
+use sema:     mach.lang.fe.sema;
+use type:     mach.lang.type;
 use comptime: mach.lang.fe.comptime;
 use driver:   mach.lang.driver;
 use tgt:      mach.lang.target;
@@ -98,6 +103,7 @@ use tgt:      mach.lang.target;
 use transport: mls.transport;
 use json:      mls.json;
 use trace:     mls.trace;
+use mtypes:    mls.types;
 
 # Site: where a resolved symbol's declaration lives — the Ast and SourceFile to
 # read its spans from, and the document URI to report. for a buffer-local symbol
@@ -115,19 +121,23 @@ pub rec Site {
     owned: bool;
 }
 
-# Cached: one buffer's dep-aware resolve result, stamped with the Ast it was
-# resolved from and the generation of the root build it resolved against. the
-# editor replaces a buffer's `*ast.Ast` on every text update (`drop_analysis`),
-# so Ast pointer identity catches a text edit — the same contract
-# `editor.resolve` uses for its own cached result; `gen` catches a cross-root or
-# post-reload staleness, since a result resolved against one build never matches
-# a different build's stamp.
+# Cached: one buffer's dep-aware resolve result — and, lazily, its sema result —
+# stamped with the Ast it was resolved from and the generation of the root build
+# it resolved against. the editor replaces a buffer's `*ast.Ast` on every text
+# update (`drop_analysis`), so Ast pointer identity catches a text edit — the same
+# contract `editor.resolve` uses for its own cached result; `gen` catches a
+# cross-root or post-reload staleness, since a result resolved against one build
+# never matches a different build's stamp. the resolve result is populated on every
+# resolve; the sema result is populated only when a type-aware feature first asks
+# for it (`sema_doc`), so the diagnostics publish path never pays for sema.
 # ---
-# rr:  the cached dep-aware ResolveResult, owned by the cache
-# a:   the Ast the result was resolved from (text-edit staleness check)
-# gen: generation of the root build it resolved against, or 0 for single-file
+# rr:   the cached dep-aware ResolveResult, owned by the cache
+# sr:   the cached SemaResult for the same Ast / gen, or nil until first demanded
+# a:    the Ast both results were derived from (text-edit staleness check)
+# gen:  generation of the root build they were derived against, or 0 for single-file
 rec Cached {
     rr:  *res.ResolveResult;
+    sr:  *sema.SemaResult;
     a:   *ast.Ast;
     gen: u32;
 }
@@ -162,6 +172,12 @@ rec Cached {
 #                 editor's to rewrite, regardless of any loaded graph's closure.
 #                 intrinsic to the path (computed at load_root from the ancestor
 #                 manifests), not to the routing that materialized the root
+# sema:           per-loaded-module SemaResult, indexed by ModuleId, parallel to
+#                 the project's module array; populated lazily by ensure_sema on
+#                 the first type-aware feature request, NEVER at load time
+# sema_count:     number of entries in `sema` (= module_len once sema'd, else 0)
+# sema_loaded:    whether sema has run over this build's module graph; reset on
+#                 every (re)load so a fresh build re-runs sema on next demand
 pub rec Root {
     path:           str;
     loaded:         bool;
@@ -174,6 +190,9 @@ pub rec Root {
     lock_mtime:     i64;
     gen:            u32;
     vendored:       bool;
+    sema:           *sema.SemaResult;
+    sema_count:     u32;
+    sema_loaded:    bool;
 }
 
 # Workspace: the session's project roots plus the per-buffer resolve cache.
@@ -258,6 +277,18 @@ pub fun interner(w: *Workspace) *intern.Interner {
 # ret: the session's source map
 pub fun sources(w: *Workspace) *src.SourceMap {
     ret ?w.s.sources;
+}
+
+# type_interner: the session's type interner, for peeling a record / union TypeId
+# to its nominal declaration site (the cross-module field-reference walk reads
+# each module's typing and matches the field's host type against its key through
+# it). the narrow read the feature layer makes; see `interner` for why the whole
+# session is kept out of feature signatures.
+# ---
+# w:   the workspace
+# ret: the session's type interner
+pub fun type_interner(w: *Workspace) *type.TypeInterner {
+    ret ?w.s.types;
 }
 
 # set_watch_active: record that the client delivers
@@ -378,6 +409,103 @@ fun resolve_fresh(w: *Workspace, root: *Root, fid: src.FileId, a: *ast.Ast) Resu
         ret err[*res.ResolveResult, str]("project: resolve cache allocation failed");
     }
     ret ok[*res.ResolveResult, str](slot);
+}
+
+# sema_doc: the buffer's SemaResult under `root` — its per-expression typing,
+# computed against the root's dep-closure typing. the type-aware twin of
+# `resolve_doc`: it first resolves the buffer (populating the resolve cache entry),
+# then, on a cache miss for the same Ast / build, lazily sema's the whole root
+# graph (`ensure_sema`) so every dependency's decl types are available, and finally
+# sema's the buffer itself against a SemaDeps spanning every sema'd root module —
+# keyed on the same Ast-pointer / generation stamp the resolve cache uses, so an
+# unedited buffer reuses it. heavy on a cold root (the first call pays for the whole
+# dep closure), so it is reached only from a type-aware feature, never the
+# diagnostics publish path. `root` must be non-nil: a single-file document has no
+# dep typing to check against. the returned pointer is owned by the cache.
+# ---
+# w:    the workspace
+# root: the loaded root governing the document (non-nil)
+# fid:  FileId of an open editor buffer
+# ret:  a borrowed pointer to the cached SemaResult, or an error
+pub fun sema_doc(w: *Workspace, root: *Root, fid: src.FileId) Result[*sema.SemaResult, str] {
+    if (root == nil) { ret err[*sema.SemaResult, str]("project: sema requires a loaded project root"); }
+
+    val rr_r: Result[*res.ResolveResult, str] = resolve_doc(w, root, fid);
+    if (is_err[*res.ResolveResult, str](rr_r)) {
+        ret err[*sema.SemaResult, str](unwrap_err[*res.ResolveResult, str](rr_r));
+    }
+    val rr: *res.ResolveResult = unwrap_ok[*res.ResolveResult, str](rr_r);
+
+    val c: *Cached = cache_slot(w, fid);
+    if (c == nil) { ret err[*sema.SemaResult, str]("project: buffer not cached for sema"); }
+    if (c.sr != nil) { ret ok[*sema.SemaResult, str](c.sr); }
+
+    val a: *ast.Ast = editor.ast_of(w.es, fid);
+    if (a == nil) { ret err[*sema.SemaResult, str]("project: buffer ast unavailable for sema"); }
+
+    # the buffer types against the dep closure, so the whole graph must be sema'd
+    # first; ensure_sema is idempotent and cached for the build.
+    ensure_sema(w, root);
+
+    var deps: sema.SemaDeps;
+    build_full_sema_deps(w, root, ?deps);
+
+    val own: sess.ModuleId = own_module(root, fid);
+    var ctx: comptime.ComptimeCtx = comptime.init(w.alloc, root.p.target.os_id, root.p.target.arch_id, root.p.target.abi_id, comptime.MODE_DEBUG, root.p.target.arch.pointer_width, root.p.compiler_name, root.p.compiler_ver);
+    val sr_r: Result[sema.SemaResult, str] = sema.sema(w.s, a, rr, ?deps, ?ctx, own);
+    comptime.dnit(?ctx);
+    free_sema_deps(w, ?deps);
+    if (is_err[sema.SemaResult, str](sr_r)) {
+        ret err[*sema.SemaResult, str](unwrap_err[sema.SemaResult, str](sr_r));
+    }
+
+    val slot_r: Result[*sema.SemaResult, str] = allocate[sema.SemaResult](w.alloc, 1);
+    if (is_err[*sema.SemaResult, str](slot_r)) {
+        var local: sema.SemaResult = unwrap_ok[sema.SemaResult, str](sr_r);
+        sema.dnit_result(?local);
+        ret slot_r;
+    }
+    val slot: *sema.SemaResult = unwrap_ok[*sema.SemaResult, str](slot_r);
+    @slot = unwrap_ok[sema.SemaResult, str](sr_r);
+    c.sr = slot;
+    ret ok[*sema.SemaResult, str](slot);
+}
+
+# build_full_sema_deps: assemble a SemaDeps spanning EVERY sema'd module of
+# `root`, for typing the active buffer (which may `use` any loaded module). each
+# entry borrows the module's retained decl_type snapshot; an un-sema'd module
+# contributes a decl-type-less entry (a lookup against it yields TYPE_ERROR, like a
+# miss). writes the deps into `out`, leaving it empty on allocation failure or when
+# the root has no retained sema. the borrowed arrays are owned by the Root's
+# SemaResults, so the result must be released with `free_sema_deps`.
+fun build_full_sema_deps(w: *Workspace, root: *Root, out: *sema.SemaDeps) {
+    out.entries = nil;
+    out.count   = 0;
+    val n: u32 = root.sema_count;
+    if (root.sema == nil || n == 0) { ret; }
+
+    val r: Result[*sema.ModuleSema, str] = allocate[sema.ModuleSema](w.alloc, n::usize);
+    if (is_err[*sema.ModuleSema, str](r)) { ret; }
+    out.entries = unwrap_ok[*sema.ModuleSema, str](r);
+    out.count   = n;
+
+    var i: u32 = 0;
+    for (i < n) {
+        var ms: sema.ModuleSema;
+        ms.path       = (?root.p.modules[i]).fqn;
+        ms.module     = i::sess.ModuleId;
+        ms.decl_type  = root.sema[i].decl_type;
+        ms.decl_count = root.sema[i].decl_count;
+        out.entries[i] = ms;
+        i = i + 1;
+    }
+}
+
+# cache_slot: the Cached entry for `fid`, or nil when out of range. the borrowed
+# slot handle sema_doc uses to attach a buffer's SemaResult to its resolve entry.
+fun cache_slot(w: *Workspace, fid: src.FileId) *Cached {
+    if (w.cache == nil || fid::u32 >= w.cache_len) { ret nil; }
+    ret ?w.cache[fid::u32];
 }
 
 # diagnose_doc: parse and dep-aware-resolve the buffer governed by `root`,
@@ -735,6 +863,9 @@ fun reset_slot(r: *Root) {
     r.lock_mtime     = 0;
     r.gen            = 0;
     r.vendored       = false;
+    r.sema           = nil;
+    r.sema_count     = 0;
+    r.sema_loaded    = false;
 }
 
 # alloc_slot: a reusable dead slot, growing the array when every slot is
@@ -797,6 +928,11 @@ fun try_load(w: *Workspace, r: *Root) bool {
     r.loaded   = true;
     r.own_base = r.p.module_len;
     r.gen      = next_gen(w);
+    # sema is lazy: a fresh build starts un-sema'd, run on the first type-aware
+    # feature request (ensure_sema), never here on the load path.
+    r.sema        = nil;
+    r.sema_count  = 0;
+    r.sema_loaded = false;
     w.load_epoch = w.load_epoch + 1;
     build_mod_paths(w, r);
     build_deps(w, r);
@@ -927,6 +1063,7 @@ fun free_root(w: *Workspace, r: *Root) {
 # generation is cleared so a later build claims a fresh, non-matching one.
 fun free_root_graph(w: *Workspace, r: *Root) {
     evict_root(w, r);
+    free_sema(w, r);
     free_deps(w, ?r.deps);
     free_mod_paths(w, r);
     if (r.loaded) {
@@ -934,6 +1071,27 @@ fun free_root_graph(w: *Workspace, r: *Root) {
         r.loaded = false;
     }
     r.gen = 0;
+}
+
+# free_sema: tear down the root's retained per-module SemaResults and the array
+# holding them, resetting the lazy-sema state so a reloaded build re-runs sema on
+# next demand. each SemaResult's parallel TypeId arrays are freed; the interned
+# types they reference live on the session and are not touched here.
+fun free_sema(w: *Workspace, r: *Root) {
+    if (r.sema == nil) {
+        r.sema_count  = 0;
+        r.sema_loaded = false;
+        ret;
+    }
+    var i: u32 = 0;
+    for (i < r.sema_count) {
+        sema.dnit_result(?r.sema[i]);
+        i = i + 1;
+    }
+    deallocate[sema.SemaResult](w.alloc, r.sema, r.sema_count::usize);
+    r.sema        = nil;
+    r.sema_count  = 0;
+    r.sema_loaded = false;
 }
 
 # record_mtimes: snapshot the root's manifest / lockfile mtimes for the
@@ -1065,6 +1223,174 @@ pub fun module_view(w: *Workspace, root: *Root, mid: sess.ModuleId) Option[Modul
     v.rr   = ?m.resolve_result;
     v.file = unwrap[*src.SourceFile](fo);
     ret some[ModuleView](v);
+}
+
+# module_sema: loaded module `mid`'s SemaResult in `root`, lazily running the
+# type checker over the whole graph on first demand (ensure_sema) and retaining
+# every module's result on the root. none when there is no project, the id is out
+# of range, or the module did not resolve / could not be typed (its retained slot
+# stays zeroed). this is the type-aware twin of `module_view`: a workspace-wide
+# type query (e.g. a field rename's cross-module walk) reads each module's typing
+# through it. the returned pointer is owned by the root.
+# ---
+# w:    the workspace
+# root: the root governing the request, or nil
+# mid:  a loaded module id in [0, module_count)
+# ret:  some(*SemaResult), or none
+pub fun module_sema(w: *Workspace, root: *Root, mid: sess.ModuleId) Option[*sema.SemaResult] {
+    if (root == nil || !root.loaded) { ret none[*sema.SemaResult](); }
+    ensure_sema(w, root);
+    if (root.sema == nil || mid::u32 >= root.sema_count) { ret none[*sema.SemaResult](); }
+    val sr: *sema.SemaResult = ?root.sema[mid::u32];
+    if (sr.expr_type == nil) { ret none[*sema.SemaResult](); }
+    ret some[*sema.SemaResult](sr);
+}
+
+# type_of: the semantic type of expression `eid` in SemaResult `sr`, or TYPE_NIL
+# when `sr` is nil or `eid` is out of range. the narrow read the feature layer
+# makes to learn an expression's type — handed a SemaResult (from `sema_doc` or
+# `module_sema`), never the session. delegates to the pure helper so the rule lives
+# in one unit-testable place.
+# ---
+# sr:  a buffer's / module's SemaResult, or nil
+# eid: the expression id to type
+# ret: the expression's TypeId, or TYPE_NIL
+pub fun type_of(sr: *sema.SemaResult, eid: id.ExprId) type.TypeId {
+    ret mtypes.type_of(sr, eid);
+}
+
+# decl_type_of: the declared (or inferred) type of decl `did` in SemaResult `sr`,
+# or TYPE_NIL when unavailable. the decl-keyed twin of `type_of`.
+# ---
+# sr:  a buffer's / module's SemaResult, or nil
+# did: the declaration id to type
+# ret: the declaration's TypeId, or TYPE_NIL
+pub fun decl_type_of(sr: *sema.SemaResult, did: id.DeclId) type.TypeId {
+    ret mtypes.decl_type_of(sr, did);
+}
+
+# RecordSite: the nominal back-link from a record / union TypeId to its declaring
+# site — what a field go-to-def / rename follows from a value's type to the `rec` /
+# `uni` declaration whose fields it must walk. carries the field range (uniform
+# across rec / uni, both being TypedName slices in `a.typed_names`) and the
+# module's Ast / source so field spans can be read directly.
+# ---
+# origin:       ModuleId of the declaring module
+# decl:         DeclId of the rec / uni declaration in `origin`'s Ast
+# a:            the declaring module's parsed Ast (field spans index into it)
+# file:         SourceFile backing `a`
+# fields_start: start index into `a.typed_names` of the first field
+# fields_len:   number of fields (record fields / union variants)
+# is_rec:       true for a record, false for a union
+pub rec RecordSite {
+    origin:       sess.ModuleId;
+    decl:         id.DeclId;
+    a:            *ast.Ast;
+    file:         *src.SourceFile;
+    fields_start: u32;
+    fields_len:   u32;
+    is_rec:       bool;
+}
+
+# record_decl: the declaring site a record / union TypeId nominally refers to,
+# resolved against the session's type interner and the root's loaded module array —
+# the nominal back-link field features follow. peels a pointer to its pointee and
+# maps a generic instance to its template. none when `tid` is not a nominal type,
+# the declaring module is not a loaded project module, or the declaration is not a
+# rec / uni. the returned Ast / file pointers are owned by the loaded project /
+# session. a record declared in the active buffer (whose synthetic module id is not
+# in the loaded array) is not found here — use `record_decl_in`, which falls back to
+# the buffer's live Ast for that case.
+# ---
+# w:    the workspace
+# root: the root the type was resolved under, or nil
+# tid:  a TypeId, typically read from a SemaResult via `type_of`
+# ret:  some(RecordSite), or none
+pub fun record_decl(w: *Workspace, root: *Root, tid: type.TypeId) Option[RecordSite] {
+    val no: Option[mtypes.Nominal] = nominal_of_tid(w, root, tid);
+    if (is_none[mtypes.Nominal](no)) { ret none[RecordSite](); }
+    val n: mtypes.Nominal = unwrap[mtypes.Nominal](no);
+
+    val m: *driver.ModuleEntry = module_entry(root, n.origin);
+    if (m == nil) { ret none[RecordSite](); }
+    val fo: Option[*src.SourceFile] = src.get(?w.s.sources, m.file_id);
+    if (!is_some[*src.SourceFile](fo)) { ret none[RecordSite](); }
+    ret record_site_from(n.origin, n.decl, ?m.a, unwrap[*src.SourceFile](fo));
+}
+
+# record_decl_in: `record_decl` extended to resolve a record / union declared in
+# the active buffer. a buffer's own nominal type is interned under its synthetic
+# module id (`own`), which is not in the loaded module array, so `record_decl`
+# alone would miss a field access on a record the edited buffer itself declares.
+# when the nominal's origin is `own`, the declaration is read from the buffer's
+# live Ast / file (`own_a` / `own_file`); otherwise it defers to a loaded module.
+# ---
+# w:        the workspace
+# root:     the root the type was resolved under, or nil
+# own:      the buffer's own module id
+# own_a:    the buffer's live Ast
+# own_file: the buffer's SourceFile
+# tid:      a TypeId, typically read from a SemaResult via `type_of`
+# ret:      some(RecordSite), or none
+pub fun record_decl_in(w: *Workspace, root: *Root, own: sess.ModuleId, own_a: *ast.Ast, own_file: *src.SourceFile, tid: type.TypeId) Option[RecordSite] {
+    val no: Option[mtypes.Nominal] = nominal_of_tid(w, root, tid);
+    if (is_none[mtypes.Nominal](no)) { ret none[RecordSite](); }
+    val n: mtypes.Nominal = unwrap[mtypes.Nominal](no);
+    if (n.origin == own) { ret record_site_from(own, n.decl, own_a, own_file); }
+    ret record_decl(w, root, tid);
+}
+
+# record_site_at: a RecordSite for the rec / uni declaration `decl` in the active
+# buffer (`own` / `own_a` / `own_file`), or none when `decl` is not a rec / uni.
+# the buffer-side entry point for a cursor sitting on a field's own declaration
+# name: the decl is in the buffer being edited, so its Ast / file are the live
+# ones. the resulting site carries the buffer's own module id, the cross-module
+# identity every other module's references are matched against.
+# ---
+# w:        the workspace (unused, kept for signature symmetry with record_decl_in)
+# root:     the project root, or nil
+# own:      the buffer's own module id
+# own_a:    the buffer's live Ast
+# own_file: the buffer's SourceFile
+# decl:     the rec / uni DeclId in the buffer
+# ret:      some(RecordSite), or none
+pub fun record_site_at(w: *Workspace, root: *Root, own: sess.ModuleId, own_a: *ast.Ast, own_file: *src.SourceFile, decl: id.DeclId) Option[RecordSite] {
+    if (decl == id.DECL_NIL) { ret none[RecordSite](); }
+    ret record_site_from(own, decl, own_a, own_file);
+}
+
+# nominal_of_tid: the nominal back-link of `tid` against the session type interner,
+# guarded on a loaded root. none when there is no project or `tid` is not nominal.
+fun nominal_of_tid(w: *Workspace, root: *Root, tid: type.TypeId) Option[mtypes.Nominal] {
+    if (root == nil || !root.loaded) { ret none[mtypes.Nominal](); }
+    ret mtypes.nominal_of(?w.s.types, tid);
+}
+
+# record_site_from: build a RecordSite for the rec / uni decl `decl` in `a` (backed
+# by `file`), or none when the decl is absent or not a rec / uni. the shared core
+# of `record_decl` / `record_decl_in` — both having chosen which Ast / file the
+# declaration lives in.
+fun record_site_from(origin: sess.ModuleId, decl: id.DeclId, a: *ast.Ast, file: *src.SourceFile) Option[RecordSite] {
+    val d_opt: Option[*adecl.Decl] = ast.get_decl(a, decl);
+    if (is_none[*adecl.Decl](d_opt)) { ret none[RecordSite](); }
+    val d: *adecl.Decl = unwrap[*adecl.Decl](d_opt);
+    val is_rec: bool = d.kind == adecl.DECL_KIND_REC;
+    if (!is_rec && d.kind != adecl.DECL_KIND_UNI) { ret none[RecordSite](); }
+
+    var rs: RecordSite;
+    rs.origin = origin;
+    rs.decl   = decl;
+    rs.a      = a;
+    rs.file   = file;
+    rs.is_rec = is_rec;
+    if (is_rec) {
+        rs.fields_start = d.data.rec_.fields_start;
+        rs.fields_len   = d.data.rec_.fields_len;
+    } or {
+        rs.fields_start = d.data.uni_.fields_start;
+        rs.fields_len   = d.data.uni_.fields_len;
+    }
+    ret some[RecordSite](rs);
 }
 
 # module_uri: a freshly built, normalized `file://` URI for loaded module `mid`'s
@@ -1292,6 +1618,145 @@ fun free_deps(w: *Workspace, deps: *res.ResolveDeps) {
     deps.count   = 0;
 }
 
+# ensure_sema: run the type checker over `root`'s loaded module graph, retaining
+# one SemaResult per module on the Root — the lazy core of the type-aware layer.
+# a no-op once it has run for the current build (sema_loaded) or for an unloaded
+# root. modules are sema'd in dependency (topological) order, each against a
+# SemaDeps assembled from the decl_type snapshots of the modules already sema'd in
+# this pass, exactly as the compiler's own build does; a module that did not
+# resolve is skipped, leaving a zeroed SemaResult that types to TYPE_NIL. the pass
+# is heavy (it walks the whole dep closure), so it runs only when a feature first
+# demands typing — never on the diagnostics publish hot path — and is cached until
+# the build reloads. allocation failure leaves the root un-sema'd (typing simply
+# stays unavailable) rather than aborting the request.
+# ---
+# w:    the workspace
+# root: the loaded root whose graph to type-check
+pub fun ensure_sema(w: *Workspace, root: *Root) {
+    if (root == nil || !root.loaded || root.sema_loaded) { ret; }
+    val n: u32 = root.p.module_len;
+    if (n == 0) { root.sema_loaded = true; ret; }
+
+    val arr_r: Result[*sema.SemaResult, str] = allocate[sema.SemaResult](w.alloc, n::usize);
+    if (is_err[*sema.SemaResult, str](arr_r)) { ret; }
+    root.sema       = unwrap_ok[*sema.SemaResult, str](arr_r);
+    root.sema_count = n;
+    zero_sema(root.sema, n);
+
+    # ready[mid]: whether module mid has a populated SemaResult this pass, so a
+    # later module's SemaDeps exposes only the snapshots already produced (every
+    # dep is strictly earlier in topo order and thus ready before its dependents).
+    val rdy_r: Result[*bool, str] = allocate[bool](w.alloc, n::usize);
+    if (is_err[*bool, str](rdy_r)) { free_sema(w, root); ret; }
+    val ready: *bool = unwrap_ok[*bool, str](rdy_r);
+    var z: u32 = 0;
+    for (z < n) { ready[z] = false; z = z + 1; }
+
+    var ti: u32 = 0;
+    for (ti < root.p.topo_len) {
+        val mid: sess.ModuleId = root.p.topo[ti];
+        run_module_sema(w, root, mid, ready);
+        ti = ti + 1;
+    }
+
+    deallocate[bool](w.alloc, ready, n::usize);
+    root.sema_loaded = true;
+}
+
+# run_module_sema: type-check one loaded module against the modules already sema'd
+# this pass, storing its SemaResult into `root.sema[mid]` and marking it ready. a
+# module that did not resolve (no resolve_result) is left zeroed and unready — its
+# types stay TYPE_NIL and dependents simply do not see it among their deps. the
+# comptime context the driver populated for the module (`m.ctx`) drives array-length
+# and `$if`-gate evaluation, matching how the compiler sema's the same module. on
+# any failure the slot is left zeroed; the pass continues so a single bad module
+# does not deny typing to the rest.
+fun run_module_sema(w: *Workspace, root: *Root, mid: sess.ModuleId, ready: *bool) {
+    if (mid::u32 >= root.p.module_len) { ret; }
+    val m: *driver.ModuleEntry = ?root.p.modules[mid::u32];
+    if (!m.resolved) { ret; }
+
+    var deps: sema.SemaDeps;
+    if (!build_sema_deps(w, root, ready, ?deps)) { ret; }
+
+    val sr_r: Result[sema.SemaResult, str] = sema.sema(w.s, ?m.a, ?m.resolve_result, ?deps, ?m.ctx, mid);
+    free_sema_deps(w, ?deps);
+    if (is_err[sema.SemaResult, str](sr_r)) { ret; }
+    root.sema[mid::u32] = unwrap_ok[sema.SemaResult, str](sr_r);
+    ready[mid::u32]     = true;
+}
+
+# build_sema_deps: assemble the SemaDeps for the module about to be analysed — one
+# ModuleSema entry per module already sema'd this pass (ready), each borrowing that
+# module's decl_type snapshot. cross-module symbol types are looked up by the
+# symbol's origin ModuleId, and a `fwd` re-export carries the originating
+# (transitive) module as the origin, so the snapshot must cover every ready module,
+# not only the direct dependencies — all of them are strictly earlier in topo order
+# and thus already produced. mirrors the compiler's own build_sema_deps. writes the
+# assembled deps into `out`; false on allocation failure (the caller skips the
+# module). an empty set (no module ready yet) is a successful result.
+fun build_sema_deps(w: *Workspace, root: *Root, ready: *bool, out: *sema.SemaDeps) bool {
+    out.entries = nil;
+    out.count   = 0;
+
+    var count: u32 = 0;
+    var i: u32 = 0;
+    for (i < root.p.module_len) {
+        if (ready[i]) { count = count + 1; }
+        i = i + 1;
+    }
+    if (count == 0) { ret true; }
+
+    val r: Result[*sema.ModuleSema, str] = allocate[sema.ModuleSema](w.alloc, count::usize);
+    if (is_err[*sema.ModuleSema, str](r)) { ret false; }
+    out.entries = unwrap_ok[*sema.ModuleSema, str](r);
+    out.count   = count;
+
+    var k: u32 = 0;
+    var j: u32 = 0;
+    for (j < root.p.module_len) {
+        if (ready[j]) {
+            val dep: *driver.ModuleEntry = ?root.p.modules[j];
+            var ms: sema.ModuleSema;
+            ms.path       = dep.fqn;
+            ms.module     = j::sess.ModuleId;
+            ms.decl_type  = root.sema[j].decl_type;
+            ms.decl_count = root.sema[j].decl_count;
+            out.entries[k] = ms;
+            k = k + 1;
+        }
+        j = j + 1;
+    }
+    ret true;
+}
+
+# free_sema_deps: release the entries array a build_sema_deps allocated. the
+# borrowed decl_type arrays it points into are owned by the producing SemaResults
+# and are NOT freed here.
+fun free_sema_deps(w: *Workspace, deps: *sema.SemaDeps) {
+    if (deps.entries == nil) { ret; }
+    deallocate[sema.ModuleSema](w.alloc, deps.entries, deps.count::usize);
+    deps.entries = nil;
+    deps.count   = 0;
+}
+
+# zero_sema: zero a freshly allocated SemaResult array so an un-run or skipped
+# module's slot has nil arrays — a lookup against it types to TYPE_NIL, never a
+# wild read. mirrors how the resolve cache zero-fills its gaps.
+fun zero_sema(arr: *sema.SemaResult, n: u32) {
+    var i: u32 = 0;
+    for (i < n) {
+        arr[i].alloc            = nil;
+        arr[i].expr_type        = nil;
+        arr[i].type_resolved_ty = nil;
+        arr[i].decl_type        = nil;
+        arr[i].expr_count       = 0;
+        arr[i].type_count       = 0;
+        arr[i].decl_count       = 0;
+        i = i + 1;
+    }
+}
+
 # cache_hit: the cached ResolveResult for `fid` when it was resolved from the
 # exact Ast `a` (the editor replaces the Ast pointer on every text update, so
 # pointer identity proves the text is current) and against the same build as
@@ -1327,19 +1792,26 @@ fun cache_put(w: *Workspace, fid: src.FileId, rr: *res.ResolveResult, a: *ast.As
             w.cache = unwrap_ok[*Cached, str](r);
         }
         var z: u32 = w.cache_len;
-        for (z < new_len) { w.cache[z].rr = nil; w.cache[z].a = nil; w.cache[z].gen = 0; z = z + 1; }
+        for (z < new_len) { w.cache[z].rr = nil; w.cache[z].sr = nil; w.cache[z].a = nil; w.cache[z].gen = 0; z = z + 1; }
         w.cache_len = new_len;
     }
     w.cache[fid::u32].rr  = rr;
+    w.cache[fid::u32].sr  = nil;
     w.cache[fid::u32].a   = a;
     w.cache[fid::u32].gen = gen;
     ret true;
 }
 
-# release_entry: free a cache slot's owned ResolveResult and zero the slot —
-# the one teardown for a Cached entry, shared by every reclamation path.
+# release_entry: free a cache slot's owned ResolveResult and SemaResult and zero
+# the slot — the one teardown for a Cached entry, shared by every reclamation path.
+# the sema result (populated lazily by sema_doc, nil otherwise) is torn down first.
 # callers guard `c.rr != nil`.
 fun release_entry(w: *Workspace, c: *Cached) {
+    if (c.sr != nil) {
+        sema.dnit_result(c.sr);
+        deallocate[sema.SemaResult](w.alloc, c.sr, 1);
+        c.sr = nil;
+    }
     res.dnit_result(c.rr);
     deallocate[res.ResolveResult](w.alloc, c.rr, 1);
     c.rr  = nil;
