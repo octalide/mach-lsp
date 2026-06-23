@@ -1,0 +1,98 @@
+# mls.types: pure helpers over sema's typing output.
+#
+# the feature layer reads per-expression types and the nominal back-link from a
+# record TypeId to its declaring module here, so the resolution rules live in one
+# place — and, being free of any session / project state, are unit-testable in
+# isolation. `project.mach` re-exports these through its own narrowed accessors so
+# no feature signature carries a `*sess.Session`.
+
+use std.types.bool.bool;
+use std.types.size.usize;
+
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_some;
+use std.types.option.unwrap;
+
+use sess: mach.lang.session;
+use type: mach.lang.type;
+use id:   mach.lang.fe.ast.id;
+use sema: mach.lang.fe.sema;
+
+# Nominal: the declaration site a record / union TypeId nominally refers to —
+# the back-link a field feature follows from a value's type to the `rec` / `uni`
+# declaration whose fields it must walk. for a generic instance this is the
+# generic template's declaration (`target_origin` / `target_decl`).
+# ---
+# origin: ModuleId of the declaring module
+# decl:   DeclId of the rec / uni declaration in `origin`'s Ast
+# kind:   the resolved type kind (TYPE_REC, TYPE_UNI, or TYPE_INSTANCE)
+pub rec Nominal {
+    origin: sess.ModuleId;
+    decl:   id.DeclId;
+    kind:   type.TypeKind;
+}
+
+# type_of: the semantic type of expression `eid` in `sr`, or TYPE_NIL when `sr`
+# is nil or `eid` is out of range. the one read the feature layer makes against a
+# buffer's / module's SemaResult to learn an expression's type.
+# ---
+# sr:  the module's / buffer's SemaResult, or nil
+# eid: the expression id to type
+# ret: the expression's TypeId, or TYPE_NIL when unavailable
+pub fun type_of(sr: *sema.SemaResult, eid: id.ExprId) type.TypeId {
+    if (sr == nil || sr.expr_type == nil) { ret type.TYPE_NIL; }
+    if (eid::u32 >= sr.expr_count) { ret type.TYPE_NIL; }
+    ret sr.expr_type[eid];
+}
+
+# decl_type_of: the declared (or inferred) type of decl `did` in `sr`, or
+# TYPE_NIL when `sr` is nil or `did` is out of range. the decl-keyed twin of
+# `type_of`, for typing a binding from its declaration rather than a use.
+# ---
+# sr:  the module's / buffer's SemaResult, or nil
+# did: the declaration id to type
+# ret: the declaration's TypeId, or TYPE_NIL when unavailable
+pub fun decl_type_of(sr: *sema.SemaResult, did: id.DeclId) type.TypeId {
+    if (sr == nil || sr.decl_type == nil) { ret type.TYPE_NIL; }
+    if (did::u32 >= sr.decl_count) { ret type.TYPE_NIL; }
+    ret sr.decl_type[did];
+}
+
+# nominal_of: the declaration site a record / union TypeId nominally refers to,
+# or none when `tid` is not a nominal type (a primitive, pointer, array, function,
+# generic parameter, or a sentinel). a pointer to a record is peeled to the record
+# first, so `*T` and `T` resolve to the same declaration — a field access through a
+# pointer reaches the same `rec` decl. a generic instance resolves to its template
+# declaration. this is the nominal back-link a field go-to-def / rename follows.
+# ---
+# ti:  the session's type interner
+# tid: the TypeId to resolve
+# ret: some(Nominal) for a nominal / instance type, none otherwise
+pub fun nominal_of(ti: *type.TypeInterner, tid: type.TypeId) Option[Nominal] {
+    if (tid == type.TYPE_NIL || tid == type.TYPE_ERROR) { ret none[Nominal](); }
+    val t_opt: Option[*type.Type] = type.get(ti, tid);
+    if (!is_some[*type.Type](t_opt)) { ret none[Nominal](); }
+    val t: *type.Type = unwrap[*type.Type](t_opt);
+
+    # peel a single pointer level: a field access through `*T` resolves to T's decl.
+    if (t.kind == type.TYPE_POINTER) {
+        ret nominal_of(ti, t.data.pointer.base);
+    }
+    if (t.kind == type.TYPE_REC || t.kind == type.TYPE_UNI) {
+        var n: Nominal;
+        n.origin = t.data.nominal.origin;
+        n.decl   = t.data.nominal.decl;
+        n.kind   = t.kind;
+        ret some[Nominal](n);
+    }
+    if (t.kind == type.TYPE_INSTANCE) {
+        var n: Nominal;
+        n.origin = t.data.instance.target_origin;
+        n.decl   = t.data.instance.target_decl;
+        n.kind   = t.kind;
+        ret some[Nominal](n);
+    }
+    ret none[Nominal]();
+}
