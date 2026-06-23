@@ -27,7 +27,14 @@ use std.types.option.Option;
 use std.types.option.some;
 use std.types.option.none;
 use std.types.option.is_some;
+use std.types.option.is_none;
 use std.types.option.unwrap;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+
+use std.allocator.Allocator;
+use page: std.allocator.page;
 
 use sess:   mach.lang.session;
 use src:    mach.lang.source;
@@ -827,4 +834,157 @@ pub fun span_bytes_equal(fa: *src.SourceFile, sa: token.Span, fb: *src.SourceFil
         i = i + 1;
     }
     ret true;
+}
+
+# span_at: a Span over `[offset, offset + len)`. the test builder for field-name /
+# query spans into a stub SourceFile.
+fun span_at(offset: usize, len: usize) token.Span {
+    var sp: token.Span;
+    sp.offset = offset;
+    sp.len    = len;
+    ret sp;
+}
+
+# stub_file: a SourceFile carrying just `text`, enough for the byte-level field-name
+# compares the pure locator does (it reads `file.text` only).
+fun stub_file(text: str) src.SourceFile {
+    var f: src.SourceFile;
+    f.path        = nil;
+    f.text        = text;
+    f.line_starts = nil;
+    f.line_len    = 0;
+    ret f;
+}
+
+# add_field: append a field TypedName named over `[offset, offset + len)` to `a`,
+# returning its index into `a.typed_names`.
+fun add_field(a: *ast.Ast, offset: usize, len: usize) u32 {
+    var tn: decl.TypedName;
+    tn.name     = span_at(offset, len);
+    tn.ty       = id.TYPE_NIL;
+    tn.comptime = false;
+    val r: Result[u32, str] = ast.add_typed_name(a, tn);
+    ret unwrap_ok[u32, str](r);
+}
+
+test "features: field_decl_span matches a field in the same source" {
+    var pa: Allocator;
+    page.make(?pa);
+    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
+    # text "xyzz": fields "x"@0, "y"@1, "zz"@2..3
+    val start: u32 = add_field(?a, 0, 1);
+    add_field(?a, 1, 1);
+    add_field(?a, 2, 2);
+    var f: src.SourceFile = stub_file("xyzz");
+
+    var fail: bool = false;
+    # query "y" (the byte at offset 1) resolves to field "y" at offset 1.
+    val o: Option[token.Span] = field_decl_span(?a, ?f, start, 3, ?f, span_at(1, 1));
+    if (is_none[token.Span](o)) { fail = true; }
+    or {
+        val sp: token.Span = unwrap[token.Span](o);
+        if (sp.offset != 1 || sp.len != 1) { fail = true; }
+    }
+
+    ast.dnit(?a);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "features: field_decl_span matches a field across two sources (dependency)" {
+    var pa: Allocator;
+    page.make(?pa);
+    # the declaring "module" file holds the record fields.
+    var da: ast.Ast = ast.init(?pa, 0::src.FileId);
+    val start: u32 = add_field(?da, 0, 4);   # "name"
+    add_field(?da, 5, 3);                     # "age"
+    var df: src.SourceFile = stub_file("name age");
+    # the referencing buffer file holds a member access "p.age".
+    var qf: src.SourceFile = stub_file("p.age");
+
+    var fail: bool = false;
+    val o: Option[token.Span] = field_decl_span(?da, ?df, start, 2, ?qf, span_at(2, 3));
+    if (is_none[token.Span](o)) { fail = true; }
+    or {
+        val sp: token.Span = unwrap[token.Span](o);
+        if (sp.offset != 5 || sp.len != 3) { fail = true; }
+    }
+
+    ast.dnit(?da);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "features: field_decl_span returns none for an unknown field" {
+    var pa: Allocator;
+    page.make(?pa);
+    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
+    val start: u32 = add_field(?a, 0, 1);   # "x"
+    add_field(?a, 2, 1);                     # "y"
+    var f: src.SourceFile = stub_file("xy");
+    var qf: src.SourceFile = stub_file("o.z");
+
+    val ok: bool = is_none[token.Span](field_decl_span(?a, ?f, start, 2, ?qf, span_at(2, 1)));
+    ast.dnit(?a);
+    if (!ok) { ret 1; }
+    ret 0;
+}
+
+test "features: field_decl_span returns none for an empty field range" {
+    var pa: Allocator;
+    page.make(?pa);
+    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
+    var f: src.SourceFile = stub_file("x");
+
+    val ok: bool = is_none[token.Span](field_decl_span(?a, ?f, 0, 0, ?f, span_at(0, 1)));
+    ast.dnit(?a);
+    if (!ok) { ret 1; }
+    ret 0;
+}
+
+test "features: field_decl_span returns none for a zero-length query" {
+    var pa: Allocator;
+    page.make(?pa);
+    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
+    val start: u32 = add_field(?a, 0, 1);   # "x"
+    var f: src.SourceFile = stub_file("x");
+
+    val ok: bool = is_none[token.Span](field_decl_span(?a, ?f, start, 1, ?f, span_at(0, 0)));
+    ast.dnit(?a);
+    if (!ok) { ret 1; }
+    ret 0;
+}
+
+test "features: span_bytes_equal matches identical bytes across files" {
+    var fa: src.SourceFile = stub_file("alpha");
+    var fb: src.SourceFile = stub_file("xalphay");
+    var fail: bool = false;
+    if (!span_bytes_equal(?fa, span_at(0, 5), ?fb, span_at(1, 5))) { fail = true; }
+    if (span_bytes_equal(?fa, span_at(0, 5), ?fb, span_at(1, 4)))  { fail = true; }
+    if (span_bytes_equal(?fa, span_at(0, 3), ?fb, span_at(0, 3)))  { fail = true; }
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "features: field_decl_self_at hits a field name and misses elsewhere" {
+    var pa: Allocator;
+    page.make(?pa);
+    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
+    val start: u32 = add_field(?a, 4, 1);   # "x" at offset 4
+    add_field(?a, 10, 3);                    # "foo" at offset 10
+
+    var fail: bool = false;
+    # offset 11 sits inside "foo".
+    val hit: Option[token.Span] = field_decl_self_at(?a, start, 2, 11);
+    if (is_none[token.Span](hit)) { fail = true; }
+    or {
+        val sp: token.Span = unwrap[token.Span](hit);
+        if (sp.offset != 10 || sp.len != 3) { fail = true; }
+    }
+    # offset 7 is between the two field names.
+    if (is_some[token.Span](field_decl_self_at(?a, start, 2, 7))) { fail = true; }
+
+    ast.dnit(?a);
+    if (fail) { ret 1; }
+    ret 0;
 }
