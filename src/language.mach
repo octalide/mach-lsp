@@ -27,7 +27,6 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
 use std.types.string.str_equals;
-use std.types.string.str_starts_with;
 use std.types.option.Option;
 use std.types.option.some;
 use std.types.option.none;
@@ -52,6 +51,8 @@ use token:  mach.lang.fe.token;
 use ast:    mach.lang.fe.ast;
 use id:     mach.lang.fe.ast.id;
 use decl:   mach.lang.fe.ast.decl;
+use atype:  mach.lang.fe.ast.type;
+use fedoc:  mach.lang.fe.doc;
 use res:    mach.lang.fe.resolve;
 use sema:   mach.lang.fe.sema;
 
@@ -93,7 +94,13 @@ pub fun hover(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocat
     val offset: usize = unwrap[usize](off_o);
 
     val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
-    if (!is_some[features.SymbolRef](ro)) { reply_null(alloc, id_raw); ret; }
+    if (!is_some[features.SymbolRef](ro)) {
+        # name resolution leaves a value-field access unbound, so a cursor on a
+        # field name yields no SymbolRef — fall through to the type-driven field
+        # hover before giving up.
+        if (field_hover(ws, alloc, ?an, offset, id_raw)) { ret; }
+        reply_null(alloc, id_raw); ret;
+    }
     val sr: features.SymbolRef = unwrap[features.SymbolRef](ro);
 
     val so: Option[*res.Symbol] = features.symbol(an.rr, sr.sym_id);
@@ -103,11 +110,18 @@ pub fun hover(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocat
     val md: str = hover_markdown(ws, an, sym, uri, alloc);
     if (md == nil) { reply_null(alloc, id_raw); ret; }
 
+    reply_hover(alloc, id_raw, an.file, sr.name_span, md);
+}
+
+# reply_hover: send a `textDocument/hover` reply rendering Markdown `md` over the
+# name span `name_span` in `file`, freeing `md` and `id_raw`. nil-replies when the
+# Markdown cannot be quoted. shared by the symbol and field hover paths.
+fun reply_hover(alloc: *Allocator, id_raw: str, file: *src.SourceFile, name_span: token.Span, md: str) {
     val qmd: str = json.quote(md, alloc);
     json.free_str(md, alloc);
     if (qmd == nil) { reply_null(alloc, id_raw); ret; }
 
-    val range: positions.LspRange = positions.range_of(an.file, sr.name_span);
+    val range: positions.LspRange = positions.range_of(file, name_span);
     val rng: str = range_json(range, alloc);
 
     val p1: str = "{\"jsonrpc\":\"2.0\",\"id\":";
@@ -119,6 +133,152 @@ pub fun hover(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocat
     json.free_str(rng, alloc);
     json.free_str(qmd, alloc);
     json.free_str(id_raw, alloc);
+}
+
+# field_hover: the type-driven hover path for a record / union field, consulted
+# when the symbol-table pivot finds nothing at `offset`. types the referencing
+# expression (a member access `foo.bar` or a struct-literal field name
+# `T{ bar: ... }`), peels it to its record site, and renders the field's name,
+# its declared type, and — when the record's doc block carries a matching
+# `# <name>: <desc>` component — that description. cross-module aware: the record
+# may be declared in a dependency module, in which case its Ast / file / doc all
+# come from the loaded module. emits the hover over the cursor's field-name span
+# and returns true when a field was rendered; returns false (without replying) so
+# the caller can fall back to a null reply. requires a loaded project root.
+# ---
+# ws:     the workspace
+# alloc:  request allocator
+# an:     the analyzed request document
+# offset: cursor byte offset into the buffer
+# id_raw: the raw JSON request id (for the reply)
+# ret:    true when a field hover was rendered and replied
+fun field_hover(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, offset: usize, id_raw: str) bool {
+    if (an.root == nil) { ret false; }
+
+    val fo: Option[features.FieldRef] = features.field_ref_at(an.a, offset);
+    if (!is_some[features.FieldRef](fo)) { ret false; }
+    val fr: features.FieldRef = unwrap[features.FieldRef](fo);
+
+    val sr_r: Result[*sema.SemaResult, str] = project.sema_doc(ws, an.root, an.fid);
+    if (is_err[*sema.SemaResult, str](sr_r)) { ret false; }
+    val sr: *sema.SemaResult = unwrap_ok[*sema.SemaResult, str](sr_r);
+
+    val tid: type.TypeId = project.type_of(sr, fr.host);
+    val rso: Option[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.a, an.file, tid);
+    if (!is_some[project.RecordSite](rso)) { ret false; }
+    val rs: project.RecordSite = unwrap[project.RecordSite](rso);
+
+    val md: str = field_hover_markdown(rs, an.file, fr.name_span, alloc);
+    if (md == nil) { ret false; }
+
+    reply_hover(alloc, id_raw, an.file, fr.name_span, md);
+    ret true;
+}
+
+# field_hover_markdown: a fenced `mach` code block rendering a field as
+# `<name>: <type>`, with the field's matching doc component description following
+# as prose when present. the field is located by matching the cursor's field-name
+# bytes `query` (in `query_file`, the buffer) against the record site's declared
+# field names; name and type spans are read from the declaring module's source so
+# a cross-module field renders. nil when no field matches, the field name cannot
+# be read, or allocation fails. a field with no matching doc component renders the
+# `name: type` block alone (no description, no error).
+fun field_hover_markdown(rs: project.RecordSite, query_file: *src.SourceFile, query: token.Span, alloc: *Allocator) str {
+    val i: usize = field_index(rs, query_file, query);
+    if (i >= rs.fields_len::usize) { ret nil; }
+    val tn: *decl.TypedName = ?rs.a.typed_names[rs.fields_start + i::u32];
+
+    val name: str = positions.span_text(rs.file, tn.name, alloc);
+    if (name == nil) { ret nil; }
+    val ty: str = field_type_text(rs, tn, alloc);
+
+    var doc: str = nil;
+    val do_opt: Option[*decl.Decl] = ast.get_decl(rs.a, rs.decl);
+    if (is_some[*decl.Decl](do_opt)) {
+        val d: *decl.Decl = unwrap[*decl.Decl](do_opt);
+        val dso: Option[token.Span] = features.field_doc_desc(rs.file.text, d.doc, tn.name);
+        if (is_some[token.Span](dso)) { doc = doc_desc_prose(rs.file, unwrap[token.Span](dso), alloc); }
+    }
+
+    val r: str = compose_field_hover(name, ty, doc, alloc);
+    json.free_str(name, alloc);
+    json.free_str(ty, alloc);
+    json.free_str(doc, alloc);
+    ret r;
+}
+
+# field_index: the index into the record site's field range whose declared name
+# bytes equal `query` (in `query_file`), or fields_len when no field matches. the
+# cross-source byte compare lets the receiver and the declaration live in
+# different modules.
+fun field_index(rs: project.RecordSite, query_file: *src.SourceFile, query: token.Span) usize {
+    if (query.len == 0) { ret rs.fields_len::usize; }
+    var i: u32 = 0;
+    for (i < rs.fields_len) {
+        val tn: *decl.TypedName = ?rs.a.typed_names[rs.fields_start + i];
+        if (features.span_bytes_equal(rs.file, tn.name, query_file, query)) { ret i::usize; }
+        i = i + 1;
+    }
+    ret rs.fields_len::usize;
+}
+
+# field_type_text: the declared-type text of a field, read from the declaring
+# module's source (`TypedName.ty` -> its AST type span), or nil when the field
+# carries no type node. the declaring module's file backs the span, so a
+# cross-module field's type renders.
+fun field_type_text(rs: project.RecordSite, tn: *decl.TypedName, alloc: *Allocator) str {
+    if (tn.ty == id.TYPE_NIL) { ret nil; }
+    val to: Option[*atype.Type] = ast.get_type(rs.a, tn.ty);
+    if (!is_some[*atype.Type](to)) { ret nil; }
+    ret positions.span_text(rs.file, unwrap[*atype.Type](to).span, alloc);
+}
+
+# doc_desc_prose: render a single doc-component description span as prose,
+# folding its embedded comment-line breaks the way `doc_text` does. nil on an
+# empty span or allocation failure.
+fun doc_desc_prose(file: *src.SourceFile, span: token.Span, alloc: *Allocator) str {
+    if (span.len == 0) { ret nil; }
+    val source: str = file.text;
+    val total: usize = doc_text(nil, 0, source, span);
+    if (total == 0) { ret nil; }
+    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
+    if (is_err[*u8, str](r)) { ret nil; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+    doc_text(buf, 0, source, span);
+    buf[total] = 0;
+    ret buf::str;
+}
+
+# compose_field_hover: assemble the field hover Markdown — a fenced `mach` block
+# of `name: type` (or just `name` when the type is unavailable), followed by the
+# description prose as a paragraph when present. nil on allocation failure.
+fun compose_field_hover(name: str, ty: str, doc: str, alloc: *Allocator) str {
+    val pre:  str = "```mach\n";
+    val post: str = "\n```";
+    val sep:  str = "\n\n";
+    val colon: str = ": ";
+
+    var total: usize = str_len(pre) + str_len(name) + str_len(post);
+    if (ty != nil)  { total = total + str_len(colon) + str_len(ty); }
+    if (doc != nil) { total = total + str_len(sep) + str_len(doc); }
+
+    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
+    if (is_err[*u8, str](r)) { ret nil; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+    var off: usize = 0;
+    off = append(buf, off, pre);
+    off = append(buf, off, name);
+    if (ty != nil) {
+        off = append(buf, off, colon);
+        off = append(buf, off, ty);
+    }
+    off = append(buf, off, post);
+    if (doc != nil) {
+        off = append(buf, off, sep);
+        off = append(buf, off, doc);
+    }
+    buf[off] = 0;
+    ret buf::str;
 }
 
 # hover_markdown: a fenced `mach` code block rendering the symbol at hover. it
@@ -138,7 +298,7 @@ fun hover_markdown(ws: *project.Workspace, an: Analyzed, sym: *res.Symbol, uri: 
             if (is_some[token.Span](sso)) {
                 sig = positions.span_text(site.file, unwrap[token.Span](sso), alloc);
             }
-            val dso: Option[token.Span] = features.doc_comment_span(site.a, sym, site.file);
+            val dso: Option[token.Span] = features.doc_span_of(site.a, sym);
             if (is_some[token.Span](dso)) { doc = doc_prose(site.file, unwrap[token.Span](dso), alloc); }
         }
         project.free_site(ws, ?site);
@@ -170,117 +330,79 @@ fun hover_markdown(ws: *project.Workspace, an: Analyzed, sym: *res.Symbol, uri: 
     ret buf::str;
 }
 
-# break kinds threaded through doc_render: the join emitted before the next
-# rendered block — nothing, a soft newline, or a blank-line paragraph break.
-val DOC_BREAK_NONE: usize = 0;
-val DOC_BREAK_LINE: usize = 1;
-val DOC_BREAK_PARA: usize = 2;
-
-# doc_prose: render a doc-comment span (the contiguous `#` run above a decl) as
-# Markdown. prose lines before the first `# ---` separator are joined by single
-# newlines; the separator becomes a thematic break (`---` fenced by blank lines
-# so CommonMark reads a horizontal rule, not a setext heading); and each
-# `ident:` line in the trailing field stanza renders as a `- **ident** — desc`
-# list item, with indented continuation lines folded into the open item. one
+# doc_prose: render a declaration's first-class doc block (`Decl.doc`) as
+# Markdown. the block is read through `fe/doc.mach`: the summary becomes a prose
+# paragraph; when a `# ---` component block follows, a thematic break (`---`
+# fenced by blank lines so CommonMark reads a horizontal rule, not a setext
+# heading) precedes each `# <name>: <desc>` component rendered as a
+# `- **name** — desc` list item. because `Decl.doc` excludes the decl's `#[...]`
+# attribute lines, no attribute syntax can leak into the rendering. one
 # `doc_render` walk both sizes and fills the buffer, so the two passes cannot
-# diverge and the allocation is str_len + 1 as `json.free_str` expects. nil on
-# an empty span, a run carrying no rendered text, or allocation failure.
+# diverge and the allocation is str_len + 1 as `json.free_str` expects. nil on an
+# empty span, a block carrying no rendered text, or allocation failure.
+# ---
+# file:  the source file the doc span points into
+# span:  the declaration's `Decl.doc` span
+# alloc: request allocator
+# ret:   the rendered Markdown, or nil
 fun doc_prose(file: *src.SourceFile, span: token.Span, alloc: *Allocator) str {
     if (span.len == 0) { ret nil; }
-    val first: usize = src.position(file, span.offset).line;
-    val last:  usize = src.position(file, span.offset + span.len - 1).line;
+    val source: str = file.text;
 
     var has_text: bool = false;
-    val total: usize = doc_render(file, first, last, nil, ?has_text);
+    val total: usize = doc_render(source, span, nil, ?has_text);
     if (!has_text) { ret nil; }
 
     val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
     if (is_err[*u8, str](r)) { ret nil; }
     val buf: *u8 = unwrap_ok[*u8, str](r);
 
-    doc_render(file, first, last, buf, ?has_text);
+    doc_render(source, span, buf, ?has_text);
     buf[total] = 0;
     ret buf::str;
 }
 
-# doc_render: walk doc-comment lines `first`..`last` (1-based) once, writing the
-# Markdown rendering into `buf` when it is non-nil and only measuring otherwise.
-# both the measure and fill passes share this walk, so the sized length and the
-# written bytes stay identical. sets `has_text` when any non-separator body byte
-# is rendered. returns the rendered length in bytes.
-fun doc_render(file: *src.SourceFile, first: usize, last: usize, buf: *u8, has_text: *bool) usize {
+# doc_render: walk a doc block once, writing the Markdown rendering into `buf`
+# when it is non-nil and only measuring otherwise. both passes share this walk so
+# the sized length and the written bytes stay identical. sets `has_text` when any
+# summary or component byte is rendered. returns the rendered length in bytes.
+fun doc_render(source: str, span: token.Span, buf: *u8, has_text: *bool) usize {
     @has_text = false;
-    var off:     usize = 0;
-    var stanza:  bool  = false;
-    var open:    bool  = false;
-    var pending: usize = DOC_BREAK_NONE;
+    var off: usize = 0;
 
-    var line: usize = first;
-    for (line <= last) {
-        if (doc_separator(file, line)) {
-            if (off > 0) { off = doc_break(buf, off, DOC_BREAK_PARA); }
+    val sum: token.Span = fedoc.summary_span(source, span);
+    if (sum.len > 0) {
+        off = doc_text(buf, off, source, sum);
+        @has_text = true;
+    }
+
+    var it: fedoc.DocComponentIter = fedoc.component_iter(source, span);
+    var c: fedoc.DocComponent;
+    var first: bool = true;
+    for (fedoc.component_next(?it, ?c)) {
+        if (first) {
+            if (off > 0) { off = doc_lf(buf, off); off = doc_lf(buf, off); }
             off = doc_emit(buf, off, "---");
-            stanza  = true;
-            open    = false;
-            pending = DOC_BREAK_PARA;
-            line = line + 1;
-            cnt;
+            first = false;
         }
-
-        val body: token.Span = doc_line_body(file, line);
-
-        if (stanza) {
-            var name: token.Span;
-            var desc: token.Span;
-            if (doc_field(file, body, ?name, ?desc)) {
-                off = doc_break(buf, off, pending);
-                off = doc_emit(buf, off, "- **");
-                off = doc_copy(buf, off, file, name);
-                off = doc_emit(buf, off, "** \xe2\x80\x94 ");
-                off = doc_copy(buf, off, file, desc);
-                @has_text = true;
-                open    = true;
-                pending = DOC_BREAK_LINE;
-                line = line + 1;
-                cnt;
-            }
-            if (open) {
-                if (body.len > 0) {
-                    off = doc_emit(buf, off, " ");
-                    off = doc_copy(buf, off, file, body);
-                    @has_text = true;
-                }
-                line = line + 1;
-                cnt;
-            }
-            off = doc_break(buf, off, pending);
-            off = doc_copy(buf, off, file, body);
-            if (body.len > 0) { @has_text = true; }
-            pending = DOC_BREAK_LINE;
-            line = line + 1;
-            cnt;
+        off = doc_lf(buf, off);
+        off = doc_emit(buf, off, "- **");
+        off = doc_text(buf, off, source, c.name_span);
+        off = doc_emit(buf, off, "**");
+        if (c.desc_span.len > 0) {
+            off = doc_emit(buf, off, " \xe2\x80\x94 ");
+            off = doc_text(buf, off, source, c.desc_span);
         }
-
-        off = doc_break(buf, off, pending);
-        off = doc_copy(buf, off, file, body);
-        if (body.len > 0) { @has_text = true; }
-        pending = DOC_BREAK_LINE;
-        line = line + 1;
+        @has_text = true;
     }
     ret off;
 }
 
-# doc_break: emit the join for break `kind` (none / soft newline / blank-line
-# paragraph) into `buf` when non-nil, returning the advanced offset.
-fun doc_break(buf: *u8, off: usize, kind: usize) usize {
-    if (kind == DOC_BREAK_NONE) { ret off; }
+# doc_lf: write a single newline into `buf` when non-nil, returning the advanced
+# offset.
+fun doc_lf(buf: *u8, off: usize) usize {
     if (buf != nil) { buf[off] = '\n'; }
-    off = off + 1;
-    if (kind == DOC_BREAK_PARA) {
-        if (buf != nil) { buf[off] = '\n'; }
-        off = off + 1;
-    }
-    ret off;
+    ret off + 1;
 }
 
 # doc_emit: write null-terminated `s` into `buf` at `off` when non-nil, only
@@ -291,80 +413,30 @@ fun doc_emit(buf: *u8, off: usize, s: str) usize {
     ret off + n;
 }
 
-# doc_copy: copy byte span `sp` of the file text into `buf` at `off` when
-# non-nil, only measuring its length otherwise, returning the advanced offset.
-fun doc_copy(buf: *u8, off: usize, file: *src.SourceFile, sp: token.Span) usize {
-    if (buf != nil && sp.len > 0) {
-        mem.raw_copy((buf::usize + off)::ptr, (file.text::usize + sp.offset)::ptr, sp.len);
+# doc_text: copy a summary / description span into `buf`, folding each embedded
+# comment-line break (`\n` then the next line's `#`, whitespace, and an optional
+# single space) into a single rendered space. a span returned by `fe/doc.mach`
+# spans only the first line's leading `#`; continuation lines keep their `#`
+# prefix, so this strips them to leave clean prose. measures when `buf` is nil.
+fun doc_text(buf: *u8, off: usize, source: str, sp: token.Span) usize {
+    val s: *u8 = source::*u8;
+    val end: usize = sp.offset + sp.len;
+    var i: usize = sp.offset;
+    for (i < end) {
+        if (s[i] == '\n') {
+            i = i + 1;
+            for (i < end && (s[i] == ' ' || s[i] == '\t')) { i = i + 1; }
+            if (i < end && s[i] == '#') { i = i + 1; }
+            for (i < end && (s[i] == ' ' || s[i] == '\t')) { i = i + 1; }
+            if (buf != nil) { buf[off] = ' '; }
+            off = off + 1;
+            cnt;
+        }
+        if (buf != nil) { buf[off] = s[i]; }
+        off = off + 1;
+        i = i + 1;
     }
-    ret off + sp.len;
-}
-
-# doc_line_body: the rendered slice of comment line `line` (1-based) as a byte
-# span into the file text — past the leading whitespace, `#`, and a single
-# following space. zero-length for an out-of-range line. unlike doc_separator
-# this does not special-case a `---` row, so callers see its raw text.
-fun doc_line_body(file: *src.SourceFile, line: usize) token.Span {
-    var sp: token.Span;
-    sp.offset = 0;
-    sp.len    = 0;
-    val bo: Option[src.LineSpan] = src.line_bounds(file, line);
-    if (!is_some[src.LineSpan](bo)) { ret sp; }
-    val lb: src.LineSpan = unwrap[src.LineSpan](bo);
-    val s: *u8 = file.text::*u8;
-    var i: usize = features.first_nonspace(s, lb.start, lb.end);
-    if (i < lb.end && s[i] == '#') { i = i + 1; }
-    if (i < lb.end && s[i] == ' ') { i = i + 1; }
-    sp.offset = i;
-    sp.len    = lb.end - i;
-    ret sp;
-}
-
-# doc_separator: true when comment `line`'s rendered body begins with `---`,
-# marking a stanza separator that renders as a horizontal rule.
-fun doc_separator(file: *src.SourceFile, line: usize) bool {
-    val body: token.Span = doc_line_body(file, line);
-    val s: *u8 = file.text::*u8;
-    ret str_starts_with((s::usize + body.offset)::str, "---");
-}
-
-# doc_field: when body span `body` is an `ident:` field row (an identifier, a
-# colon, then whitespace or end of line), write the identifier span into `name`
-# and the description span — past the colon and its alignment padding — into
-# `desc`, and return true. false for any non-field row.
-fun doc_field(file: *src.SourceFile, body: token.Span, name: *token.Span, desc: *token.Span) bool {
-    val s: *u8 = file.text::*u8;
-    val start: usize = body.offset;
-    val end:   usize = body.offset + body.len;
-    if (start >= end || !doc_ident_start(s[start])) { ret false; }
-
-    var i: usize = start + 1;
-    for (i < end && doc_ident_char(s[i])) { i = i + 1; }
-    if (i >= end || s[i] != ':') { ret false; }
-    val name_end: usize = i;
-    i = i + 1;
-    if (i < end && s[i] != ' ' && s[i] != '\t') { ret false; }
-
-    val d: usize = features.first_nonspace(s, i, end);
-    var nm: token.Span;
-    nm.offset = start;
-    nm.len    = name_end - start;
-    @name = nm;
-    var ds: token.Span;
-    ds.offset = d;
-    ds.len    = end - d;
-    @desc = ds;
-    ret true;
-}
-
-# doc_ident_start: true when `c` may begin a field identifier.
-fun doc_ident_start(c: u8) bool {
-    ret (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
-}
-
-# doc_ident_char: true when `c` may continue a field identifier.
-fun doc_ident_char(c: u8) bool {
-    ret doc_ident_start(c) || (c >= '0' && c <= '9');
+    ret off;
 }
 
 # compose_kind_name: a `<kind> <name>` rendering for a symbol with no local

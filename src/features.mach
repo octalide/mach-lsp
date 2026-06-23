@@ -47,6 +47,7 @@ use decl:   mach.lang.fe.ast.decl;
 use stmt:   mach.lang.fe.ast.stmt;
 use expr:   mach.lang.fe.ast.expr;
 use atype:  mach.lang.fe.ast.type;
+use fedoc:  mach.lang.fe.doc;
 use res:    mach.lang.fe.resolve;
 
 # SymbolRef: a symbol a position references, joined with the location of the
@@ -433,54 +434,64 @@ fun param_signature_span(a: *ast.Ast, sym: *res.Symbol) Option[token.Span] {
     ret some[token.Span](sp);
 }
 
-# doc_comment_span: the byte span of the contiguous run of `#` comment lines
-# immediately above a local symbol's declaration — its doc comment. the lexer
-# discards comment tokens, so this back-scans the file's line index the way
-# `mach doc` scans raw text: from the decl's line it walks backward over
-# comment lines (tolerating leading whitespace before the `#`), stopping at
-# the first non-comment line. none for a param / generic, a decl with no
-# comment run flush above it, or a decl on the first line.
+# doc_span_of: the first-class doc-block span the parser attached to a local
+# symbol's declaration (`Decl.doc`) — the `#`-comment run directly above the
+# decl with its `#[...]` attribute lines excluded, or none. the attribute-aware
+# replacement for the old source line-scan: it carries no `#[attr]` bytes, so the
+# rendered doc never folds in attribute syntax. none for a param / generic (which
+# carry no Decl node), a decl with no docstring (empty `doc` span), or an absent /
+# out-of-range decl.
 # ---
-# a:    the Ast owning the decl
-# sym:  the symbol whose doc comment is wanted
-# file: the source file owning the decl
-# ret:  some(span) covering the comment run (its line endings included), or none
-pub fun doc_comment_span(a: *ast.Ast, sym: *res.Symbol, file: *src.SourceFile) Option[token.Span] {
+# a:   the Ast owning the decl
+# sym: the symbol whose doc block is wanted
+# ret: some(span) covering the doc block within the file text, or none
+pub fun doc_span_of(a: *ast.Ast, sym: *res.Symbol) Option[token.Span] {
     if (sym.kind == res.SYM_PARAM || sym.kind == res.SYM_GENERIC) { ret none[token.Span](); }
-    val dso: Option[token.Span] = decl_span_of(a, sym);
-    if (!is_some[token.Span](dso)) { ret none[token.Span](); }
-    val decl_line: usize = src.position(file, unwrap[token.Span](dso).offset).line;
-
-    var first: usize = decl_line;
-    for (first > 1 && comment_line(file, first - 1)) { first = first - 1; }
-    if (first == decl_line) { ret none[token.Span](); }
-
-    val so: Option[usize] = src.line_start(file, first);
-    val eo: Option[usize] = src.line_start(file, decl_line);
-    if (!is_some[usize](so) || !is_some[usize](eo)) { ret none[token.Span](); }
-
-    var sp: token.Span;
-    sp.offset = unwrap[usize](so);
-    sp.len    = unwrap[usize](eo) - sp.offset;
-    ret some[token.Span](sp);
+    if (sym.decl == id.DECL_NIL) { ret none[token.Span](); }
+    val d_opt: Option[*decl.Decl] = ast.get_decl(a, sym.decl);
+    if (!is_some[*decl.Decl](d_opt)) { ret none[token.Span](); }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+    if (d.doc.len == 0) { ret none[token.Span](); }
+    ret some[token.Span](d.doc);
 }
 
-# first_nonspace: index of the first non-space, non-tab byte in `s` at or after
-# `pos`, clamped to `end`. shared by the doc-comment scan and its renderer.
-pub fun first_nonspace(s: *u8, pos: usize, end: usize) usize {
-    var i: usize = pos;
-    for (i < end && (s[i] == ' ' || s[i] == '\t')) { i = i + 1; }
-    ret i;
+# field_doc_desc: the description span of the component in the record / union doc
+# block `doc` whose component name matches the field name `field_name` — scanned
+# through `fe/doc.mach`'s component cursor, comparing each component's `name_span`
+# bytes against the field-name bytes. both spans index into the declaring module's
+# `source`, since the doc block and the field declaration share that file. none
+# when the doc block has no matching component, no component block at all, or an
+# empty matching description.
+# ---
+# source:     the declaring module's source text (both spans point into it)
+# doc:        the record / union declaration's `Decl.doc` span
+# field_name: the field's declared-name span in `source`
+# ret:        some(description span) for the matching component, or none
+pub fun field_doc_desc(source: str, doc: token.Span, field_name: token.Span) Option[token.Span] {
+    if (doc.len == 0 || field_name.len == 0) { ret none[token.Span](); }
+    var it: fedoc.DocComponentIter = fedoc.component_iter(source, doc);
+    var c: fedoc.DocComponent;
+    for (fedoc.component_next(?it, ?c)) {
+        if (same_source_span_equal(source, c.name_span, field_name)) {
+            if (c.desc_span.len == 0) { ret none[token.Span](); }
+            ret some[token.Span](c.desc_span);
+        }
+    }
+    ret none[token.Span]();
 }
 
-# comment_line: true when the 1-based `line`'s first significant byte is `#`.
-fun comment_line(file: *src.SourceFile, line: usize) bool {
-    val bo: Option[src.LineSpan] = src.line_bounds(file, line);
-    if (!is_some[src.LineSpan](bo)) { ret false; }
-    val lb: src.LineSpan = unwrap[src.LineSpan](bo);
-    val s: *u8 = file.text::*u8;
-    val i: usize = first_nonspace(s, lb.start, lb.end);
-    ret i < lb.end && s[i] == '#';
+# same_source_span_equal: true when spans `a` and `b` cover identical bytes within
+# the single source text `source`. the same-file analogue of `span_bytes_equal`,
+# used to match a doc component's name against a field name (both spans into the
+# declaring module's source).
+fun same_source_span_equal(source: str, a: token.Span, b: token.Span) bool {
+    if (a.len != b.len) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        if (source[a.offset + i] != source[b.offset + i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 # kind_label: a human-readable label for a symbol kind, for hover rendering.
@@ -987,4 +998,160 @@ test "features: field_decl_self_at hits a field name and misses elsewhere" {
     ast.dnit(?a);
     if (fail) { ret 1; }
     ret 0;
+}
+
+# add_doc_fun: append a function decl carrying the doc-block span `[doc_off,
+# doc_off + doc_len)` to `a`, returning its DeclId. the function payload is left
+# zeroed; only `kind` and `doc` matter for the doc-retrieval tests.
+fun add_doc_fun(a: *ast.Ast, doc_off: usize, doc_len: usize) id.DeclId {
+    var d: decl.Decl;
+    d.kind             = decl.DECL_KIND_FUN;
+    d.flags            = 0;
+    d.doc.offset       = doc_off;
+    d.doc.len          = doc_len;
+    d.decorators_start = 0;
+    d.decorators_len   = 0;
+    d.data.fun_.name.offset   = 0;
+    d.data.fun_.name.len      = 0;
+    d.data.fun_.generics_start = 0;
+    d.data.fun_.generics_len   = 0;
+    d.data.fun_.params_start   = 0;
+    d.data.fun_.params_len     = 0;
+    d.data.fun_.return_type    = id.TYPE_NIL;
+    d.data.fun_.body           = id.STMT_NIL;
+    val r: Result[id.DeclId, str] = ast.add_decl(a, d);
+    ret unwrap_ok[id.DeclId, str](r);
+}
+
+# fun_sym: a SYM_FUN symbol whose decl is `did`, for the doc-retrieval tests.
+fun fun_sym(did: id.DeclId) res.Symbol {
+    var s: res.Symbol;
+    s.kind   = res.SYM_FUN;
+    s.name   = intern.STR_NIL;
+    s.decl   = did;
+    s.slot   = 0;
+    s.origin = 0::sess.ModuleId;
+    ret s;
+}
+
+test "features: doc_span_of returns the decl's first-class doc span" {
+    var pa: Allocator;
+    page.make(?pa);
+    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
+    val did: id.DeclId = add_doc_fun(?a, 4, 9);
+    var sym: res.Symbol = fun_sym(did);
+
+    var fail: bool = false;
+    val o: Option[token.Span] = doc_span_of(?a, ?sym);
+    if (is_none[token.Span](o)) { fail = true; }
+    or {
+        val sp: token.Span = unwrap[token.Span](o);
+        if (sp.offset != 4 || sp.len != 9) { fail = true; }
+    }
+
+    ast.dnit(?a);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "features: doc_span_of returns none for a decl with no docstring" {
+    var pa: Allocator;
+    page.make(?pa);
+    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
+    val did: id.DeclId = add_doc_fun(?a, 0, 0);   # empty doc span = no docstring
+    var sym: res.Symbol = fun_sym(did);
+
+    val ok: bool = is_none[token.Span](doc_span_of(?a, ?sym));
+    ast.dnit(?a);
+    if (!ok) { ret 1; }
+    ret 0;
+}
+
+test "features: doc_span_of returns none for a param symbol" {
+    var pa: Allocator;
+    page.make(?pa);
+    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
+    val did: id.DeclId = add_doc_fun(?a, 4, 9);
+    var sym: res.Symbol = fun_sym(did);
+    sym.kind = res.SYM_PARAM;
+
+    val ok: bool = is_none[token.Span](doc_span_of(?a, ?sym));
+    ast.dnit(?a);
+    if (!ok) { ret 1; }
+    ret 0;
+}
+
+test "features: field_doc_desc finds the matching component's description" {
+    # the doc block and the rec body share one source, so the field-name query
+    # span and the component name span both point into `src` — the same-file
+    # match field_doc_desc performs in `field_hover_markdown`.
+    #             0         1         2         3         4         5         6         7         8         9
+    #             0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456
+    val src: str = "# a point\n# ---\n# x: the horizontal coordinate\n# y: the vertical coordinate\nrec P { x: i32; y: i32; }";
+    var doc: token.Span;
+    doc.offset = 0;
+    doc.len    = 75;   # through the end of the `# y: ...` component, before the rec body
+    # the rec-body field names: "x" at offset 84, "y" at offset 92.
+
+    var fail: bool = false;
+    # "y" field -> the "y" component description.
+    val oy: Option[token.Span] = field_doc_desc(src, doc, name_span_in(92, 1));
+    if (is_none[token.Span](oy)) { fail = true; }
+    or {
+        val sp: token.Span = unwrap[token.Span](oy);
+        if (!region_eq(src, sp, "the vertical coordinate")) { fail = true; }
+    }
+    # "x" field -> the "x" component description.
+    val ox: Option[token.Span] = field_doc_desc(src, doc, name_span_in(84, 1));
+    if (is_none[token.Span](ox)) { fail = true; }
+    or {
+        val sp: token.Span = unwrap[token.Span](ox);
+        if (!region_eq(src, sp, "the horizontal coordinate")) { fail = true; }
+    }
+
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "features: field_doc_desc returns none when no component matches" {
+    val src: str = "# a point\n# ---\n# x: the horizontal coordinate\nrec P { z: i32; }";
+    var doc: token.Span;
+    doc.offset = 0;
+    doc.len    = 46;
+    # "z" field name at offset 55 — no matching component.
+    val ok: bool = is_none[token.Span](field_doc_desc(src, doc, name_span_in(55, 1)));
+    if (!ok) { ret 1; }
+    ret 0;
+}
+
+test "features: field_doc_desc returns none for a summary-only doc block" {
+    val src: str = "# just a summary, no components\nrec P { x: i32; }";
+    var doc: token.Span;
+    doc.offset = 0;
+    doc.len    = 31;
+    # "x" field name at offset 40 — the block has no component lines.
+    val ok: bool = is_none[token.Span](field_doc_desc(src, doc, name_span_in(40, 1)));
+    if (!ok) { ret 1; }
+    ret 0;
+}
+
+# name_span_in: a span over `[offset, offset + len)`, the test builder for a
+# field-name query into the shared doc/body source.
+fun name_span_in(offset: usize, len: usize) token.Span {
+    var sp: token.Span;
+    sp.offset = offset;
+    sp.len    = len;
+    ret sp;
+}
+
+# region_eq: true when `span` of `source` equals the byte content of `expect`.
+fun region_eq(source: str, span: token.Span, expect: str) bool {
+    val n: usize = str_len(expect);
+    if (span.len != n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (source[span.offset + i] != expect[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
