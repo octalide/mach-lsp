@@ -31,3 +31,6 @@ jobs:
 
       - name: Build
         run: mach build .
+
+      - name: Test
+        run: mach test .
