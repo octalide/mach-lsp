@@ -4,27 +4,74 @@
 # behaviour cannot go there. every notable event is appended to a fixed log
 # path instead. tracing is best-effort: a failed open or write is silently
 # dropped so logging never disturbs the protocol stream.
+#
+# tracing is gated on the MLS_TRACE environment variable, evaluated once on
+# the first log call: when it is unset every later call returns immediately
+# with no syscalls. when it is set the log file is opened once and the
+# descriptor is reused for the life of the process, so each enabled call
+# costs a single write.
 
 use std.types.string.str;
 use std.types.string.str_len;
 use std.types.size.usize;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
 
 use os: std.system.os;
+use env: std.process.env;
 
 # LOG_PATH: fixed file the trace log is appended to.
 val LOG_PATH: str = "/tmp/mach-lsp.log";
 
+# TRACE_VAR: environment variable that enables tracing when set.
+val TRACE_VAR: str = "MLS_TRACE";
+
+# LOG_CHECKED: whether the MLS_TRACE gate has been evaluated yet.
+var LOG_CHECKED: bool = false;
+
+# LOG_ENABLED: cached MLS_TRACE gate; writes happen only when true.
+var LOG_ENABLED: bool = false;
+
+# LOG_FD: trace log descriptor, opened lazily once tracing is enabled. -1
+# until opened, and left at -1 when the open fails so logging stays a silent
+# no-op (best-effort).
+var LOG_FD: i64 = -1;
+
+# trace_enabled: report whether the MLS_TRACE variable is set.
+# ---
+# ret: true when MLS_TRACE is present in the environment
+fun trace_enabled() bool {
+    var buf: [1]u8;
+    ret env.get(TRACE_VAR, ?buf[0], 1) >= 0;
+}
+
+# trace_open: open the trace log for appending.
+# ---
+# ret: a live descriptor, or a negative value on failure
+fun trace_open() i64 {
+    val flags: i32 = os.O_WRONLY | os.O_CREAT | os.O_APPEND;
+    ret os.open(os.AT_FDCWD, LOG_PATH::*u8, flags, 420);
+}
+
 # log: append a message to the trace log, best-effort.
+#
+# the MLS_TRACE gate and log descriptor are resolved on the first call and
+# reused thereafter; when tracing is disabled this returns with no syscalls.
 # ---
 # msg: null-terminated message to append; nil / empty is a no-op
 pub fun log(msg: str) {
+    if (!LOG_CHECKED) {
+        LOG_CHECKED = true;
+        LOG_ENABLED = trace_enabled();
+        if (LOG_ENABLED) { LOG_FD = trace_open(); }
+    }
+
+    if (!LOG_ENABLED) { ret; }
+    if (LOG_FD < 0) { ret; }
     if (msg == nil) { ret; }
     val len: usize = str_len(msg);
     if (len == 0) { ret; }
 
-    val flags: i32 = os.O_WRONLY | os.O_CREAT | os.O_APPEND;
-    val fd: i64 = os.open(os.AT_FDCWD, LOG_PATH::*u8, flags, 420);
-    if (fd < 0) { ret; }
-    os.write(fd::i32, msg::*u8, len);
-    os.close(fd::i32);
+    os.write(LOG_FD::i32, msg::*u8, len);
 }
