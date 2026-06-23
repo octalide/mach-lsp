@@ -1,8 +1,0 @@
-# tool: a secondary binary artifact's entry, the sole path to toolonly. the union
-# over every declared artifact's closure must load toolonly so workspace features
-# see its use-sites.
-use mbfix.toolonly.toolmain;
-
-fun main() i64 {
-    ret toolmain();
-}

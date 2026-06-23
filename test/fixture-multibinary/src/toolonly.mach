@@ -1,8 +1,0 @@
-# toolonly: reachable only through the non-primary `tool` binary's entry. its use
-# of core.shared is in the union graph only when the union covers every artifact's
-# closure, not just the primary's.
-use mbfix.core.shared;
-
-pub fun toolmain() i64 {
-    ret shared();
-}
