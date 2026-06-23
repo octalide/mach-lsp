@@ -29,6 +29,7 @@ use std.types.string.str_len;
 use std.types.string.str_equals;
 use std.types.string.str_starts_with;
 use std.types.option.Option;
+use std.types.option.some;
 use std.types.option.none;
 use std.types.option.is_some;
 use std.types.option.unwrap;
@@ -46,11 +47,13 @@ use sess:   mach.lang.session;
 use src:    mach.lang.source;
 use intern: mach.lang.intern;
 use editor: mach.lang.editor;
+use type:   mach.lang.type;
 use token:  mach.lang.fe.token;
 use ast:    mach.lang.fe.ast;
 use id:     mach.lang.fe.ast.id;
 use decl:   mach.lang.fe.ast.decl;
 use res:    mach.lang.fe.resolve;
+use sema:   mach.lang.fe.sema;
 
 use transport: mls.transport;
 use json:      mls.json;
@@ -63,6 +66,7 @@ use project:   mls.project;
 # ---
 # interner: the session's string interner, for resolving symbol-name StrIds
 # file:     the document's SourceFile (text + line index for offset/position)
+# fid:      the document's FileId (for the type-aware field path's sema_doc)
 # a:        the buffer's parsed Ast
 # rr:       the buffer's ResolveResult side tables
 # own:      this buffer's module id (Symbol.origin equals it for local symbols)
@@ -70,6 +74,7 @@ use project:   mls.project;
 rec Analyzed {
     interner: *intern.Interner;
     file:     *src.SourceFile;
+    fid:      src.FileId;
     a:        *ast.Ast;
     rr:       *res.ResolveResult;
     own:      sess.ModuleId;
@@ -396,7 +401,13 @@ pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     val offset: usize = unwrap[usize](off_o);
 
     val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
-    if (!is_some[features.SymbolRef](ro)) { reply_null(alloc, id_raw); ret; }
+    if (!is_some[features.SymbolRef](ro)) {
+        # name resolution leaves a value-field access unbound, so a cursor on a
+        # field name yields no SymbolRef — fall through to the type-driven field
+        # path before giving up.
+        if (field_definition(ws, alloc, ?an, uri, offset, id_raw)) { ret; }
+        reply_null(alloc, id_raw); ret;
+    }
     val sr: features.SymbolRef = unwrap[features.SymbolRef](ro);
 
     val so: Option[*res.Symbol] = features.symbol(an.rr, sr.sym_id);
@@ -421,6 +432,131 @@ pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     send6(alloc, p1, id_raw, p2, loc, p3, nil, nil);
 
     json.free_str(loc, alloc);
+    json.free_str(id_raw, alloc);
+}
+
+# field_definition: the type-driven go-to-definition path for a record / union
+# field, consulted when the symbol-table pivot finds nothing at `offset`. handles
+# three field positions: a member access `foo.bar`, a struct-literal field name
+# `T{ bar: ... }`, and a field's own declaration site (which resolves to itself).
+# the first two type the referencing expression, peel it to its record site, and
+# match the field name; the third matches the cursor against the rec / uni decl's
+# own field names. emits the field declaration's Location and returns true when a
+# field is found and replied; returns false (without replying) so the caller can
+# fall back to a null reply otherwise. requires a loaded project root for typing.
+# ---
+# ws:     the workspace
+# alloc:  request allocator
+# an:     the analyzed request document
+# uri:    the request document URI
+# offset: cursor byte offset into the buffer
+# id_raw: the raw JSON request id (for the reply)
+# ret:    true when a field declaration was located and emitted
+fun field_definition(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, uri: str, offset: usize, id_raw: str) bool {
+    if (an.root == nil) { ret false; }
+
+    val fo: Option[features.FieldRef] = features.field_ref_at(an.a, offset);
+    if (is_some[features.FieldRef](fo)) {
+        val fr: features.FieldRef = unwrap[features.FieldRef](fo);
+
+        val sr_r: Result[*sema.SemaResult, str] = project.sema_doc(ws, an.root, an.fid);
+        if (is_err[*sema.SemaResult, str](sr_r)) { ret false; }
+        val sr: *sema.SemaResult = unwrap_ok[*sema.SemaResult, str](sr_r);
+
+        val tid: type.TypeId = project.type_of(sr, fr.host);
+        val rso: Option[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.a, an.file, tid);
+        if (!is_some[project.RecordSite](rso)) { ret false; }
+        val rs: project.RecordSite = unwrap[project.RecordSite](rso);
+
+        val spo: Option[token.Span] = features.field_decl_span(rs.a, rs.file, rs.fields_start, rs.fields_len, an.file, fr.name_span);
+        if (!is_some[token.Span](spo)) { ret false; }
+        ret emit_field_location(ws, alloc, an, uri, rs, unwrap[token.Span](spo), id_raw);
+    }
+
+    # the cursor may sit on a field's own declaration name inside a rec / uni;
+    # resolve it to itself by matching the offset against the decl's field names.
+    val self_o: Option[FieldSelf] = field_self_at(an, offset);
+    if (is_some[FieldSelf](self_o)) {
+        val fs: FieldSelf = unwrap[FieldSelf](self_o);
+        val loc: str = location_json(an.file, uri, fs.name, alloc);
+        if (loc == nil) { ret false; }
+        reply_result(alloc, id_raw, loc);
+        json.free_str(loc, alloc);
+        ret true;
+    }
+
+    ret false;
+}
+
+# FieldSelf: a field declaration the cursor sits on at its own definition site —
+# the field name span resolves to itself for go-to-definition.
+# ---
+# name: byte span of the field name in the buffer
+rec FieldSelf {
+    name: token.Span;
+}
+
+# field_self_at: the rec / uni field whose own declaration name covers `offset` in
+# the buffer, or none. enumerates the buffer's record / union declarations and
+# their fields so a cursor on a field's binding name resolves to itself.
+# ---
+# an:     the analyzed request document
+# offset: cursor byte offset into the buffer
+# ret:    some(FieldSelf) on a field declaration name, or none
+fun field_self_at(an: *Analyzed, offset: usize) Option[FieldSelf] {
+    val did: id.DeclId = ast.offset_to_decl(an.a, offset);
+    if (did == id.DECL_NIL) { ret none[FieldSelf](); }
+    val d_opt: Option[*decl.Decl] = ast.get_decl(an.a, did);
+    if (!is_some[*decl.Decl](d_opt)) { ret none[FieldSelf](); }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+
+    var start: u32 = 0;
+    var len:   u32 = 0;
+    if (d.kind == decl.DECL_KIND_REC) {
+        start = d.data.rec_.fields_start;
+        len   = d.data.rec_.fields_len;
+    } or (d.kind == decl.DECL_KIND_UNI) {
+        start = d.data.uni_.fields_start;
+        len   = d.data.uni_.fields_len;
+    } or {
+        ret none[FieldSelf]();
+    }
+
+    val nso: Option[token.Span] = features.field_decl_self_at(an.a, start, len, offset);
+    if (!is_some[token.Span](nso)) { ret none[FieldSelf](); }
+    var fs: FieldSelf;
+    fs.name = unwrap[token.Span](nso);
+    ret some[FieldSelf](fs);
+}
+
+# emit_field_location: send the Location of a field declaration at its record
+# site. builds the site's `file://` URI (the buffer's own URI when the record is
+# declared in this module, else the defining module's on-disk file) and emits the
+# field name span. true on success; false on a URI / allocation failure.
+fun emit_field_location(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, uri: str, rs: project.RecordSite, name: token.Span, id_raw: str) bool {
+    var furi: str = uri;
+    var owned: bool = false;
+    if (rs.origin != an.own) {
+        furi = project.module_uri(ws, an.root, rs.origin);
+        if (furi == nil) { ret false; }
+        owned = true;
+    }
+
+    val loc: str = location_json(rs.file, furi, name, alloc);
+    if (owned) { json.free_str(furi, ws.alloc); }
+    if (loc == nil) { ret false; }
+    reply_result(alloc, id_raw, loc);
+    json.free_str(loc, alloc);
+    ret true;
+}
+
+# reply_result: send a JSON-RPC success reply carrying `result` for request
+# `id_raw`. shared by the field-definition replies.
+fun reply_result(alloc: *Allocator, id_raw: str, result: str) {
+    val p1: str = "{\"jsonrpc\":\"2.0\",\"id\":";
+    val p2: str = ",\"result\":";
+    val p3: str = "}";
+    send6(alloc, p1, id_raw, p2, result, p3, nil, nil);
     json.free_str(id_raw, alloc);
 }
 
@@ -748,6 +884,7 @@ fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *documents.
     if (!is_some[*src.SourceFile](fo)) { ret false; }
     out.interner = project.interner(ws);
     out.file     = unwrap[*src.SourceFile](fo);
+    out.fid      = doc.file_id;
     out.root     = root;
     out.own      = project.own_module(root, doc.file_id);
     ret true;

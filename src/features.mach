@@ -27,7 +27,14 @@ use std.types.option.Option;
 use std.types.option.some;
 use std.types.option.none;
 use std.types.option.is_some;
+use std.types.option.is_none;
 use std.types.option.unwrap;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+
+use std.allocator.Allocator;
+use page: std.allocator.page;
 
 use sess:   mach.lang.session;
 use src:    mach.lang.source;
@@ -693,4 +700,291 @@ fun type_name_span(a: *ast.Ast, tid: id.TypeId) Option[token.Span] {
     val t: *atype.Type = unwrap[*atype.Type](t_opt);
     if (t.kind == atype.TYPE_KIND_NAMED) { ret some[token.Span](t.data.named.name); }
     ret none[token.Span]();
+}
+
+# FieldRef: a record / union field a cursor position references, before the field
+# is typed. name resolution leaves a value-field access unbound (`expr_resolved`
+# is SYMBOL_NIL for a MEMBER node), so this is the type-driven parallel to
+# `SymbolRef`: the feature layer resolves it to a field declaration through a
+# TypeId rather than the symbol table. `host` is the expression whose semantic
+# type names the record / union the field belongs to — the receiver for a member
+# access `foo.bar`, the struct literal itself for `T{ bar: ... }` (whose inferred
+# type is the record). the caller types `host`, peels it to a record site, then
+# matches `name_span` against the site's fields.
+# ---
+# host:      expression id to type (member receiver, or the struct literal itself)
+# name_span: byte span of the referenced field-name token (`.bar` / `bar`)
+pub rec FieldRef {
+    host:      id.ExprId;
+    name_span: token.Span;
+}
+
+# field_ref_at: the record / union field a byte offset references through a member
+# access or a struct-literal field name, or none. the type-driven pivot for
+# go-to-definition on fields: `expr_resolved` never binds a value-field access, so
+# this recovers the field name and the expression whose type names the field's
+# record directly from the syntax. it is consulted only when the symbol-table
+# pivot (`ref_at`) finds nothing, so an ordinary symbol still wins. pure over the
+# Ast — the actual field-decl lookup needs types and runs in the caller via
+# `field_decl_span`.
+# ---
+# a:      the buffer's parsed Ast
+# offset: byte offset into the buffer
+# ret:    some(FieldRef) on a field-name position, or none
+pub fun field_ref_at(a: *ast.Ast, offset: usize) Option[FieldRef] {
+    val eid: id.ExprId = ast.offset_to_expr(a, offset);
+    if (eid == id.EXPR_NIL) { ret none[FieldRef](); }
+    val eo: Option[*expr.Expr] = ast.get_expr(a, eid);
+    if (!is_some[*expr.Expr](eo)) { ret none[FieldRef](); }
+    val e: *expr.Expr = unwrap[*expr.Expr](eo);
+
+    if (e.kind == expr.EXPR_KIND_MEMBER) {
+        if (!ast.span_contains(e.data.member.name, offset)) { ret none[FieldRef](); }
+        var fr: FieldRef;
+        fr.host      = e.data.member.object;
+        fr.name_span = e.data.member.name;
+        ret some[FieldRef](fr);
+    }
+
+    if (e.kind == expr.EXPR_KIND_STRUCT_LIT) {
+        val start: u32 = e.data.struct_lit.fields_start;
+        val len:   u32 = e.data.struct_lit.fields_len;
+        var i: u32 = 0;
+        for (i < len) {
+            val fi: *expr.FieldInit = ?a.field_inits[start + i];
+            if (ast.span_contains(fi.name, offset)) {
+                var fr: FieldRef;
+                fr.host      = eid;
+                fr.name_span = fi.name;
+                ret some[FieldRef](fr);
+            }
+            i = i + 1;
+        }
+    }
+
+    ret none[FieldRef]();
+}
+
+# field_decl_span: the name span of the field declared in `decl_a` (its rec / uni
+# field range `[fields_start, fields_start + fields_len)` in `decl_a.typed_names`)
+# whose name bytes equal the referencing token `query` in `query_file`, or none
+# when no field matches. pure and session-free — the field-decl locator the
+# go-to-definition path drives once a value's type has been resolved to its record
+# site. comparing bytes across the two files lets the receiver and the declaration
+# live in different modules.
+# ---
+# decl_a:       the declaring module's Ast (its typed_names hold the fields)
+# decl_file:    the SourceFile backing `decl_a` (field-name bytes)
+# fields_start: start index of the field range in `decl_a.typed_names`
+# fields_len:   number of fields
+# query_file:   the SourceFile backing the referencing token
+# query:        byte span of the referenced field name
+# ret:          some(field name span in `decl_a`), or none
+pub fun field_decl_span(decl_a: *ast.Ast, decl_file: *src.SourceFile, fields_start: u32, fields_len: u32, query_file: *src.SourceFile, query: token.Span) Option[token.Span] {
+    if (query.len == 0) { ret none[token.Span](); }
+    var i: u32 = 0;
+    for (i < fields_len) {
+        val tn: *decl.TypedName = ?decl_a.typed_names[fields_start + i];
+        if (span_bytes_equal(decl_file, tn.name, query_file, query)) {
+            ret some[token.Span](tn.name);
+        }
+        i = i + 1;
+    }
+    ret none[token.Span]();
+}
+
+# field_decl_self_at: the name span of the rec / uni field whose own declaration
+# name covers `offset` in `decl_file`, or none. resolves the field's declaration
+# site to itself (go-to-definition on a field where it is declared). scans the
+# field range `[fields_start, fields_start + fields_len)` in `decl_a.typed_names`.
+# ---
+# decl_a:       the Ast holding the field declarations
+# decl_file:    the SourceFile backing `decl_a`
+# fields_start: start index of the field range in `decl_a.typed_names`
+# fields_len:   number of fields
+# offset:       byte offset into `decl_file`
+# ret:          some(field name span) when the offset is on a field name, or none
+pub fun field_decl_self_at(decl_a: *ast.Ast, fields_start: u32, fields_len: u32, offset: usize) Option[token.Span] {
+    var i: u32 = 0;
+    for (i < fields_len) {
+        val tn: *decl.TypedName = ?decl_a.typed_names[fields_start + i];
+        if (ast.span_contains(tn.name, offset)) { ret some[token.Span](tn.name); }
+        i = i + 1;
+    }
+    ret none[token.Span]();
+}
+
+# span_bytes_equal: true when the bytes of `sa` in `fa` exactly equal the bytes of
+# `sb` in `fb`. the cross-file identifier compare the field-decl locator matches a
+# field name against the referencing token with — the two may sit in different
+# source files (a field declared in a dependency, referenced in the buffer).
+# ---
+# fa: source file backing span `sa`
+# sa: byte span in `fa`
+# fb: source file backing span `sb`
+# sb: byte span in `fb`
+# ret: true on an exact byte-for-byte match
+pub fun span_bytes_equal(fa: *src.SourceFile, sa: token.Span, fb: *src.SourceFile, sb: token.Span) bool {
+    if (sa.len != sb.len) { ret false; }
+    val a: *u8 = fa.text::*u8;
+    val b: *u8 = fb.text::*u8;
+    var i: usize = 0;
+    for (i < sa.len) {
+        if (a[sa.offset + i] != b[sb.offset + i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# span_at: a Span over `[offset, offset + len)`. the test builder for field-name /
+# query spans into a stub SourceFile.
+fun span_at(offset: usize, len: usize) token.Span {
+    var sp: token.Span;
+    sp.offset = offset;
+    sp.len    = len;
+    ret sp;
+}
+
+# stub_file: a SourceFile carrying just `text`, enough for the byte-level field-name
+# compares the pure locator does (it reads `file.text` only).
+fun stub_file(text: str) src.SourceFile {
+    var f: src.SourceFile;
+    f.path        = nil;
+    f.text        = text;
+    f.line_starts = nil;
+    f.line_len    = 0;
+    ret f;
+}
+
+# add_field: append a field TypedName named over `[offset, offset + len)` to `a`,
+# returning its index into `a.typed_names`.
+fun add_field(a: *ast.Ast, offset: usize, len: usize) u32 {
+    var tn: decl.TypedName;
+    tn.name     = span_at(offset, len);
+    tn.ty       = id.TYPE_NIL;
+    tn.comptime = false;
+    val r: Result[u32, str] = ast.add_typed_name(a, tn);
+    ret unwrap_ok[u32, str](r);
+}
+
+test "features: field_decl_span matches a field in the same source" {
+    var pa: Allocator;
+    page.make(?pa);
+    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
+    # text "xyzz": fields "x"@0, "y"@1, "zz"@2..3
+    val start: u32 = add_field(?a, 0, 1);
+    add_field(?a, 1, 1);
+    add_field(?a, 2, 2);
+    var f: src.SourceFile = stub_file("xyzz");
+
+    var fail: bool = false;
+    # query "y" (the byte at offset 1) resolves to field "y" at offset 1.
+    val o: Option[token.Span] = field_decl_span(?a, ?f, start, 3, ?f, span_at(1, 1));
+    if (is_none[token.Span](o)) { fail = true; }
+    or {
+        val sp: token.Span = unwrap[token.Span](o);
+        if (sp.offset != 1 || sp.len != 1) { fail = true; }
+    }
+
+    ast.dnit(?a);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "features: field_decl_span matches a field across two sources (dependency)" {
+    var pa: Allocator;
+    page.make(?pa);
+    # the declaring "module" file holds the record fields.
+    var da: ast.Ast = ast.init(?pa, 0::src.FileId);
+    val start: u32 = add_field(?da, 0, 4);   # "name"
+    add_field(?da, 5, 3);                     # "age"
+    var df: src.SourceFile = stub_file("name age");
+    # the referencing buffer file holds a member access "p.age".
+    var qf: src.SourceFile = stub_file("p.age");
+
+    var fail: bool = false;
+    val o: Option[token.Span] = field_decl_span(?da, ?df, start, 2, ?qf, span_at(2, 3));
+    if (is_none[token.Span](o)) { fail = true; }
+    or {
+        val sp: token.Span = unwrap[token.Span](o);
+        if (sp.offset != 5 || sp.len != 3) { fail = true; }
+    }
+
+    ast.dnit(?da);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "features: field_decl_span returns none for an unknown field" {
+    var pa: Allocator;
+    page.make(?pa);
+    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
+    val start: u32 = add_field(?a, 0, 1);   # "x"
+    add_field(?a, 2, 1);                     # "y"
+    var f: src.SourceFile = stub_file("xy");
+    var qf: src.SourceFile = stub_file("o.z");
+
+    val ok: bool = is_none[token.Span](field_decl_span(?a, ?f, start, 2, ?qf, span_at(2, 1)));
+    ast.dnit(?a);
+    if (!ok) { ret 1; }
+    ret 0;
+}
+
+test "features: field_decl_span returns none for an empty field range" {
+    var pa: Allocator;
+    page.make(?pa);
+    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
+    var f: src.SourceFile = stub_file("x");
+
+    val ok: bool = is_none[token.Span](field_decl_span(?a, ?f, 0, 0, ?f, span_at(0, 1)));
+    ast.dnit(?a);
+    if (!ok) { ret 1; }
+    ret 0;
+}
+
+test "features: field_decl_span returns none for a zero-length query" {
+    var pa: Allocator;
+    page.make(?pa);
+    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
+    val start: u32 = add_field(?a, 0, 1);   # "x"
+    var f: src.SourceFile = stub_file("x");
+
+    val ok: bool = is_none[token.Span](field_decl_span(?a, ?f, start, 1, ?f, span_at(0, 0)));
+    ast.dnit(?a);
+    if (!ok) { ret 1; }
+    ret 0;
+}
+
+test "features: span_bytes_equal matches identical bytes across files" {
+    var fa: src.SourceFile = stub_file("alpha");
+    var fb: src.SourceFile = stub_file("xalphay");
+    var fail: bool = false;
+    if (!span_bytes_equal(?fa, span_at(0, 5), ?fb, span_at(1, 5))) { fail = true; }
+    if (span_bytes_equal(?fa, span_at(0, 5), ?fb, span_at(1, 4)))  { fail = true; }
+    if (span_bytes_equal(?fa, span_at(0, 3), ?fb, span_at(0, 3)))  { fail = true; }
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "features: field_decl_self_at hits a field name and misses elsewhere" {
+    var pa: Allocator;
+    page.make(?pa);
+    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
+    val start: u32 = add_field(?a, 4, 1);   # "x" at offset 4
+    add_field(?a, 10, 3);                    # "foo" at offset 10
+
+    var fail: bool = false;
+    # offset 11 sits inside "foo".
+    val hit: Option[token.Span] = field_decl_self_at(?a, start, 2, 11);
+    if (is_none[token.Span](hit)) { fail = true; }
+    or {
+        val sp: token.Span = unwrap[token.Span](hit);
+        if (sp.offset != 10 || sp.len != 3) { fail = true; }
+    }
+    # offset 7 is between the two field names.
+    if (is_some[token.Span](field_decl_self_at(?a, start, 2, 7))) { fail = true; }
+
+    ast.dnit(?a);
+    if (fail) { ret 1; }
+    ret 0;
 }
