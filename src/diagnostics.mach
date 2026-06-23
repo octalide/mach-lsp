@@ -54,6 +54,15 @@ val MAX_DIAGNOSTICS: usize = 200;
 # or editing a buffer stays instant — the project loads lazily on the first
 # feature request, after which the server re-publishes the now-loaded buffers
 # (#96).
+# semantic (type) diagnostics are layered on when — and only when — the governing
+# root's dep closure has already been sema'd (`project.sema_ready`, a load-free
+# check that never triggers a build or the heavy whole-closure `ensure_sema`).
+# `sema_doc` then types the active buffer against the closure's retained dep typing
+# (bounded — one module) and emits its type diagnostics onto the same session
+# DiagList `diagnose_doc` populated, so parse + resolve + type diagnostics publish
+# together. a loaded-but-un-sema'd root publishes parse + resolve only (instant);
+# the server re-publishes with types once a feature request sema's the closure (the
+# sema epoch) (#113).
 # ---
 # w:       the workspace, for routing the document to its governing root
 # es:      editor session holding the buffer
@@ -71,6 +80,13 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, sources: *src.
         ret;
     }
     val list: *diag.DiagList = unwrap_ok[*diag.DiagList, str](dr);
+
+    # append the buffer's type diagnostics when the closure is already sema'd. the
+    # gate is load-free (never `ensure_sema`), so this stays off the build/whole-
+    # closure path — `sema_doc`'s internal `ensure_sema` is a no-op on a ready root.
+    # the type diagnostics land on the same session DiagList `list` points into;
+    # `sema_doc`'s returned typing is the feature layer's, discarded here.
+    if (project.sema_ready(root)) { project.sema_doc(w, root, fid); }
 
     val quoted_uri: str = json.quote(uri, alloc);
     if (quoted_uri == nil) { ret; }
