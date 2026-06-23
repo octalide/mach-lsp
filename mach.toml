@@ -1,7 +1,7 @@
 [project]
 id      = "mls"
 name    = "Mach Language Server"
-version = "0.8.0"
+version = "0.8.1"
 src     = "src"
 dep     = "dep"
 target  = "native"
