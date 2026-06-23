@@ -39,6 +39,7 @@ use page: std.allocator.page;
 use sess:   mach.lang.session;
 use src:    mach.lang.source;
 use intern: mach.lang.intern;
+use type:   mach.lang.type;
 use token:  mach.lang.fe.token;
 use ast:    mach.lang.fe.ast;
 use id:     mach.lang.fe.ast.id;
@@ -49,6 +50,9 @@ use expr:   mach.lang.fe.ast.expr;
 use atype:  mach.lang.fe.ast.type;
 use fedoc:  mach.lang.fe.doc;
 use res:    mach.lang.fe.resolve;
+use sema:   mach.lang.fe.sema;
+
+use mtypes: mls.types;
 
 # SymbolRef: a symbol a position references, joined with the location of the
 # name token that referenced it.
@@ -823,6 +827,157 @@ pub fun field_decl_self_at(decl_a: *ast.Ast, fields_start: u32, fields_len: u32,
         i = i + 1;
     }
     ret none[token.Span]();
+}
+
+# FieldKey: the cross-module identity of a record / union field — the nominal
+# declaration site of its record (`origin`, `decl`) paired with the field name as
+# bytes in the declaring module's source. the field-reference / field-rename walk
+# carries it across every loaded module: a member access or struct-literal init
+# names this field iff its host expression's type peels to the keyed record and the
+# referenced name bytes equal the keyed field name. the name is held as a file +
+# span (not interned) because a field has no Symbol and so no StrId.
+# ---
+# origin:     ModuleId of the module declaring the record / union
+# decl:       DeclId of the rec / uni declaration in `origin`'s Ast
+# decl_file:  SourceFile backing the declaring module (the field-name bytes)
+# field_name: byte span of the field's declared name in `decl_file`
+pub rec FieldKey {
+    origin:     sess.ModuleId;
+    decl:       id.DeclId;
+    decl_file:  *src.SourceFile;
+    field_name: token.Span;
+}
+
+# field_ref_span_at: the field-name span of expr `eid` in module (`a`, `sr`) when
+# it references the keyed field, or none. the field analogue of `expr_ref_span`:
+# resolution never binds a value-field access, so a field reference is recovered
+# by typing the host expression and peeling it to its record's nominal site rather
+# than reading a Symbol. two expression shapes name a field:
+#   - a member access `obj.field`: types the receiver `member.object` and, when
+#     that peels to the keyed record and the member name bytes equal the field
+#     name, yields the member name span;
+#   - a struct literal `T{ field: ... }`: types the literal itself and, when that
+#     peels to the keyed record, yields the matching init-name span.
+# the host type is read from `sr` (the module's SemaResult) and peeled through the
+# session type interner `ti`, so a field reached through `*T` or a generic instance
+# of the record matches the same key. pure over (`a`, `sr`, `ti`) — the caller
+# walks `[0, a.expr_len)` feeding the spans this returns to a sink.
+# ---
+# a:    the module's parsed Ast
+# sr:   the module's SemaResult (per-expr typing)
+# ti:   the session type interner (for nominal peeling)
+# eid:  the expr id to test
+# qf:   the SourceFile backing `a` (the referenced name bytes)
+# key:  the field identity to match
+# ret:  some(name span) when `eid` references the keyed field, or none
+pub fun field_ref_span_at(a: *ast.Ast, sr: *sema.SemaResult, ti: *type.TypeInterner, eid: id.ExprId, qf: *src.SourceFile, key: FieldKey) Option[token.Span] {
+    val eo: Option[*expr.Expr] = ast.get_expr(a, eid);
+    if (!is_some[*expr.Expr](eo)) { ret none[token.Span](); }
+    val e: *expr.Expr = unwrap[*expr.Expr](eo);
+
+    if (e.kind == expr.EXPR_KIND_MEMBER) {
+        if (!host_matches(sr, ti, e.data.member.object, key)) { ret none[token.Span](); }
+        if (!span_bytes_equal(qf, e.data.member.name, key.decl_file, key.field_name)) { ret none[token.Span](); }
+        ret some[token.Span](e.data.member.name);
+    }
+
+    if (e.kind == expr.EXPR_KIND_STRUCT_LIT) {
+        if (!host_matches(sr, ti, eid, key)) { ret none[token.Span](); }
+        val start: u32 = e.data.struct_lit.fields_start;
+        val len:   u32 = e.data.struct_lit.fields_len;
+        var i: u32 = 0;
+        for (i < len) {
+            val fi: *expr.FieldInit = ?a.field_inits[start + i];
+            if (span_bytes_equal(qf, fi.name, key.decl_file, key.field_name)) {
+                ret some[token.Span](fi.name);
+            }
+            i = i + 1;
+        }
+    }
+
+    ret none[token.Span]();
+}
+
+# host_matches: whether host expression `eid`'s type peels to the keyed record's
+# nominal declaration site. the type-identity half of `field_ref_span_at`: a
+# member receiver or a struct literal whose `(origin, decl)` equals the key names
+# the same record across modules, regardless of pointer / generic-instance wrapping
+# (peeled by `nominal_of`).
+fun host_matches(sr: *sema.SemaResult, ti: *type.TypeInterner, eid: id.ExprId, key: FieldKey) bool {
+    val tid: type.TypeId = mtypes.type_of(sr, eid);
+    val no: Option[mtypes.Nominal] = mtypes.nominal_of(ti, tid);
+    if (is_none[mtypes.Nominal](no)) { ret false; }
+    val n: mtypes.Nominal = unwrap[mtypes.Nominal](no);
+    ret n.origin == key.origin && n.decl == key.decl;
+}
+
+# doc_component_name_span: the byte span to rewrite when a doc component's name is
+# renamed — the component in doc block `doc` (within `source`) whose name matches
+# the binding `query` (in `qf`), narrowed to the exact identifier token a rename
+# replaces. for a field or value parameter the component head is `# <name>:` and
+# the whole component `name_span` is the identifier, so it is returned as-is. for a
+# generic the component head keeps its syntactic `# [T]:` bracket form (see
+# `mach.lang.fe.doc`), so the returned span is the inner `T` only — the brackets
+# are preserved. none when no component matches, or (for a generic) the matched
+# component carries no bracketed identifier. matching compares the inner identifier
+# against `query` so a `# [T]:` head matches the generic named `T`.
+# ---
+# source:      the declaring module's source text (the doc block points into it)
+# doc:         the owning decl's `Decl.doc` span
+# qf:          the SourceFile backing `query`
+# query:       byte span of the field / param / generic binding name
+# is_generic:  true to match / rewrite the bracket form `# [T]:`
+# ret:         some(span to rewrite) for the matching component, or none
+pub fun doc_component_name_span(source: str, doc: token.Span, qf: *src.SourceFile, query: token.Span, is_generic: bool) Option[token.Span] {
+    if (doc.len == 0 || query.len == 0) { ret none[token.Span](); }
+    var it: fedoc.DocComponentIter = fedoc.component_iter(source, doc);
+    var c: fedoc.DocComponent;
+    for (fedoc.component_next(?it, ?c)) {
+        val ident: token.Span = component_ident(source, c.name_span, is_generic);
+        if (ident.len == 0) { cnt; }
+        if (span_bytes_equal_2(source, ident, qf, query)) { ret some[token.Span](ident); }
+    }
+    ret none[token.Span]();
+}
+
+# component_ident: the identifier token within a component name span — the whole
+# span for a plain `name`, or the bracketed inner identifier for a generic's `[T]`
+# head. an empty span when a generic head has no `[...]` enclosed single-word
+# identifier. the narrowing `doc_component_name_span` applies so a generic rename
+# rewrites `T` inside `[T]` without disturbing the brackets.
+fun component_ident(source: str, name: token.Span, is_generic: bool) token.Span {
+    if (!is_generic) { ret name; }
+    if (name.len < 3) { ret empty_span(); }
+    val lo: usize = name.offset;
+    val hi: usize = name.offset + name.len;
+    if (source[lo] != '[' || source[hi - 1] != ']') { ret empty_span(); }
+    var sp: token.Span;
+    sp.offset = lo + 1;
+    sp.len    = (hi - 1) - (lo + 1);
+    ret sp;
+}
+
+# empty_span: a zero-length span, the "absent" marker for component_ident.
+fun empty_span() token.Span {
+    var s: token.Span;
+    s.offset = 0;
+    s.len    = 0;
+    ret s;
+}
+
+# span_bytes_equal_2: true when span `sa` in `source` and span `sb` in `fb` cover
+# identical bytes. a cross-source compare where one side is a raw `str` (a doc
+# block lives in the declaring module's source) and the other a SourceFile (the
+# binding name) — bridging `same_source_span_equal` and `span_bytes_equal`.
+fun span_bytes_equal_2(source: str, sa: token.Span, fb: *src.SourceFile, sb: token.Span) bool {
+    if (sa.len != sb.len) { ret false; }
+    val b: *u8 = fb.text::*u8;
+    var i: usize = 0;
+    for (i < sa.len) {
+        if (source[sa.offset + i] != b[sb.offset + i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 # span_bytes_equal: true when the bytes of `sa` in `fa` exactly equal the bytes of

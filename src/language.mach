@@ -632,6 +632,395 @@ fun reply_result(alloc: *Allocator, id_raw: str, result: str) {
     json.free_str(id_raw, alloc);
 }
 
+# FieldTarget: a record / union field resolved from a cursor, the type-driven twin
+# of a SymbolRef for the field references / rename / prepareRename paths. carries
+# the field's cross-module identity (`key`), the record's declaring site (`rs`,
+# for the field-declaration span and its doc block), and whether that site is the
+# active buffer (so the declaring module's edits — the field decl name and the doc
+# component — are placed in the buffer's URI rather than a loaded module's).
+# ---
+# key:            the field's cross-module identity
+# rs:             the record's declaring site (field range, Ast, file, doc)
+# decl_in_buffer: true when the record is declared in the active buffer
+rec FieldTarget {
+    key:            features.FieldKey;
+    rs:             project.RecordSite;
+    decl_in_buffer: bool;
+}
+
+# field_target_at: the record / union field a cursor references, resolved to its
+# cross-module identity and declaring site, or none. drives the field references /
+# rename / prepareRename paths: pivots the offset through `field_ref_at` (a member
+# access or struct-literal field name) or `field_self_at` (a field's own decl
+# name), types the host expression, peels it to a `RecordSite`, and matches the
+# field name to recover its declaring span. none when the position is not on a
+# field, the host cannot be typed, or no field matches. requires a loaded project
+# root for typing.
+# ---
+# ws:     the workspace
+# an:     the analyzed request document
+# offset: cursor byte offset into the buffer
+# ret:    some(FieldTarget) on a field position, or none
+fun field_target_at(ws: *project.Workspace, an: *Analyzed, offset: usize) Option[FieldTarget] {
+    if (an.root == nil) { ret none[FieldTarget](); }
+
+    val fo: Option[features.FieldRef] = features.field_ref_at(an.a, offset);
+    if (is_some[features.FieldRef](fo)) {
+        val fr: features.FieldRef = unwrap[features.FieldRef](fo);
+        val sr_r: Result[*sema.SemaResult, str] = project.sema_doc(ws, an.root, an.fid);
+        if (is_err[*sema.SemaResult, str](sr_r)) { ret none[FieldTarget](); }
+        val tid: type.TypeId = project.type_of(unwrap_ok[*sema.SemaResult, str](sr_r), fr.host);
+        val rso: Option[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.a, an.file, tid);
+        if (!is_some[project.RecordSite](rso)) { ret none[FieldTarget](); }
+        val rs: project.RecordSite = unwrap[project.RecordSite](rso);
+        val spo: Option[token.Span] = features.field_decl_span(rs.a, rs.file, rs.fields_start, rs.fields_len, an.file, fr.name_span);
+        if (!is_some[token.Span](spo)) { ret none[FieldTarget](); }
+        ret some[FieldTarget](make_field_target(an, rs, unwrap[token.Span](spo)));
+    }
+
+    # the cursor may sit on a field's own declaration name inside a rec / uni in
+    # the buffer; resolve it to itself, then to that record's site for the walk.
+    val self_o: Option[FieldSelf] = field_self_at(an, offset);
+    if (is_some[FieldSelf](self_o)) {
+        val fs: FieldSelf = unwrap[FieldSelf](self_o);
+        val did: id.DeclId = ast.offset_to_decl(an.a, offset);
+        val rso: Option[project.RecordSite] = project.record_site_at(ws, an.root, an.own, an.a, an.file, did);
+        if (!is_some[project.RecordSite](rso)) { ret none[FieldTarget](); }
+        ret some[FieldTarget](make_field_target(an, unwrap[project.RecordSite](rso), fs.name));
+    }
+
+    ret none[FieldTarget]();
+}
+
+# make_field_target: assemble a FieldTarget from a resolved record site and the
+# field's declared-name span. the field name and its source live in the record's
+# declaring module (`rs.file`), which is the cross-module byte identity every
+# other module's references are matched against.
+fun make_field_target(an: *Analyzed, rs: project.RecordSite, field_name: token.Span) FieldTarget {
+    var t: FieldTarget;
+    t.key.origin     = rs.origin;
+    t.key.decl       = rs.decl;
+    t.key.decl_file  = rs.file;
+    t.key.field_name = field_name;
+    t.rs             = rs;
+    t.decl_in_buffer = rs.origin == an.own;
+    ret t;
+}
+
+# FieldXRef: one module contributing field references — its Ast, SemaResult (for
+# typing each host expression), source file, document URI, and whether it is the
+# record's declaring module (so its field-declaration name span and doc component
+# are emitted). the active buffer is always `out[0]`; each other loaded module
+# that types a reference is another (owned `file://` URI freed by free_field_refs).
+rec FieldXRef {
+    a:        *ast.Ast;
+    sr:       *sema.SemaResult;
+    file:     *src.SourceFile;
+    uri:      str;
+    declaring: bool;
+}
+
+# build_field_refs: populate `out` with the modules that reference the keyed field
+# and return the count. `out[0]` is always the active buffer (live SemaResult);
+# each subsequent entry is a loaded module whose SemaResult types at least one
+# reference to the field, skipping the buffer's on-disk twin so its live edits are
+# not double-counted. every module is walked (a field is reachable wherever its
+# record is imported), so this is not gated on project ownership — the rename gate
+# is applied separately by the caller.
+# ---
+# ws:    the workspace
+# an:    the active buffer's analysis
+# uri:   the active buffer's document URI
+# t:     the resolved field target
+# out:   array of at least `cap` FieldXRef slots
+# cap:   capacity of `out` (module_count + 1)
+# ret:   number of populated entries (>= 1), or 0 when the buffer cannot be typed
+fun build_field_refs(ws: *project.Workspace, an: Analyzed, uri: str, t: FieldTarget, out: *FieldXRef, cap: usize) usize {
+    val sr_r: Result[*sema.SemaResult, str] = project.sema_doc(ws, an.root, an.fid);
+    if (is_err[*sema.SemaResult, str](sr_r)) { ret 0; }
+    out[0].a         = an.a;
+    out[0].sr        = unwrap_ok[*sema.SemaResult, str](sr_r);
+    out[0].file      = an.file;
+    out[0].uri       = uri;
+    out[0].declaring = t.decl_in_buffer;
+    var n: usize = 1;
+
+    val self_o: Option[sess.ModuleId] = project.module_for_uri(ws, an.root, uri);
+    val have_self: bool = is_some[sess.ModuleId](self_o);
+    var self_mid: sess.ModuleId = 0::sess.ModuleId;
+    if (have_self) { self_mid = unwrap[sess.ModuleId](self_o); }
+
+    val mc: u32 = project.module_count(an.root);
+    var mid: u32 = 0;
+    for (mid < mc && n < cap) {
+        val cur: sess.ModuleId = mid::sess.ModuleId;
+        if (have_self && cur == self_mid) { mid = mid + 1; cnt; }
+        val mv_o: Option[project.ModuleView] = project.module_view(ws, an.root, cur);
+        val ms_o: Option[*sema.SemaResult] = project.module_sema(ws, an.root, cur);
+        if (!is_some[project.ModuleView](mv_o) || !is_some[*sema.SemaResult](ms_o)) { mid = mid + 1; cnt; }
+        val muri: str = project.module_uri(ws, an.root, cur);
+        if (muri == nil) { mid = mid + 1; cnt; }
+        val mv: project.ModuleView = unwrap[project.ModuleView](mv_o);
+        out[n].a         = mv.a;
+        out[n].sr        = unwrap[*sema.SemaResult](ms_o);
+        out[n].file      = mv.file;
+        out[n].uri       = muri;
+        out[n].declaring = cur == t.key.origin;
+        n = n + 1;
+        mid = mid + 1;
+    }
+    ret n;
+}
+
+# free_field_refs: release the owned `file://` URIs of the graph-module entries.
+# refs[0] borrows the request URI and is skipped.
+fun free_field_refs(ws: *project.Workspace, refs: *FieldXRef, n: usize) {
+    var i: usize = 1;
+    for (i < n) {
+        if (refs[i].uri != nil) { json.free_str(refs[i].uri, ws.alloc); }
+        i = i + 1;
+    }
+}
+
+# walk_field_sites: feed every site naming the keyed field in module `s` to the
+# sink — every member access / struct-literal init whose host type peels to the
+# keyed record, plus (when `s` is the record's declaring module) the field
+# declaration's own name span and, for rename, the matching `# <field>:` doc
+# component name token. the field decl and doc spans always carry the field name
+# and bypass the (nil) spelling guard.
+fun walk_field_sites(s: *FieldXRef, ti: *type.TypeInterner, t: FieldTarget, want_doc: bool, k: *WalkSink) {
+    var ei: usize = 0;
+    for (ei < s.a.expr_len) {
+        val so: Option[token.Span] = features.field_ref_span_at(s.a, s.sr, ti, ei::id.ExprId, s.file, t.key);
+        if (is_some[token.Span](so)) { sink_emit(k, s.file, s.uri, unwrap[token.Span](so)); }
+        ei = ei + 1;
+    }
+    if (s.declaring) {
+        sink_emit(k, s.file, s.uri, t.key.field_name);
+        if (want_doc) {
+            val d_opt: Option[*decl.Decl] = ast.get_decl(t.rs.a, t.rs.decl);
+            if (is_some[*decl.Decl](d_opt)) {
+                val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+                if (d.doc.len != 0) {
+                    val co: Option[token.Span] = features.doc_component_name_span(t.rs.file.text, d.doc, t.rs.file, t.key.field_name, false);
+                    if (is_some[token.Span](co)) { sink_emit(k, s.file, s.uri, unwrap[token.Span](co)); }
+                }
+            }
+        }
+    }
+}
+
+# field_references: the type-driven references path for a record / union field.
+# resolves the field, walks every loaded module's SemaResult collecting its
+# member-access / struct-literal sites plus the field declaration, and emits a
+# Location[]. true when a field was resolved and replied; false (without replying)
+# so the caller falls back to an empty array.
+fun field_references(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, uri: str, offset: usize, id_raw: str) bool {
+    val to: Option[FieldTarget] = field_target_at(ws, an, offset);
+    if (!is_some[FieldTarget](to)) { ret false; }
+    val t: FieldTarget = unwrap[FieldTarget](to);
+
+    val cap: usize = (project.module_count(an.root) + 1)::usize;
+    val ra: Result[*FieldXRef, str] = allocate[FieldXRef](alloc, cap);
+    if (is_err[*FieldXRef, str](ra)) { ret false; }
+    val refs: *FieldXRef = unwrap_ok[*FieldXRef, str](ra);
+
+    val n: usize = build_field_refs(ws, @an, uri, t, refs, cap);
+    if (n == 0) { deallocate[FieldXRef](alloc, refs, cap); ret false; }
+
+    emit_field_locations(ws, alloc, id_raw, refs, n, t);
+    free_field_refs(ws, refs, n);
+    deallocate[FieldXRef](alloc, refs, cap);
+    ret true;
+}
+
+# field_rename: the type-driven rename path for a record / union field. refuses
+# (returns false without replying — the caller emits an empty edit) when the
+# field's record is declared in a vendored dependency: such a declaration is not
+# the editor's to rewrite. otherwise resolves the field, walks every loaded
+# module, and emits a WorkspaceEdit replacing every member-access / struct-literal
+# site, the field declaration, and the record's matching doc component. true when
+# the edit was replied.
+fun field_rename(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, uri: str, offset: usize, id_raw: str, new_name: str) bool {
+    val to: Option[FieldTarget] = field_target_at(ws, an, offset);
+    if (!is_some[FieldTarget](to)) { ret false; }
+    val t: FieldTarget = unwrap[FieldTarget](to);
+
+    if (!field_record_renameable(ws, an.root, uri, t)) { reply_empty_edit(alloc, id_raw); ret true; }
+
+    val cap: usize = (project.module_count(an.root) + 1)::usize;
+    val ra: Result[*FieldXRef, str] = allocate[FieldXRef](alloc, cap);
+    if (is_err[*FieldXRef, str](ra)) { ret false; }
+    val refs: *FieldXRef = unwrap_ok[*FieldXRef, str](ra);
+
+    val n: usize = build_field_refs(ws, @an, uri, t, refs, cap);
+    if (n == 0) { deallocate[FieldXRef](alloc, refs, cap); reply_empty_edit(alloc, id_raw); ret true; }
+
+    emit_field_rename(ws, alloc, id_raw, refs, n, t, new_name);
+    free_field_refs(ws, refs, n);
+    deallocate[FieldXRef](alloc, refs, cap);
+    ret true;
+}
+
+# field_record_renameable: whether the field's record is the editor's to rewrite —
+# the same gate the symbol rename `renameable` applies, keyed on the record's
+# declaring module. a record declared in a loaded module keys directly on
+# `is_project_module`; a record declared in the active buffer keys on the buffer's
+# on-disk twin (a dependency source opened for editing has a loaded twin that is
+# not project-owned), and on the buffer's governing root not being a vendored
+# dependency project when it has no twin.
+fun field_record_renameable(ws: *project.Workspace, root: *project.Root, uri: str, t: FieldTarget) bool {
+    if (!t.decl_in_buffer) { ret project.is_project_module(ws, root, t.key.origin); }
+    val twin_o: Option[sess.ModuleId] = project.module_for_uri(ws, root, uri);
+    if (!is_some[sess.ModuleId](twin_o)) { ret !project.root_vendored(root); }
+    ret project.is_project_module(ws, root, unwrap[sess.ModuleId](twin_o));
+}
+
+# field_prepare_span: write the field-name span the cursor sits on into `out` and
+# return true when it resolves to a field of a project-owned record, or false. the
+# prepareRename gate for field positions.
+fun field_prepare_span(ws: *project.Workspace, an: *Analyzed, uri: str, offset: usize, out: *token.Span) bool {
+    val to: Option[FieldTarget] = field_target_at(ws, an, offset);
+    if (!is_some[FieldTarget](to)) { ret false; }
+    val t: FieldTarget = unwrap[FieldTarget](to);
+    if (!field_record_renameable(ws, an.root, uri, t)) { ret false; }
+    # the range reported is the cursor's own field-name token in the buffer; the
+    # decl-site name lives in the record's module, which may not be the buffer.
+    val fo: Option[features.FieldRef] = features.field_ref_at(an.a, offset);
+    if (is_some[features.FieldRef](fo)) { @out = unwrap[features.FieldRef](fo).name_span; ret true; }
+    val self_o: Option[FieldSelf] = field_self_at(an, offset);
+    if (is_some[FieldSelf](self_o)) { @out = unwrap[FieldSelf](self_o).name; ret true; }
+    ret false;
+}
+
+# emit_field_locations: send a Location[] of every field site across `refs` (each
+# module's member-access / struct-literal sites plus the field declaration). takes
+# ownership of `id_raw` and frees it.
+fun emit_field_locations(ws: *project.Workspace, alloc: *Allocator, id_raw: str, refs: *FieldXRef, nref: usize, t: FieldTarget) {
+    val ti: *type.TypeInterner = project.type_interner(ws);
+    val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
+    val mid:    str = ",\"result\":[";
+    val suffix: str = "]}";
+
+    var k: WalkSink = sink_init(alloc, nil, nil);
+    var si: usize = 0;
+    for (si < nref) { walk_field_sites(?refs[si], ti, t, false, ?k); si = si + 1; }
+
+    val total: usize = str_len(prefix) + str_len(id_raw) + str_len(mid) + k.total + str_len(suffix);
+    val br: Result[*u8, str] = allocate[u8](alloc, total + 1);
+    if (is_err[*u8, str](br)) { reply_empty_array(alloc, id_raw); ret; }
+    val buf: *u8 = unwrap_ok[*u8, str](br);
+
+    var off: usize = 0;
+    off = append(buf, off, prefix);
+    off = append(buf, off, id_raw);
+    off = append(buf, off, mid);
+    k.buf   = buf;
+    k.off   = off;
+    k.count = 0;
+    var sj: usize = 0;
+    for (sj < nref) { walk_field_sites(?refs[sj], ti, t, false, ?k); sj = sj + 1; }
+    off = k.off;
+    off = append(buf, off, suffix);
+    buf[off] = 0;
+    transport.send_message(buf::str, alloc);
+    deallocate[u8](alloc, buf, total + 1);
+    json.free_str(id_raw, alloc);
+}
+
+# emit_field_rename: send a WorkspaceEdit renaming the field to `new_name` across
+# `refs`, one `changes` entry per module. each entry rewrites that module's
+# member-access / struct-literal sites; the declaring module's entry also rewrites
+# the field declaration and the record's matching doc component. takes ownership of
+# `id_raw` and frees it.
+fun emit_field_rename(ws: *project.Workspace, alloc: *Allocator, id_raw: str, refs: *FieldXRef, nref: usize, t: FieldTarget, new_name: str) {
+    val ti: *type.TypeInterner = project.type_interner(ws);
+    val qname: str = json.quote(new_name, alloc);
+    if (qname == nil) { reply_empty_edit(alloc, id_raw); ret; }
+
+    val ga: Result[*str, str] = allocate[str](alloc, nref);
+    if (is_err[*str, str](ga)) { json.free_str(qname, alloc); reply_empty_edit(alloc, id_raw); ret; }
+    val groups: *str = unwrap_ok[*str, str](ga);
+
+    val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
+    val mid:    str = ",\"result\":{\"changes\":{";
+    val suffix: str = "}}}";
+    var total: usize = str_len(prefix) + str_len(id_raw) + str_len(mid) + str_len(suffix);
+    var ng: usize = 0;
+    var si: usize = 0;
+    for (si < nref) {
+        val g: str = field_rename_group_json(?refs[si], ti, t, qname, alloc);
+        if (g != nil) {
+            if (ng > 0) { total = total + 1; }
+            total = total + str_len(g);
+            groups[ng] = g;
+            ng = ng + 1;
+        }
+        si = si + 1;
+    }
+
+    val br: Result[*u8, str] = allocate[u8](alloc, total + 1);
+    if (is_err[*u8, str](br)) {
+        free_groups(groups, ng, alloc);
+        deallocate[str](alloc, groups, nref);
+        json.free_str(qname, alloc);
+        reply_empty_edit(alloc, id_raw); ret;
+    }
+    val buf: *u8 = unwrap_ok[*u8, str](br);
+
+    var off: usize = 0;
+    off = append(buf, off, prefix);
+    off = append(buf, off, id_raw);
+    off = append(buf, off, mid);
+    var gi: usize = 0;
+    for (gi < ng) {
+        if (gi > 0) { buf[off] = ','; off = off + 1; }
+        off = append(buf, off, groups[gi]);
+        gi = gi + 1;
+    }
+    off = append(buf, off, suffix);
+    buf[off] = 0;
+    transport.send_message(buf::str, alloc);
+    deallocate[u8](alloc, buf, total + 1);
+
+    free_groups(groups, ng, alloc);
+    deallocate[str](alloc, groups, nref);
+    json.free_str(qname, alloc);
+    json.free_str(id_raw, alloc);
+}
+
+# field_rename_group_json: the `changes`-map entry `"<uri>":[<edits>]` for module
+# `s`, rewriting its field sites (and, for the declaring module, the declaration
+# and doc component) to the quoted `qname`, or nil when `s` contributes no edit.
+fun field_rename_group_json(s: *FieldXRef, ti: *type.TypeInterner, t: FieldTarget, qname: str, alloc: *Allocator) str {
+    val quri: str = json.quote(s.uri, alloc);
+    if (quri == nil) { ret nil; }
+
+    var k: WalkSink = sink_init(alloc, qname, nil);
+    walk_field_sites(s, ti, t, true, ?k);
+    if (k.count == 0) { json.free_str(quri, alloc); ret nil; }
+
+    val open:  str = ":[";
+    val close: str = "]";
+    val total: usize = str_len(quri) + str_len(open) + k.total + str_len(close);
+    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
+    if (is_err[*u8, str](r)) { json.free_str(quri, alloc); ret nil; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+
+    var off: usize = 0;
+    off = append(buf, off, quri);
+    off = append(buf, off, open);
+    k.buf   = buf;
+    k.off   = off;
+    k.count = 0;
+    walk_field_sites(s, ti, t, true, ?k);
+    off = k.off;
+    off = append(buf, off, close);
+    buf[off] = 0;
+    json.free_str(quri, alloc);
+    ret buf::str;
+}
+
 # references: answer textDocument/references with every Location resolving to
 # the symbol at the cursor — its declaration plus every use-site across the
 # loaded project graph (the requesting buffer and every other module that
@@ -646,7 +1035,13 @@ pub fun references(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     val offset: usize = unwrap[usize](off_o);
 
     val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
-    if (!is_some[features.SymbolRef](ro)) { reply_empty_array(alloc, id_raw); ret; }
+    if (!is_some[features.SymbolRef](ro)) {
+        # name resolution leaves a value-field access unbound, so a cursor on a
+        # field name yields no SymbolRef — fall through to the type-driven field
+        # references before giving up.
+        if (field_references(ws, alloc, ?an, uri, offset, id_raw)) { ret; }
+        reply_empty_array(alloc, id_raw); ret;
+    }
     val sr: features.SymbolRef = unwrap[features.SymbolRef](ro);
 
     val so: Option[*res.Symbol] = features.symbol(an.rr, sr.sym_id);
@@ -692,7 +1087,12 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
     val offset: usize = unwrap[usize](off_o);
 
     val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
-    if (!is_some[features.SymbolRef](ro)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
+    if (!is_some[features.SymbolRef](ro)) {
+        # a cursor on a field name yields no SymbolRef — fall through to the
+        # type-driven field rename, which gates on the record's ownership.
+        if (field_rename(ws, alloc, ?an, uri, offset, id_raw, new_name)) { json.free_str(new_name, alloc); ret; }
+        reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret;
+    }
     val sr: features.SymbolRef = unwrap[features.SymbolRef](ro);
 
     val so: Option[*res.Symbol] = features.symbol(an.rr, sr.sym_id);
@@ -708,6 +1108,13 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
 
     var bind: token.Span;
     val has_bind: bool = binding_span(an, sr.sym_id, ?bind);
+
+    # a param / generic carries its name in its owning decl's docstring component
+    # block too (`# <param>:` / `# [T]:`); rename rewrites that name token in the
+    # buffer where the decl lives. a fun / rec / val / etc. summary line no longer
+    # carries the name, so only param / generic bindings contribute a doc edit.
+    var doc: token.Span;
+    val has_doc: bool = param_generic_doc_span(an, sym, name, ?doc);
 
     val cap: usize = (project.module_count(an.root) + 1)::usize;
     val ra: Result[*XRef, str] = allocate[XRef](alloc, cap);
@@ -725,15 +1132,41 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
         reply_empty_edit(alloc, id_raw);
         ret;
     }
-    emit_rename(alloc, id_raw, refs, n, new_name, name, bind, has_bind);
+    emit_rename(alloc, id_raw, refs, n, new_name, name, bind, has_bind, doc, has_doc);
     free_refs(ws, refs, n);
     deallocate[XRef](alloc, refs, cap);
     json.free_str(new_name, alloc);
 }
 
+# param_generic_doc_span: write the doc-component name token for a param / generic
+# symbol's binding into `out` and return true, or false when the symbol is not a
+# param / generic, its owning decl has no docstring, or no component matches its
+# name. the doc block lives in the buffer the decl is declared in, so its name span
+# (`Decl.doc` resolved through `mach.lang.fe.doc`) is a buffer edit. a generic's
+# component head is the bracket form `# [T]:`, so the returned span is the inner
+# identifier only (the brackets stay).
+fun param_generic_doc_span(an: Analyzed, sym: *res.Symbol, name: str, out: *token.Span) bool {
+    if (sym.kind != res.SYM_PARAM && sym.kind != res.SYM_GENERIC) { ret false; }
+    if (sym.decl == id.DECL_NIL) { ret false; }
+    val d_opt: Option[*decl.Decl] = ast.get_decl(an.a, sym.decl);
+    if (!is_some[*decl.Decl](d_opt)) { ret false; }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+    if (d.doc.len == 0) { ret false; }
+
+    val bo: Option[token.Span] = features.binding_name_span(an.a, sym);
+    if (!is_some[token.Span](bo)) { ret false; }
+    val is_generic: bool = sym.kind == res.SYM_GENERIC;
+    val co: Option[token.Span] = features.doc_component_name_span(an.file.text, d.doc, an.file, unwrap[token.Span](bo), is_generic);
+    if (!is_some[token.Span](co)) { ret false; }
+    @out = unwrap[token.Span](co);
+    ret true;
+}
+
 # prepare_rename: answer textDocument/prepareRename with the range of the name
 # token at the cursor when it is a renameable symbol (a buffer-local symbol, or a
-# project-owned cross-module one), or null when it is not the editor's to rename.
+# project-owned cross-module one) or a field of a known, project-owned record, or
+# null when it is not the editor's to rename (an unresolved position, a dependency
+# symbol, or a field of a vendored record).
 pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
     val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
     if (id_raw == nil) { ret; }
@@ -744,21 +1177,32 @@ pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, alloc:
     val offset: usize = unwrap[usize](off_o);
 
     val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
-    if (!is_some[features.SymbolRef](ro)) { reply_null(alloc, id_raw); ret; }
+    if (!is_some[features.SymbolRef](ro)) {
+        # a cursor on a field name yields no SymbolRef — accept it when it resolves
+        # to a field of a project-owned record (the same gate field rename uses).
+        var name_span: token.Span;
+        if (field_prepare_span(ws, ?an, uri, offset, ?name_span)) {
+            reply_range(alloc, id_raw, an.file, name_span); ret;
+        }
+        reply_null(alloc, id_raw); ret;
+    }
     val sr: features.SymbolRef = unwrap[features.SymbolRef](ro);
 
     val so: Option[*res.Symbol] = features.symbol(an.rr, sr.sym_id);
     if (!is_some[*res.Symbol](so)) { reply_null(alloc, id_raw); ret; }
     if (!renameable(ws, an.root, uri, unwrap[*res.Symbol](so), sr)) { reply_null(alloc, id_raw); ret; }
 
-    val range: positions.LspRange = positions.range_of(an.file, sr.name_span);
-    val rng: str = range_json(range, alloc);
+    reply_range(alloc, id_raw, an.file, sr.name_span);
+}
 
+# reply_range: send a prepareRename success reply carrying the range of `span` in
+# `file`, freeing `id_raw`. shared by the symbol and field prepare paths.
+fun reply_range(alloc: *Allocator, id_raw: str, file: *src.SourceFile, span: token.Span) {
+    val rng: str = range_json(positions.range_of(file, span), alloc);
     val p1: str = "{\"jsonrpc\":\"2.0\",\"id\":";
     val p2: str = ",\"result\":";
     val p3: str = "}";
     send6(alloc, p1, id_raw, p2, rng, p3, nil, nil);
-
     json.free_str(rng, alloc);
     json.free_str(id_raw, alloc);
 }
@@ -1008,46 +1452,49 @@ fun sink_init(alloc: *Allocator, qname: str, guard: str) WalkSink {
     ret k;
 }
 
-# sink_emit: size or write one Location / TextEdit for `span` of source `s`,
-# per the sink's mode.
-fun sink_emit(k: *WalkSink, s: *XRef, span: token.Span) {
+# sink_emit: size or write one Location / TextEdit for `span` in `file` (located
+# at `uri`), per the sink's mode. taking `file` / `uri` rather than a source
+# record lets the symbol walk (XRef) and the field walk (FieldXRef) share it.
+fun sink_emit(k: *WalkSink, file: *src.SourceFile, uri: str, span: token.Span) {
     if (k.qname == nil) {
-        if (k.buf == nil) { k.total = k.total + loc_len(s.file, s.uri, span, k.alloc, k.count); }
-        or                { k.off   = put_loc(k.buf, k.off, s.file, s.uri, span, k.alloc, k.count); }
+        if (k.buf == nil) { k.total = k.total + loc_len(file, uri, span, k.alloc, k.count); }
+        or                { k.off   = put_loc(k.buf, k.off, file, uri, span, k.alloc, k.count); }
     }
     or {
-        if (k.buf == nil) { k.total = k.total + edit_len(s.file, span, k.qname, k.alloc, k.count); }
-        or                { k.off   = put_edit(k.buf, k.off, s.file, span, k.qname, k.alloc, k.count); }
+        if (k.buf == nil) { k.total = k.total + edit_len(file, span, k.qname, k.alloc, k.count); }
+        or                { k.off   = put_edit(k.buf, k.off, file, span, k.qname, k.alloc, k.count); }
     }
     k.count = k.count + 1;
 }
 
 # walk_refs: feed every reference to `s.target` in source `s` to the sink — the
 # declaration name, `use` / `fwd` import-path leaves, and the body (expr / type)
-# use-sites, plus the active buffer's param / generic binding when
-# `include_bind`. body spans pass the sink's spelling guard (see WalkSink);
-# declaration and import leaves always carry the declared name and are exempt.
-fun walk_refs(s: *XRef, include_bind: bool, bind: token.Span, k: *WalkSink) {
+# use-sites, plus the active buffer's param / generic binding when `include_bind`
+# and its owning decl's matching doc-component name token when `include_doc`. body
+# spans pass the sink's spelling guard (see WalkSink); declaration, import leaves,
+# binding, and doc-component spans always carry the declared name and are exempt.
+fun walk_refs(s: *XRef, include_bind: bool, bind: token.Span, include_doc: bool, doc: token.Span, k: *WalkSink) {
     if (s.target == res.SYMBOL_NIL) { ret; }
-    if (include_bind) { sink_emit(k, s, bind); }
+    if (include_bind) { sink_emit(k, s.file, s.uri, bind); }
+    if (include_doc)  { sink_emit(k, s.file, s.uri, doc); }
     var di: usize = 0;
     for (di < s.a.decl_len) {
         val dso: Option[token.Span] = features.decl_ref_span(s.a, s.rr, di::id.DeclId, s.target);
-        if (is_some[token.Span](dso)) { sink_emit(k, s, unwrap[token.Span](dso)); }
+        if (is_some[token.Span](dso)) { sink_emit(k, s.file, s.uri, unwrap[token.Span](dso)); }
         val iso: Option[token.Span] = features.import_ref_span(s.a, s.rr, di::id.DeclId, s.target, s.file);
-        if (is_some[token.Span](iso)) { sink_emit(k, s, unwrap[token.Span](iso)); }
+        if (is_some[token.Span](iso)) { sink_emit(k, s.file, s.uri, unwrap[token.Span](iso)); }
         di = di + 1;
     }
     var ei: usize = 0;
     for (ei < s.a.expr_len) {
         val so: Option[token.Span] = features.expr_ref_span(s.a, s.rr, ei::id.ExprId, s.target);
-        if (is_some[token.Span](so) && guard_admits(s, k, unwrap[token.Span](so))) { sink_emit(k, s, unwrap[token.Span](so)); }
+        if (is_some[token.Span](so) && guard_admits(s, k, unwrap[token.Span](so))) { sink_emit(k, s.file, s.uri, unwrap[token.Span](so)); }
         ei = ei + 1;
     }
     var ti: usize = 0;
     for (ti < s.a.type_len) {
         val so: Option[token.Span] = features.type_ref_span(s.a, s.rr, ti::id.TypeId, s.target);
-        if (is_some[token.Span](so) && guard_admits(s, k, unwrap[token.Span](so))) { sink_emit(k, s, unwrap[token.Span](so)); }
+        if (is_some[token.Span](so) && guard_admits(s, k, unwrap[token.Span](so))) { sink_emit(k, s.file, s.uri, unwrap[token.Span](so)); }
         ti = ti + 1;
     }
 }
@@ -1068,9 +1515,10 @@ fun emit_locations(alloc: *Allocator, id_raw: str, refs: *XRef, nref: usize, bin
     val mid:    str = ",\"result\":[";
     val suffix: str = "]}";
 
+    var empty: token.Span;
     var k: WalkSink = sink_init(alloc, nil, nil);
     var si: usize = 0;
-    for (si < nref) { walk_refs(?refs[si], si == 0 && has_bind, bind, ?k); si = si + 1; }
+    for (si < nref) { walk_refs(?refs[si], si == 0 && has_bind, bind, false, empty, ?k); si = si + 1; }
 
     val total: usize = str_len(prefix) + str_len(id_raw) + str_len(mid) + k.total + str_len(suffix);
     val br: Result[*u8, str] = allocate[u8](alloc, total + 1);
@@ -1086,7 +1534,7 @@ fun emit_locations(alloc: *Allocator, id_raw: str, refs: *XRef, nref: usize, bin
     k.off   = off;
     k.count = 0;
     var sj: usize = 0;
-    for (sj < nref) { walk_refs(?refs[sj], sj == 0 && has_bind, bind, ?k); sj = sj + 1; }
+    for (sj < nref) { walk_refs(?refs[sj], sj == 0 && has_bind, bind, false, empty, ?k); sj = sj + 1; }
     off = k.off;
 
     off = append(buf, off, suffix);
@@ -1100,9 +1548,10 @@ fun emit_locations(alloc: *Allocator, id_raw: str, refs: *XRef, nref: usize, bin
 # files in `refs`, one `changes` entry per file. each entry renames the
 # declaration, the import-path leaves, and every body reference spelled with the
 # declared name `name` (so an aliased import's references are not rewritten); the
-# active buffer's param / generic binding is included when `has_bind`. takes
-# ownership of `id_raw` and frees it.
-fun emit_rename(alloc: *Allocator, id_raw: str, refs: *XRef, nref: usize, new_name: str, name: str, bind: token.Span, has_bind: bool) {
+# active buffer's param / generic binding is included when `has_bind`, and its
+# owning decl's matching doc-component name token when `has_doc`. takes ownership
+# of `id_raw` and frees it.
+fun emit_rename(alloc: *Allocator, id_raw: str, refs: *XRef, nref: usize, new_name: str, name: str, bind: token.Span, has_bind: bool, doc: token.Span, has_doc: bool) {
     val qname: str = json.quote(new_name, alloc);
     if (qname == nil) { reply_empty_edit(alloc, id_raw); ret; }
 
@@ -1117,7 +1566,7 @@ fun emit_rename(alloc: *Allocator, id_raw: str, refs: *XRef, nref: usize, new_na
     var ng: usize = 0;
     var si: usize = 0;
     for (si < nref) {
-        val g: str = rename_group_json(?refs[si], si == 0 && has_bind, bind, name, qname, alloc);
+        val g: str = rename_group_json(?refs[si], si == 0 && has_bind, bind, si == 0 && has_doc, doc, name, qname, alloc);
         if (g != nil) {
             if (ng > 0) { total = total + 1; }
             total = total + str_len(g);
@@ -1160,15 +1609,16 @@ fun emit_rename(alloc: *Allocator, id_raw: str, refs: *XRef, nref: usize, new_na
 # rename_group_json: the `changes`-map entry `"<uri>":[<edits>]` for source `s`,
 # renaming the declaration, import-path leaves, and every body reference spelled
 # `name` to the already-quoted `qname` (via the shared walk; see WalkSink), or
-# nil when `s` contributes no edit. the active buffer's param / generic binding
-# is included when `include_bind`.
-fun rename_group_json(s: *XRef, include_bind: bool, bind: token.Span, name: str, qname: str, alloc: *Allocator) str {
+# nil when `s` contributes no edit. the active buffer's param / generic binding is
+# included when `include_bind` and its owning decl's doc-component name token when
+# `include_doc`.
+fun rename_group_json(s: *XRef, include_bind: bool, bind: token.Span, include_doc: bool, doc: token.Span, name: str, qname: str, alloc: *Allocator) str {
     if (s.target == res.SYMBOL_NIL) { ret nil; }
     val quri: str = json.quote(s.uri, alloc);
     if (quri == nil) { ret nil; }
 
     var k: WalkSink = sink_init(alloc, qname, name);
-    walk_refs(s, include_bind, bind, ?k);
+    walk_refs(s, include_bind, bind, include_doc, doc, ?k);
     if (k.count == 0) { json.free_str(quri, alloc); ret nil; }
 
     val open:  str = ":[";
@@ -1184,7 +1634,7 @@ fun rename_group_json(s: *XRef, include_bind: bool, bind: token.Span, name: str,
     k.buf   = buf;
     k.off   = off;
     k.count = 0;
-    walk_refs(s, include_bind, bind, ?k);
+    walk_refs(s, include_bind, bind, include_doc, doc, ?k);
     off = k.off;
     off = append(buf, off, close);
     buf[off] = 0;
