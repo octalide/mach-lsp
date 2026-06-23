@@ -1,0 +1,305 @@
+# mls.types: pure helpers over sema's typing output.
+#
+# the feature layer reads per-expression types and the nominal back-link from a
+# record TypeId to its declaring module here, so the resolution rules live in one
+# place — and, being free of any session / project state, are unit-testable in
+# isolation. `project.mach` re-exports these through its own narrowed accessors so
+# no feature signature carries a `*sess.Session`.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_some;
+use std.types.option.is_none;
+use std.types.option.unwrap;
+
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+use page: std.allocator.page;
+
+use sess:   mach.lang.session;
+use type:   mach.lang.type;
+use id:     mach.lang.fe.ast.id;
+use sema:   mach.lang.fe.sema;
+use intern: mach.lang.intern;
+
+# Nominal: the declaration site a record / union TypeId nominally refers to —
+# the back-link a field feature follows from a value's type to the `rec` / `uni`
+# declaration whose fields it must walk. for a generic instance this is the
+# generic template's declaration (`target_origin` / `target_decl`).
+# ---
+# origin: ModuleId of the declaring module
+# decl:   DeclId of the rec / uni declaration in `origin`'s Ast
+# kind:   the resolved type kind (TYPE_REC, TYPE_UNI, or TYPE_INSTANCE)
+pub rec Nominal {
+    origin: sess.ModuleId;
+    decl:   id.DeclId;
+    kind:   type.TypeKind;
+}
+
+# type_of: the semantic type of expression `eid` in `sr`, or TYPE_NIL when `sr`
+# is nil or `eid` is out of range. the one read the feature layer makes against a
+# buffer's / module's SemaResult to learn an expression's type.
+# ---
+# sr:  the module's / buffer's SemaResult, or nil
+# eid: the expression id to type
+# ret: the expression's TypeId, or TYPE_NIL when unavailable
+pub fun type_of(sr: *sema.SemaResult, eid: id.ExprId) type.TypeId {
+    if (sr == nil || sr.expr_type == nil) { ret type.TYPE_NIL; }
+    if (eid::u32 >= sr.expr_count) { ret type.TYPE_NIL; }
+    ret sr.expr_type[eid];
+}
+
+# decl_type_of: the declared (or inferred) type of decl `did` in `sr`, or
+# TYPE_NIL when `sr` is nil or `did` is out of range. the decl-keyed twin of
+# `type_of`, for typing a binding from its declaration rather than a use.
+# ---
+# sr:  the module's / buffer's SemaResult, or nil
+# did: the declaration id to type
+# ret: the declaration's TypeId, or TYPE_NIL when unavailable
+pub fun decl_type_of(sr: *sema.SemaResult, did: id.DeclId) type.TypeId {
+    if (sr == nil || sr.decl_type == nil) { ret type.TYPE_NIL; }
+    if (did::u32 >= sr.decl_count) { ret type.TYPE_NIL; }
+    ret sr.decl_type[did];
+}
+
+# nominal_of: the declaration site a record / union TypeId nominally refers to,
+# or none when `tid` is not a nominal type (a primitive, pointer, array, function,
+# generic parameter, or a sentinel). a pointer to a record is peeled to the record
+# first, so `*T` and `T` resolve to the same declaration — a field access through a
+# pointer reaches the same `rec` decl. a generic instance resolves to its template
+# declaration. this is the nominal back-link a field go-to-def / rename follows.
+# ---
+# ti:  the session's type interner
+# tid: the TypeId to resolve
+# ret: some(Nominal) for a nominal / instance type, none otherwise
+pub fun nominal_of(ti: *type.TypeInterner, tid: type.TypeId) Option[Nominal] {
+    if (tid == type.TYPE_NIL || tid == type.TYPE_ERROR) { ret none[Nominal](); }
+    val t_opt: Option[*type.Type] = type.get(ti, tid);
+    if (!is_some[*type.Type](t_opt)) { ret none[Nominal](); }
+    val t: *type.Type = unwrap[*type.Type](t_opt);
+
+    # peel a single pointer level: a field access through `*T` resolves to T's decl.
+    if (t.kind == type.TYPE_POINTER) {
+        ret nominal_of(ti, t.data.pointer.base);
+    }
+    if (t.kind == type.TYPE_REC || t.kind == type.TYPE_UNI) {
+        var n: Nominal;
+        n.origin = t.data.nominal.origin;
+        n.decl   = t.data.nominal.decl;
+        n.kind   = t.kind;
+        ret some[Nominal](n);
+    }
+    if (t.kind == type.TYPE_INSTANCE) {
+        var n: Nominal;
+        n.origin = t.data.instance.target_origin;
+        n.decl   = t.data.instance.target_decl;
+        n.kind   = t.kind;
+        ret some[Nominal](n);
+    }
+    ret none[Nominal]();
+}
+
+# make_sema_result: build a standalone SemaResult over `pa` with the given
+# parallel-array lengths, every slot prefilled to TYPE_NIL. the test helper that
+# stands in for sema's own allocation so the pure accessors can be exercised
+# without running a whole analysis. released with `free_sema_result`.
+fun make_sema_result(pa: *Allocator, expr_n: u32, decl_n: u32) sema.SemaResult {
+    var sr: sema.SemaResult;
+    sr.alloc            = pa;
+    sr.expr_type        = nil;
+    sr.type_resolved_ty = nil;
+    sr.decl_type        = nil;
+    sr.expr_count       = 0;
+    sr.type_count       = 0;
+    sr.decl_count       = 0;
+    if (expr_n > 0) {
+        val r: Result[*type.TypeId, str] = allocate[type.TypeId](pa, expr_n::usize);
+        if (!is_err[*type.TypeId, str](r)) {
+            sr.expr_type  = unwrap_ok[*type.TypeId, str](r);
+            sr.expr_count = expr_n;
+            var i: u32 = 0;
+            for (i < expr_n) { sr.expr_type[i] = type.TYPE_NIL; i = i + 1; }
+        }
+    }
+    if (decl_n > 0) {
+        val r: Result[*type.TypeId, str] = allocate[type.TypeId](pa, decl_n::usize);
+        if (!is_err[*type.TypeId, str](r)) {
+            sr.decl_type  = unwrap_ok[*type.TypeId, str](r);
+            sr.decl_count = decl_n;
+            var i: u32 = 0;
+            for (i < decl_n) { sr.decl_type[i] = type.TYPE_NIL; i = i + 1; }
+        }
+    }
+    ret sr;
+}
+
+# free_sema_result: release a SemaResult built by make_sema_result.
+fun free_sema_result(pa: *Allocator, sr: *sema.SemaResult) {
+    if (sr.expr_type != nil && sr.expr_count > 0) {
+        deallocate[type.TypeId](pa, sr.expr_type, sr.expr_count::usize);
+    }
+    if (sr.decl_type != nil && sr.decl_count > 0) {
+        deallocate[type.TypeId](pa, sr.decl_type, sr.decl_count::usize);
+    }
+}
+
+test "types: type_of returns TYPE_NIL for a nil SemaResult" {
+    if (type_of(nil, 0) != type.TYPE_NIL) { ret 1; }
+    ret 0;
+}
+
+test "types: type_of returns TYPE_NIL for an out-of-range expr id" {
+    var pa: Allocator;
+    page.make(?pa);
+    var sr: sema.SemaResult = make_sema_result(?pa, 2, 0);
+    if (type_of(?sr, 5) != type.TYPE_NIL) { free_sema_result(?pa, ?sr); ret 1; }
+    free_sema_result(?pa, ?sr);
+    ret 0;
+}
+
+test "types: type_of reads the stored expression type" {
+    var pa: Allocator;
+    page.make(?pa);
+    var ti: type.TypeInterner = unwrap_ok[type.TypeInterner, str](type.init(?pa));
+    val i32t: type.TypeId = unwrap[type.TypeId](type.prim(?ti, type.TYPE_I32));
+
+    var sr: sema.SemaResult = make_sema_result(?pa, 3, 0);
+    sr.expr_type[1] = i32t;
+    var fail: bool = false;
+    if (type_of(?sr, 1) != i32t)          { fail = true; }
+    if (type_of(?sr, 0) != type.TYPE_NIL) { fail = true; }
+
+    free_sema_result(?pa, ?sr);
+    type.dnit(?ti);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "types: decl_type_of reads the stored declaration type" {
+    var pa: Allocator;
+    page.make(?pa);
+    var ti: type.TypeInterner = unwrap_ok[type.TypeInterner, str](type.init(?pa));
+    val u8t: type.TypeId = unwrap[type.TypeId](type.prim(?ti, type.TYPE_U8));
+
+    var sr: sema.SemaResult = make_sema_result(?pa, 0, 2);
+    sr.decl_type[0] = u8t;
+    var fail: bool = false;
+    if (decl_type_of(?sr, 0) != u8t)            { fail = true; }
+    if (decl_type_of(?sr, 9) != type.TYPE_NIL)  { fail = true; }
+    if (decl_type_of(nil, 0) != type.TYPE_NIL)  { fail = true; }
+
+    free_sema_result(?pa, ?sr);
+    type.dnit(?ti);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "types: nominal_of resolves a record TypeId to its declaration site" {
+    var pa: Allocator;
+    page.make(?pa);
+    var ti: type.TypeInterner = unwrap_ok[type.TypeInterner, str](type.init(?pa));
+
+    val rec: type.TypeId = unwrap_ok[type.TypeId, str](
+        type.intern_nominal(?ti, intern.STR_NIL, 7::sess.ModuleId, 3::id.DeclId, type.TYPE_REC));
+
+    val no: Option[Nominal] = nominal_of(?ti, rec);
+    var fail: bool = false;
+    if (is_none[Nominal](no)) { fail = true; }
+    or {
+        val n: Nominal = unwrap[Nominal](no);
+        if (n.origin != 7::sess.ModuleId) { fail = true; }
+        if (n.decl   != 3::id.DeclId)     { fail = true; }
+        if (n.kind   != type.TYPE_REC)    { fail = true; }
+    }
+
+    type.dnit(?ti);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "types: nominal_of peels a pointer to the pointee record" {
+    var pa: Allocator;
+    page.make(?pa);
+    var ti: type.TypeInterner = unwrap_ok[type.TypeInterner, str](type.init(?pa));
+
+    val rec: type.TypeId = unwrap_ok[type.TypeId, str](
+        type.intern_nominal(?ti, intern.STR_NIL, 2::sess.ModuleId, 4::id.DeclId, type.TYPE_REC));
+    val ptr: type.TypeId = unwrap_ok[type.TypeId, str](type.intern_pointer(?ti, rec));
+
+    val no: Option[Nominal] = nominal_of(?ti, ptr);
+    var fail: bool = false;
+    if (is_none[Nominal](no)) { fail = true; }
+    or {
+        val n: Nominal = unwrap[Nominal](no);
+        if (n.origin != 2::sess.ModuleId) { fail = true; }
+        if (n.decl   != 4::id.DeclId)     { fail = true; }
+        if (n.kind   != type.TYPE_REC)    { fail = true; }
+    }
+
+    type.dnit(?ti);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "types: nominal_of maps a generic instance to its template" {
+    var pa: Allocator;
+    page.make(?pa);
+    var ti: type.TypeInterner = unwrap_ok[type.TypeInterner, str](type.init(?pa));
+
+    val i32t: type.TypeId = unwrap[type.TypeId](type.prim(?ti, type.TYPE_I32));
+    var args: [1]type.TypeId;
+    args[0] = i32t;
+    val inst: type.TypeId = unwrap_ok[type.TypeId, str](
+        type.intern_instance(?ti, 5::sess.ModuleId, 8::id.DeclId, ?args[0], 1));
+
+    val no: Option[Nominal] = nominal_of(?ti, inst);
+    var fail: bool = false;
+    if (is_none[Nominal](no)) { fail = true; }
+    or {
+        val n: Nominal = unwrap[Nominal](no);
+        if (n.origin != 5::sess.ModuleId)  { fail = true; }
+        if (n.decl   != 8::id.DeclId)      { fail = true; }
+        if (n.kind   != type.TYPE_INSTANCE) { fail = true; }
+    }
+
+    type.dnit(?ti);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "types: nominal_of returns none for a primitive type" {
+    var pa: Allocator;
+    page.make(?pa);
+    var ti: type.TypeInterner = unwrap_ok[type.TypeInterner, str](type.init(?pa));
+    val i32t: type.TypeId = unwrap[type.TypeId](type.prim(?ti, type.TYPE_I32));
+
+    val ok: bool = is_none[Nominal](nominal_of(?ti, i32t));
+    type.dnit(?ti);
+    if (!ok) { ret 1; }
+    ret 0;
+}
+
+test "types: nominal_of returns none for sentinel TypeIds" {
+    var pa: Allocator;
+    page.make(?pa);
+    var ti: type.TypeInterner = unwrap_ok[type.TypeInterner, str](type.init(?pa));
+
+    var fail: bool = false;
+    if (!is_none[Nominal](nominal_of(?ti, type.TYPE_NIL)))   { fail = true; }
+    if (!is_none[Nominal](nominal_of(?ti, type.TYPE_ERROR))) { fail = true; }
+    type.dnit(?ti);
+    if (fail) { ret 1; }
+    ret 0;
+}
