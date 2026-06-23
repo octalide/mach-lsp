@@ -1259,22 +1259,25 @@ pub fun decl_type_of(sr: *sema.SemaResult, did: id.DeclId) type.TypeId {
 
 # RecordSite: the nominal back-link from a record / union TypeId to its declaring
 # site — what a field go-to-def / rename follows from a value's type to the `rec` /
-# `uni` declaration whose fields it must walk. carries both the declaration payload
-# and the module's Ast / source so field spans can be read directly.
+# `uni` declaration whose fields it must walk. carries the field range (uniform
+# across rec / uni, both being TypedName slices in `a.typed_names`) and the
+# module's Ast / source so field spans can be read directly.
 # ---
-# origin: ModuleId of the declaring module
-# decl:   DeclId of the rec / uni declaration in `origin`'s Ast
-# a:      the declaring module's parsed Ast (field spans index into it)
-# file:   SourceFile backing `a`
-# rec:    the DeclRec payload (field range), valid when kind is TYPE_REC
-# is_rec: true for a record, false for a union (selects the payload)
+# origin:       ModuleId of the declaring module
+# decl:         DeclId of the rec / uni declaration in `origin`'s Ast
+# a:            the declaring module's parsed Ast (field spans index into it)
+# file:         SourceFile backing `a`
+# fields_start: start index into `a.typed_names` of the first field
+# fields_len:   number of fields (record fields / union variants)
+# is_rec:       true for a record, false for a union
 pub rec RecordSite {
-    origin: sess.ModuleId;
-    decl:   id.DeclId;
-    a:      *ast.Ast;
-    file:   *src.SourceFile;
-    rec:    adecl.DeclRec;
-    is_rec: bool;
+    origin:       sess.ModuleId;
+    decl:         id.DeclId;
+    a:            *ast.Ast;
+    file:         *src.SourceFile;
+    fields_start: u32;
+    fields_len:   u32;
+    is_rec:       bool;
 }
 
 # record_decl: the declaring site a record / union TypeId nominally refers to,
@@ -1311,7 +1314,13 @@ pub fun record_decl(w: *Workspace, root: *Root, tid: type.TypeId) Option[RecordS
     rs.a      = ?m.a;
     rs.file   = unwrap[*src.SourceFile](fo);
     rs.is_rec = is_rec;
-    if (is_rec) { rs.rec = d.data.rec_; }
+    if (is_rec) {
+        rs.fields_start = d.data.rec_.fields_start;
+        rs.fields_len   = d.data.rec_.fields_len;
+    } or {
+        rs.fields_start = d.data.uni_.fields_start;
+        rs.fields_len   = d.data.uni_.fields_len;
+    }
     ret some[RecordSite](rs);
 }
 
