@@ -695,40 +695,31 @@ fun type_name_span(a: *ast.Ast, tid: id.TypeId) Option[token.Span] {
     ret none[token.Span]();
 }
 
-# FIELD_NONE / FIELD_MEMBER / FIELD_STRUCT_LIT: the shape of a field reference the
-# cursor pivots to. a member access `foo.bar` carries the receiver expression to
-# type; a struct literal `T{ bar: ... }` carries the named type the field belongs
-# to. both also carry the referenced field-name span (the `.bar` / `bar` token).
-pub val FIELD_NONE:        u8 = 0;
-pub val FIELD_MEMBER:      u8 = 1;
-pub val FIELD_STRUCT_LIT:  u8 = 2;
-
 # FieldRef: a record / union field a cursor position references, before the field
 # is typed. name resolution leaves a value-field access unbound (`expr_resolved`
 # is SYMBOL_NIL for a MEMBER node), so this is the type-driven parallel to
-# `SymbolRef`: the feature layer resolves it to a field declaration through the
-# record's TypeId rather than the symbol table. the kind selects which of
-# `object` / `lit_ty` to follow.
+# `SymbolRef`: the feature layer resolves it to a field declaration through a
+# TypeId rather than the symbol table. `host` is the expression whose semantic
+# type names the record / union the field belongs to — the receiver for a member
+# access `foo.bar`, the struct literal itself for `T{ bar: ... }` (whose inferred
+# type is the record). the caller types `host`, peels it to a record site, then
+# matches `name_span` against the site's fields.
 # ---
-# kind:      FIELD_MEMBER (follow `object`) or FIELD_STRUCT_LIT (follow `lit_ty`)
-# object:    receiver expression id for a member access (EXPR_NIL otherwise)
-# lit_ty:    named type id of the struct literal (TYPE_NIL otherwise)
-# name_span: byte span of the referenced field-name token
+# host:      expression id to type (member receiver, or the struct literal itself)
+# name_span: byte span of the referenced field-name token (`.bar` / `bar`)
 pub rec FieldRef {
-    kind:      u8;
-    object:    id.ExprId;
-    lit_ty:    id.TypeId;
+    host:      id.ExprId;
     name_span: token.Span;
 }
 
 # field_ref_at: the record / union field a byte offset references through a member
 # access or a struct-literal field name, or none. the type-driven pivot for
 # go-to-definition on fields: `expr_resolved` never binds a value-field access, so
-# this recovers the field name (and the receiver / literal type the field decl is
-# reached through) directly from the syntax. it is consulted only when the
-# symbol-table pivot (`ref_at`) finds nothing, so an ordinary symbol still wins.
-# pure over the Ast — the actual field-decl lookup needs types and runs in the
-# caller via `field_decl_span`.
+# this recovers the field name and the expression whose type names the field's
+# record directly from the syntax. it is consulted only when the symbol-table
+# pivot (`ref_at`) finds nothing, so an ordinary symbol still wins. pure over the
+# Ast — the actual field-decl lookup needs types and runs in the caller via
+# `field_decl_span`.
 # ---
 # a:      the buffer's parsed Ast
 # offset: byte offset into the buffer
@@ -743,9 +734,7 @@ pub fun field_ref_at(a: *ast.Ast, offset: usize) Option[FieldRef] {
     if (e.kind == expr.EXPR_KIND_MEMBER) {
         if (!ast.span_contains(e.data.member.name, offset)) { ret none[FieldRef](); }
         var fr: FieldRef;
-        fr.kind      = FIELD_MEMBER;
-        fr.object    = e.data.member.object;
-        fr.lit_ty    = id.TYPE_NIL;
+        fr.host      = e.data.member.object;
         fr.name_span = e.data.member.name;
         ret some[FieldRef](fr);
     }
@@ -758,9 +747,7 @@ pub fun field_ref_at(a: *ast.Ast, offset: usize) Option[FieldRef] {
             val fi: *expr.FieldInit = ?a.field_inits[start + i];
             if (ast.span_contains(fi.name, offset)) {
                 var fr: FieldRef;
-                fr.kind      = FIELD_STRUCT_LIT;
-                fr.object    = id.EXPR_NIL;
-                fr.lit_ty    = e.data.struct_lit.ty;
+                fr.host      = eid;
                 fr.name_span = fi.name;
                 ret some[FieldRef](fr);
             }

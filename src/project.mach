@@ -1281,38 +1281,76 @@ pub rec RecordSite {
 }
 
 # record_decl: the declaring site a record / union TypeId nominally refers to,
-# resolved against the session's type interner and the root's module array — the
-# nominal back-link field features follow. peels a pointer to its pointee and maps
-# a generic instance to its template. none when `tid` is not a nominal type, the
-# declaring module is out of range, or the declaration is not a rec / uni. the
-# returned Ast / file pointers are owned by the loaded project / session.
+# resolved against the session's type interner and the root's loaded module array —
+# the nominal back-link field features follow. peels a pointer to its pointee and
+# maps a generic instance to its template. none when `tid` is not a nominal type,
+# the declaring module is not a loaded project module, or the declaration is not a
+# rec / uni. the returned Ast / file pointers are owned by the loaded project /
+# session. a record declared in the active buffer (whose synthetic module id is not
+# in the loaded array) is not found here — use `record_decl_in`, which falls back to
+# the buffer's live Ast for that case.
 # ---
 # w:    the workspace
 # root: the root the type was resolved under, or nil
 # tid:  a TypeId, typically read from a SemaResult via `type_of`
 # ret:  some(RecordSite), or none
 pub fun record_decl(w: *Workspace, root: *Root, tid: type.TypeId) Option[RecordSite] {
-    if (root == nil || !root.loaded) { ret none[RecordSite](); }
-    val no: Option[mtypes.Nominal] = mtypes.nominal_of(?w.s.types, tid);
+    val no: Option[mtypes.Nominal] = nominal_of_tid(w, root, tid);
     if (is_none[mtypes.Nominal](no)) { ret none[RecordSite](); }
     val n: mtypes.Nominal = unwrap[mtypes.Nominal](no);
 
     val m: *driver.ModuleEntry = module_entry(root, n.origin);
     if (m == nil) { ret none[RecordSite](); }
-    val d_opt: Option[*adecl.Decl] = ast.get_decl(?m.a, n.decl);
+    val fo: Option[*src.SourceFile] = src.get(?w.s.sources, m.file_id);
+    if (!is_some[*src.SourceFile](fo)) { ret none[RecordSite](); }
+    ret record_site_from(n.origin, n.decl, ?m.a, unwrap[*src.SourceFile](fo));
+}
+
+# record_decl_in: `record_decl` extended to resolve a record / union declared in
+# the active buffer. a buffer's own nominal type is interned under its synthetic
+# module id (`own`), which is not in the loaded module array, so `record_decl`
+# alone would miss a field access on a record the edited buffer itself declares.
+# when the nominal's origin is `own`, the declaration is read from the buffer's
+# live Ast / file (`own_a` / `own_file`); otherwise it defers to a loaded module.
+# ---
+# w:        the workspace
+# root:     the root the type was resolved under, or nil
+# own:      the buffer's own module id
+# own_a:    the buffer's live Ast
+# own_file: the buffer's SourceFile
+# tid:      a TypeId, typically read from a SemaResult via `type_of`
+# ret:      some(RecordSite), or none
+pub fun record_decl_in(w: *Workspace, root: *Root, own: sess.ModuleId, own_a: *ast.Ast, own_file: *src.SourceFile, tid: type.TypeId) Option[RecordSite] {
+    val no: Option[mtypes.Nominal] = nominal_of_tid(w, root, tid);
+    if (is_none[mtypes.Nominal](no)) { ret none[RecordSite](); }
+    val n: mtypes.Nominal = unwrap[mtypes.Nominal](no);
+    if (n.origin == own) { ret record_site_from(own, n.decl, own_a, own_file); }
+    ret record_decl(w, root, tid);
+}
+
+# nominal_of_tid: the nominal back-link of `tid` against the session type interner,
+# guarded on a loaded root. none when there is no project or `tid` is not nominal.
+fun nominal_of_tid(w: *Workspace, root: *Root, tid: type.TypeId) Option[mtypes.Nominal] {
+    if (root == nil || !root.loaded) { ret none[mtypes.Nominal](); }
+    ret mtypes.nominal_of(?w.s.types, tid);
+}
+
+# record_site_from: build a RecordSite for the rec / uni decl `decl` in `a` (backed
+# by `file`), or none when the decl is absent or not a rec / uni. the shared core
+# of `record_decl` / `record_decl_in` — both having chosen which Ast / file the
+# declaration lives in.
+fun record_site_from(origin: sess.ModuleId, decl: id.DeclId, a: *ast.Ast, file: *src.SourceFile) Option[RecordSite] {
+    val d_opt: Option[*adecl.Decl] = ast.get_decl(a, decl);
     if (is_none[*adecl.Decl](d_opt)) { ret none[RecordSite](); }
     val d: *adecl.Decl = unwrap[*adecl.Decl](d_opt);
     val is_rec: bool = d.kind == adecl.DECL_KIND_REC;
     if (!is_rec && d.kind != adecl.DECL_KIND_UNI) { ret none[RecordSite](); }
 
-    val fo: Option[*src.SourceFile] = src.get(?w.s.sources, m.file_id);
-    if (!is_some[*src.SourceFile](fo)) { ret none[RecordSite](); }
-
     var rs: RecordSite;
-    rs.origin = n.origin;
-    rs.decl   = n.decl;
-    rs.a      = ?m.a;
-    rs.file   = unwrap[*src.SourceFile](fo);
+    rs.origin = origin;
+    rs.decl   = decl;
+    rs.a      = a;
+    rs.file   = file;
     rs.is_rec = is_rec;
     if (is_rec) {
         rs.fields_start = d.data.rec_.fields_start;
