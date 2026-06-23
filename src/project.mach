@@ -279,6 +279,18 @@ pub fun sources(w: *Workspace) *src.SourceMap {
     ret ?w.s.sources;
 }
 
+# type_interner: the session's type interner, for peeling a record / union TypeId
+# to its nominal declaration site (the cross-module field-reference walk reads
+# each module's typing and matches the field's host type against its key through
+# it). the narrow read the feature layer makes; see `interner` for why the whole
+# session is kept out of feature signatures.
+# ---
+# w:   the workspace
+# ret: the session's type interner
+pub fun type_interner(w: *Workspace) *type.TypeInterner {
+    ret ?w.s.types;
+}
+
 # set_watch_active: record that the client delivers
 # workspace/didChangeWatchedFiles for the registered manifest / lockfile /
 # source globs, so invalidation is event-driven and the per-request
@@ -1326,6 +1338,25 @@ pub fun record_decl_in(w: *Workspace, root: *Root, own: sess.ModuleId, own_a: *a
     val n: mtypes.Nominal = unwrap[mtypes.Nominal](no);
     if (n.origin == own) { ret record_site_from(own, n.decl, own_a, own_file); }
     ret record_decl(w, root, tid);
+}
+
+# record_site_at: a RecordSite for the rec / uni declaration `decl` in the active
+# buffer (`own` / `own_a` / `own_file`), or none when `decl` is not a rec / uni.
+# the buffer-side entry point for a cursor sitting on a field's own declaration
+# name: the decl is in the buffer being edited, so its Ast / file are the live
+# ones. the resulting site carries the buffer's own module id, the cross-module
+# identity every other module's references are matched against.
+# ---
+# w:        the workspace (unused, kept for signature symmetry with record_decl_in)
+# root:     the project root, or nil
+# own:      the buffer's own module id
+# own_a:    the buffer's live Ast
+# own_file: the buffer's SourceFile
+# decl:     the rec / uni DeclId in the buffer
+# ret:      some(RecordSite), or none
+pub fun record_site_at(w: *Workspace, root: *Root, own: sess.ModuleId, own_a: *ast.Ast, own_file: *src.SourceFile, decl: id.DeclId) Option[RecordSite] {
+    if (decl == id.DECL_NIL) { ret none[RecordSite](); }
+    ret record_site_from(own, decl, own_a, own_file);
 }
 
 # nominal_of_tid: the nominal back-link of `tid` against the session type interner,
