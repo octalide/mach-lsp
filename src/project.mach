@@ -217,6 +217,11 @@ pub rec Root {
 # load_epoch:   monotonic counter bumped on every successful root build, so the
 #               server can tell a feature request triggered a lazy load and
 #               re-publish diagnostics for the now-loaded buffers (#96)
+# sema_epoch:   monotonic counter bumped whenever a root's dep closure finishes
+#               sema (ensure_sema), so the server can tell a feature request
+#               triggered the lazy whole-closure typing and re-publish the open
+#               buffers WITH their semantic diagnostics — the type-diagnostics
+#               twin of load_epoch (#113)
 pub rec Workspace {
     s:            *sess.Session;
     es:           *editor.EditorSession;
@@ -229,6 +234,7 @@ pub rec Workspace {
     cache_len:    u32;
     gen_seq:      u32;
     load_epoch:   u32;
+    sema_epoch:   u32;
 }
 
 # init: construct an empty workspace over the server's sessions.
@@ -251,6 +257,7 @@ pub fun init(s: *sess.Session, es: *editor.EditorSession, alloc: *Allocator) Wor
     w.cache_len     = 0;
     w.gen_seq       = 1;
     w.load_epoch    = 0;
+    w.sema_epoch    = 0;
     ret w;
 }
 
@@ -312,6 +319,33 @@ pub fun set_watch_active(w: *Workspace, on: bool) {
 # ret: the current load epoch
 pub fun load_epoch(w: *Workspace) u32 {
     ret w.load_epoch;
+}
+
+# sema_epoch: the workspace's current sema epoch — a counter bumped whenever a
+# root's dep closure finishes typing (ensure_sema). the server snapshots it around
+# a feature request alongside the load epoch; a change means a type-aware feature
+# lazily sema'd a closure, so the open buffers it governs can be re-published with
+# their semantic diagnostics — which the load-free publish path could not produce
+# while the closure was still un-sema'd — without waiting for an edit (#113).
+# ---
+# w:   the workspace
+# ret: the current sema epoch
+pub fun sema_epoch(w: *Workspace) u32 {
+    ret w.sema_epoch;
+}
+
+# sema_ready: whether `root`'s loaded dep closure has already been sema'd, so its
+# retained per-module typing exists. a load-free check: it never triggers a build
+# or ensure_sema. the diagnostics publish path gates buffer sema on this — only on
+# a ready root is sema_doc cheap and correct (one module against retained dep
+# typing); a loaded-but-un-sema'd root publishes parse + resolve only, keeping
+# open/edit instant (#96). false for a nil, unloaded, or un-sema'd root.
+# ---
+# root: the candidate governing root, or nil
+# ret:  true when sema has run over root's current build
+pub fun sema_ready(root: *Root) bool {
+    if (root == nil) { ret false; }
+    ret root.loaded && root.sema_loaded;
 }
 
 # dnit: release the resolve cache and every loaded root.
@@ -1627,15 +1661,18 @@ fun free_deps(w: *Workspace, deps: *res.ResolveDeps) {
 # resolve is skipped, leaving a zeroed SemaResult that types to TYPE_NIL. the pass
 # is heavy (it walks the whole dep closure), so it runs only when a feature first
 # demands typing — never on the diagnostics publish hot path — and is cached until
-# the build reloads. allocation failure leaves the root un-sema'd (typing simply
-# stays unavailable) rather than aborting the request.
+# the build reloads. on completion it bumps the workspace sema epoch, the signal
+# the server uses to re-publish the open buffers with semantic diagnostics now
+# that the closure's retained typing exists (#113). allocation failure leaves the
+# root un-sema'd (typing simply stays unavailable, no epoch bump) rather than
+# aborting the request.
 # ---
 # w:    the workspace
 # root: the loaded root whose graph to type-check
 pub fun ensure_sema(w: *Workspace, root: *Root) {
     if (root == nil || !root.loaded || root.sema_loaded) { ret; }
     val n: u32 = root.p.module_len;
-    if (n == 0) { root.sema_loaded = true; ret; }
+    if (n == 0) { root.sema_loaded = true; w.sema_epoch = w.sema_epoch + 1; ret; }
 
     val arr_r: Result[*sema.SemaResult, str] = allocate[sema.SemaResult](w.alloc, n::usize);
     if (is_err[*sema.SemaResult, str](arr_r)) { ret; }
@@ -1661,6 +1698,7 @@ pub fun ensure_sema(w: *Workspace, root: *Root) {
 
     deallocate[bool](w.alloc, ready, n::usize);
     root.sema_loaded = true;
+    w.sema_epoch = w.sema_epoch + 1;
 }
 
 # run_module_sema: type-check one loaded module against the modules already sema'd
@@ -2004,4 +2042,33 @@ fun append(buf: *u8, offset: usize, s: str) usize {
     val n: usize = str_len(s);
     if (n > 0) { mem.raw_copy((buf::usize + offset)::ptr, s::ptr, n); }
     ret offset + n;
+}
+
+test "project: sema_ready is false for a nil root" {
+    if (sema_ready(nil)) { ret 1; }
+    ret 0;
+}
+
+test "project: sema_ready is false for a loaded but un-sema'd root" {
+    var r: Root;
+    r.loaded      = true;
+    r.sema_loaded = false;
+    if (sema_ready(?r)) { ret 1; }
+    ret 0;
+}
+
+test "project: sema_ready is false for an unloaded root even if sema_loaded" {
+    var r: Root;
+    r.loaded      = false;
+    r.sema_loaded = true;
+    if (sema_ready(?r)) { ret 1; }
+    ret 0;
+}
+
+test "project: sema_ready is true only when loaded and sema'd" {
+    var r: Root;
+    r.loaded      = true;
+    r.sema_loaded = true;
+    if (!sema_ready(?r)) { ret 1; }
+    ret 0;
 }

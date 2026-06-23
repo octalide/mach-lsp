@@ -352,9 +352,12 @@ fun handle_feature(srv: *Server, body: str, which: i64) {
     val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
 
     # a feature request resolves dep-aware via project.root_for, which loads the
-    # governing project lazily on first use. snapshot the load epoch so a load
-    # triggered here re-publishes the now-loaded buffers' diagnostics (#96).
+    # governing project lazily on first use; a type-aware feature additionally
+    # sema's the closure lazily (ensure_sema). snapshot both the load epoch and the
+    # sema epoch so a load (#96) or a first sema (#113) triggered here re-publishes
+    # the now-loaded / now-typed buffers' diagnostics.
     val epoch_before: u32 = project.load_epoch(?srv.ws);
+    val sema_before:  u32 = project.sema_epoch(?srv.ws);
 
     if (which == 0) { language.hover(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
     or (which == 1) { language.definition(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
@@ -366,16 +369,18 @@ fun handle_feature(srv: *Server, body: str, which: i64) {
 
     if (uri != nil) { json.free_str(uri, srv.alloc); }
 
-    if (project.load_epoch(?srv.ws) != epoch_before) { republish_loaded(srv); }
+    if (project.load_epoch(?srv.ws) != epoch_before || project.sema_epoch(?srv.ws) != sema_before) { republish_loaded(srv); }
 }
 
 # republish_loaded: re-publish diagnostics for every open document now governed
-# by a loaded project root. run after a feature request triggers a lazy load
-# (#96): the buffers under the freshly-loaded root were published parse-only on
-# open, so this upgrades them to dep-aware semantic diagnostics — including any
-# out-of-closure import the load now flags — without the user touching the file.
-# the publish path is load-free, so a buffer under no loaded root simply
-# re-publishes its parse-only diagnostics (unchanged), and nothing new is built.
+# by a loaded project root. run after a feature request triggers a lazy load (#96)
+# or the first whole-closure sema (#113): the buffers under the freshly-loaded root
+# were published parse-only on open, so a load upgrades them to dep-aware
+# resolution diagnostics — including any out-of-closure import the load now flags —
+# and a completed sema further layers their type diagnostics, all without the user
+# touching the file. the publish path is load-free, so a buffer under no loaded
+# root simply re-publishes its parse-only diagnostics (unchanged), and nothing new
+# is built.
 fun republish_loaded(srv: *Server) {
     val n: usize = documents.slot_count(?srv.docs);
     var i: usize = 0;
