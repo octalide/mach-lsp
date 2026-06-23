@@ -1,7 +1,0 @@
-# common: declares the pub symbol used by both the default-reachable entry and
-# the windows-only module, so references on it must reach both under the union.
-
-# shared: a value imported and used across the default and windows-only modules.
-pub fun shared() i64 {
-    ret 42;
-}

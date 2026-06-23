@@ -117,15 +117,34 @@ whole closure; incremental (per-module) rebuild is an upstream follow-up.
 
 ## Building
 
-The compiler and standard library are vendored under `dep/` as git dependencies.
-Build with a Mach compiler binary (v1.5.5 or newer):
+The compiler and standard library are vendored under `dep/` as git submodules
+and declared as git dependencies in `mach.toml`. Pull them, then build with the
+Mach toolchain:
 
 ```sh
-mach dep pull
-mach build .
+mach dep pull   # vendor dep/mach and dep/mach-std
+mach build .    # compile the server
 ```
 
 The server binary is produced at `out/linux/debug/bin/mls`.
+
+## Installing
+
+Copy the built binary onto your `PATH`:
+
+```sh
+install -Dm755 out/linux/debug/bin/mls ~/.local/bin/mls
+```
+
+Then point your editor's LSP client at `mls`; the server speaks the LSP base
+protocol over stdin/stdout.
+
+## Tracing
+
+The server speaks JSON-RPC on stdout, so it cannot log there. Set the
+`MLS_TRACE` environment variable (to any value) to append a JSON-RPC trace to
+`/tmp/mach-lsp.log`; leave it unset — the default — and the server performs no
+logging.
 
 ## How the compiler dependency is wired
 
@@ -149,50 +168,6 @@ and fetched by `mach dep pull`; both track `branch/main`.
 | `project` | per-root project graphs: route a document to its governing root, load each root's module graph, re-resolve a buffer against its root's dependency set, map a symbol to its declaring file's `file://` URI, expose a root's loaded modules for the use-site walk, and invalidate a root on a watched-file change |
 | `language` | hover / definition / references / rename / documentSymbol / completion request bodies |
 | `trace` | append-only debug trace log (`/tmp/mach-lsp.log`) |
-
-## Testing
-
-The stdio test suite under `test/` drives the built server with framed
-JSON-RPC. `test/harness.py` owns the protocol framing and the spawn helper;
-each scenario module asserts one surface:
-
-- `test_diagnostics.py` — broken buffer → diagnostics with ranges; clean
-  buffer → empty; `didChange`/`didClose` clear.
-- `test_features.py` — local features over a typed source: hover renders
-  signatures / types / doc comments, definition lands on the decl, references
-  finds decl + use-sites, rename emits a `WorkspaceEdit` (including a parameter
-  binding), documentSymbol lists the top-level decls, completion includes the
-  file's functions.
-- `test_crossmodule.py` — against `test/fixture` (which depends on the vendored
-  `mach-std`): definition / references / hover on a `use`d std symbol reach a
-  `file://` location inside `dep/mach-std`, a local symbol still resolves in the
-  buffer, and renaming a dependency symbol is refused (prepareRename null, empty
-  edit) — whether referenced cross-module, with the dependency source opened as
-  the buffer, or with the dependency source opened cold before any project
-  document.
-- `test_workspace.py` — against `test/fixture-ws`, a depless two-module project:
-  references on a `pub` symbol used across files returns use-sites in both
-  modules, and rename rewrites the declaration, the importer's `use` path leaf,
-  and every use-site across both files — invoked from either buffer. a
-  block-local binding shadowing a pub name renames buffer-local without touching
-  importers, and a pub declaration renamed by unsaved edits refuses (empty edit)
-  instead of emitting a partial rename.
-- `test_multiroot.py` — `test/fixture-ws` and `test/fixture` open in one
-  session: each cross-module definition lands in its own project's files, in
-  either open order, so the two roots resolve independently.
-- `test_invalidation.py` — a scratch copy of `test/fixture-ws`: editing a dep
-  source on disk and firing `workspace/didChangeWatchedFiles` (and, separately,
-  bumping the manifest mtime for the fallback path) makes the next definition
-  serve the shifted declaration line, proving the root's graph reloaded; a
-  broken manifest fixed on disk is retried rather than pinned failed.
-- `test_encoding.py` — a buffer with an em dash (3 UTF-8 bytes, 1 UTF-16 unit)
-  before a `g()` call: a definition request at the call's UTF-16 column resolves
-  it (inbound UTF-16→byte) and references reports the use-site at the UTF-16
-  column, not the byte column (outbound byte→UTF-16).
-
-```sh
-make test          # builds, then runs test/run.py
-```
 
 ## Deferred
 

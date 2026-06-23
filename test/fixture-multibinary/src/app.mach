@@ -1,8 +1,0 @@
-# app: the primary binary artifact (first declared, so the union's resolution
-# ctx). reaches core.shared directly but never toolonly, so toolonly sits outside
-# the primary artifact's closure.
-use mbfix.core.shared;
-
-fun main() i64 {
-    ret shared();
-}
