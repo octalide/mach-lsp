@@ -8,4 +8,4 @@ commit = "eb940a5b48020c18ac73464377d2ba5471241306"
 [deps.mach]
 url = "https://github.com/octalide/mach"
 ref = "branch/main"
-commit = "f3fe2037bcefd0aad1e00472fa6041fa531a0177"
+commit = "cd3cf02b49edaaa30d8047c678ce71df5b0a6932"
