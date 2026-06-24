@@ -1192,7 +1192,7 @@ pub fun site_of(w: *Workspace, root: *Root, own: sess.ModuleId, own_a: *ast.Ast,
     if (furi == nil) { ret none[Site](); }
 
     var s: Site;
-    s.a     = ?m.a;
+    s.a     = m.a;
     s.file  = unwrap[*src.SourceFile](fo);
     s.uri   = furi;
     s.owned = true;
@@ -1253,8 +1253,8 @@ pub fun module_view(w: *Workspace, root: *Root, mid: sess.ModuleId) Option[Modul
     val fo: Option[*src.SourceFile] = src.get(?w.s.sources, m.file_id);
     if (!is_some[*src.SourceFile](fo)) { ret none[ModuleView](); }
     var v: ModuleView;
-    v.a    = ?m.a;
-    v.rr   = ?m.resolve_result;
+    v.a    = m.a;
+    v.rr   = m.resolve_result;
     v.file = unwrap[*src.SourceFile](fo);
     ret some[ModuleView](v);
 }
@@ -1349,7 +1349,7 @@ pub fun record_decl(w: *Workspace, root: *Root, tid: type.TypeId) Option[RecordS
     if (m == nil) { ret none[RecordSite](); }
     val fo: Option[*src.SourceFile] = src.get(?w.s.sources, m.file_id);
     if (!is_some[*src.SourceFile](fo)) { ret none[RecordSite](); }
-    ret record_site_from(n.origin, n.decl, ?m.a, unwrap[*src.SourceFile](fo));
+    ret record_site_from(n.origin, n.decl, m.a, unwrap[*src.SourceFile](fo));
 }
 
 # record_decl_in: `record_decl` extended to resolve a record / union declared in
@@ -1717,7 +1717,7 @@ fun run_module_sema(w: *Workspace, root: *Root, mid: sess.ModuleId, ready: *bool
     var deps: sema.SemaDeps;
     if (!build_sema_deps(w, root, ready, ?deps)) { ret; }
 
-    val sr_r: Result[sema.SemaResult, str] = sema.sema(w.s, ?m.a, ?m.resolve_result, ?deps, ?m.ctx, mid);
+    val sr_r: Result[sema.SemaResult, str] = sema.sema(w.s, m.a, m.resolve_result, ?deps, ?m.ctx, mid);
     free_sema_deps(w, ?deps);
     if (is_err[sema.SemaResult, str](sr_r)) { ret; }
     root.sema[mid::u32] = unwrap_ok[sema.SemaResult, str](sr_r);
