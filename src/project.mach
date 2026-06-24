@@ -51,6 +51,23 @@
 # structurally unhittable — no entry survives its root's reload as a stale hit —
 # while a freed root's entries are evicted per-root rather than by clearing the
 # whole cache.
+#
+# incremental rebuild (lsp #117): the free-and-reload is not a from-scratch
+# rebuild. mach 2.5.7's driver is query-engine-driven, and the session query DB
+# (Q_PARSE / Q_RESOLVE / Q_EXPORTS) lives on `Workspace.s` and SURVIVES
+# `driver.dnit_project` — only the per-build `driver.Project` arrays are freed.
+# so the next `build_project_union` reuses every unchanged module's cached parse
+# and resolve and recomputes only the edited module plus the importers whose
+# public surface moved past the Q_EXPORTS firewall; an on-disk edit's cost is the
+# changed closure, not the whole graph. what is NOT yet possible is driving the
+# graph from a still-unsaved buffer's LIVE text (overriding the driver's per-module
+# disk read): the driver's `parse_module` unconditionally re-reads disk and
+# mirrors it into Q_FILE_TEXT, and the editor's buffers live in their own
+# (URI-keyed) FileId space disjoint from the project's (path-keyed) modules — so an
+# unsaved edit reaches an open buffer's own analysis but not its importers'. closing
+# that gap needs a driver-side source-overlay API the vendored driver does not yet
+# expose (tracked as a mach follow-up); until then a cross-module feature reflects an
+# edited dependency only once it is saved.
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -83,7 +100,8 @@ use fs:      std.filesystem;
 use pathlib: std.types.path;
 use toml:    std.data.toml;
 
-use mem: std.memory;
+use mem:  std.memory;
+use page: std.allocator.page;
 
 use sess:     mach.lang.session;
 use src:      mach.lang.source;
@@ -1192,7 +1210,7 @@ pub fun site_of(w: *Workspace, root: *Root, own: sess.ModuleId, own_a: *ast.Ast,
     if (furi == nil) { ret none[Site](); }
 
     var s: Site;
-    s.a     = ?m.a;
+    s.a     = m.a;
     s.file  = unwrap[*src.SourceFile](fo);
     s.uri   = furi;
     s.owned = true;
@@ -1253,8 +1271,8 @@ pub fun module_view(w: *Workspace, root: *Root, mid: sess.ModuleId) Option[Modul
     val fo: Option[*src.SourceFile] = src.get(?w.s.sources, m.file_id);
     if (!is_some[*src.SourceFile](fo)) { ret none[ModuleView](); }
     var v: ModuleView;
-    v.a    = ?m.a;
-    v.rr   = ?m.resolve_result;
+    v.a    = m.a;
+    v.rr   = m.resolve_result;
     v.file = unwrap[*src.SourceFile](fo);
     ret some[ModuleView](v);
 }
@@ -1349,7 +1367,7 @@ pub fun record_decl(w: *Workspace, root: *Root, tid: type.TypeId) Option[RecordS
     if (m == nil) { ret none[RecordSite](); }
     val fo: Option[*src.SourceFile] = src.get(?w.s.sources, m.file_id);
     if (!is_some[*src.SourceFile](fo)) { ret none[RecordSite](); }
-    ret record_site_from(n.origin, n.decl, ?m.a, unwrap[*src.SourceFile](fo));
+    ret record_site_from(n.origin, n.decl, m.a, unwrap[*src.SourceFile](fo));
 }
 
 # record_decl_in: `record_decl` extended to resolve a record / union declared in
@@ -1717,7 +1735,7 @@ fun run_module_sema(w: *Workspace, root: *Root, mid: sess.ModuleId, ready: *bool
     var deps: sema.SemaDeps;
     if (!build_sema_deps(w, root, ready, ?deps)) { ret; }
 
-    val sr_r: Result[sema.SemaResult, str] = sema.sema(w.s, ?m.a, ?m.resolve_result, ?deps, ?m.ctx, mid);
+    val sr_r: Result[sema.SemaResult, str] = sema.sema(w.s, m.a, m.resolve_result, ?deps, ?m.ctx, mid);
     free_sema_deps(w, ?deps);
     if (is_err[sema.SemaResult, str](sr_r)) { ret; }
     root.sema[mid::u32] = unwrap_ok[sema.SemaResult, str](sr_r);
@@ -2071,4 +2089,195 @@ test "project: sema_ready is true only when loaded and sema'd" {
     r.sema_loaded = true;
     if (!sema_ready(?r)) { ret 1; }
     ret 0;
+}
+
+# t_cat: concatenate two strings into a fresh nul-terminated owned buffer. a test
+# helper; the page allocator reclaims the leaked copies on dnit.
+fun t_cat(alloc: *Allocator, a: str, b: str) str {
+    val total: usize = str_len(a) + str_len(b);
+    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
+    if (is_err[*u8, str](r)) { ret nil; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+    var off: usize = 0;
+    off = append(buf, off, a);
+    off = append(buf, off, b);
+    buf[off] = 0;
+    ret buf::str;
+}
+
+# t_manifest: the scaffolded project's mach.toml (id "proj", host-resolved native
+# target), mirroring the three-target shape the driver's own union tests use.
+fun t_manifest() str {
+    ret "[project]\nid = \"proj\"\nname = \"p\"\nversion = \"0.0.0\"\nsrc = \"src\"\ntarget = \"native\"\nout = \"out/{target}/bin/{name}{ext}\"\n\n[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[target.windows]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\next = \".exe\"\n\n[target.linux-arm64]\nisa = \"aarch64\"\nos = \"linux\"\nabi = \"aapcs64\"\n\n[bin.proj]\nentry = \"main.mach\"\n";
+}
+
+# t_write: write `text` to `path` (test helper), true on success.
+fun t_write(path: str, text: str) bool {
+    if (path == nil) { ret false; }
+    ret !is_err[bool, str](fs.write_file(path, text, str_len(text), 420));
+}
+
+# t_scaffold: materialize a temp "proj" project (manifest + src/main,leaf,other) on
+# disk and return its owned root path, or nil. the caller removes the tree via
+# fs.remove_all. main imports both leaf and other; only leaf is edited by the test.
+fun t_scaffold(alloc: *Allocator, main_text: str, leaf_text: str) str {
+    val tf_r: Result[fs.TempFile, str] = fs.temp_create(alloc, "mls_inc_test");
+    if (is_err[fs.TempFile, str](tf_r)) { ret nil; }
+    var tf: fs.TempFile = unwrap_ok[fs.TempFile, str](tf_r);
+    val dup_r: Result[str, str] = strutil.str_dup(alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (is_err[str, str](dup_r)) { ret nil; }
+    val root: str = unwrap_ok[str, str](dup_r);
+
+    if (is_err[bool, str](fs.create_dir_all(alloc, root, 493))) { ret nil; }
+    val src_dir: str = t_cat(alloc, root, "/src");
+    if (src_dir == nil || is_err[bool, str](fs.create_dir_all(alloc, src_dir, 493))) { ret nil; }
+
+    if (!t_write(t_cat(alloc, root, "/mach.toml"), t_manifest())) { ret nil; }
+    if (!t_write(t_cat(alloc, src_dir, "/main.mach"), main_text)) { ret nil; }
+    if (!t_write(t_cat(alloc, src_dir, "/leaf.mach"), leaf_text)) { ret nil; }
+    if (!t_write(t_cat(alloc, src_dir, "/other.mach"), "pub fun fb() i32 { ret 2; }\n")) { ret nil; }
+    ret root;
+}
+
+# t_imported_decl: the DeclId (as u32) the buffer's resolve binds the imported symbol
+# named `name` to, or 0xFFFFFFFF when absent (test helper). cross-session safe: the
+# name is matched by interned text on `s`.
+fun t_imported_decl(s: *sess.Session, rr: *res.ResolveResult, name: str) u32 {
+    if (rr == nil) { ret 0xFFFFFFFF; }
+    var i: u32 = 0;
+    for (i < rr.symbol_count) {
+        if (rr.symbols[i].kind == res.SYM_IMPORTED) {
+            val no: Option[str] = intern.lookup(?s.interner, rr.symbols[i].name);
+            if (is_some[str](no) && str_equals(unwrap[str](no), name)) { ret rr.symbols[i].decl::u32; }
+        }
+        i = i + 1;
+    }
+    ret 0xFFFFFFFF;
+}
+
+# t_module_rr: the borrowed (query-DB-owned) ResolveResult handle of the loaded module
+# at `uri` in `root`, or nil (test helper). pointer identity across a reload proves the
+# module's Q_RESOLVE entry was reused.
+fun t_module_rr(w: *Workspace, root: *Root, uri: str) *res.ResolveResult {
+    val mo: Option[sess.ModuleId] = module_for_uri(w, root, uri);
+    if (is_none[sess.ModuleId](mo)) { ret nil; }
+    val mv: Option[ModuleView] = module_view(w, root, unwrap[sess.ModuleId](mo));
+    if (is_none[ModuleView](mv)) { ret nil; }
+    ret unwrap[ModuleView](mv).rr;
+}
+
+# t_buffer_fa_decl: open `main_text` at `main_uri` in a fresh workspace over `root`'s
+# on-disk graph and return the DeclId its `use proj.leaf.fa` binds to (test helper).
+# 0xFFFFFFFF on any failure. the from-scratch oracle the incremental result is checked
+# against.
+fun t_buffer_fa_decl(alloc: *Allocator, root: str, main_uri: str, main_text: str) u32 {
+    val srB: Result[sess.Session, str] = sess.init(alloc);
+    if (is_err[sess.Session, str](srB)) { ret 0xFFFFFFFF; }
+    var sB: sess.Session = unwrap_ok[sess.Session, str](srB);
+    var esB: editor.EditorSession = editor.init(?sB);
+    var wB: Workspace = init(?sB, ?esB, alloc);
+
+    var decl: u32 = 0xFFFFFFFF;
+    val fB_r: Result[src.FileId, str] = editor.open(?esB, main_uri, main_text);
+    if (!is_err[src.FileId, str](fB_r)) {
+        val fB: src.FileId = unwrap_ok[src.FileId, str](fB_r);
+        val rootB: *Root = root_for(?wB, main_uri);
+        if (rootB != nil) {
+            val rrB_r: Result[*res.ResolveResult, str] = resolve_doc(?wB, rootB, fB);
+            if (!is_err[*res.ResolveResult, str](rrB_r)) {
+                decl = t_imported_decl(?sB, unwrap_ok[*res.ResolveResult, str](rrB_r), "fa");
+            }
+        }
+    }
+
+    dnit(?wB);
+    editor.dnit(?esB);
+    sess.dnit(?sB);
+    ret decl;
+}
+
+test "project incremental: an on-disk dep edit reloads correctly (matches fresh) and reuses an unaffected module" {
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+
+    val main_text: str = "use proj.leaf.fa;\nuse proj.other.fb;\nfun main() i32 { ret fa() + fb(); }\n";
+    val leaf_v1:   str = "pub fun fa() i32 { ret 1; }\n";
+    # pub-surface change: prepend a new pub function, shifting fa's DeclId — a change
+    # the importer's binding genuinely depends on.
+    val leaf_v2:   str = "pub fun fz() i32 { ret 0; }\npub fun fa() i32 { ret 1; }\n";
+
+    val root: str = t_scaffold(?alloc, main_text, leaf_v1);
+    if (root == nil) { ret 1; }
+
+    val src_dir:   str = t_cat(?alloc, root, "/src");
+    val leaf_path: str = t_cat(?alloc, src_dir, "/leaf.mach");
+    val main_uri:  str = t_cat(?alloc, "file://", t_cat(?alloc, src_dir, "/main.mach"));
+    val leaf_uri:  str = t_cat(?alloc, "file://", leaf_path);
+    val other_uri: str = t_cat(?alloc, "file://", t_cat(?alloc, src_dir, "/other.mach"));
+
+    val srA: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](srA)) { fs.remove_all(?alloc, root); ret 1; }
+    var sA: sess.Session = unwrap_ok[sess.Session, str](srA);
+    var esA: editor.EditorSession = editor.init(?sA);
+    var wA: Workspace = init(?sA, ?esA, ?alloc);
+
+    var bad: i32 = 0;
+
+    # cold build: open main, load the project, resolve the buffer against the v1 graph.
+    val fA_r: Result[src.FileId, str] = editor.open(?esA, main_uri, main_text);
+    if (is_err[src.FileId, str](fA_r)) { bad = 1; }
+    or {
+        val fA: src.FileId = unwrap_ok[src.FileId, str](fA_r);
+        val rootA1: *Root = root_for(?wA, main_uri);
+        if (rootA1 == nil) { bad = 1; }
+        or {
+            val rrA1_r: Result[*res.ResolveResult, str] = resolve_doc(?wA, rootA1, fA);
+            if (is_err[*res.ResolveResult, str](rrA1_r)) { bad = 1; }
+            or {
+                val fa_decl_pre: u32 = t_imported_decl(?sA, unwrap_ok[*res.ResolveResult, str](rrA1_r), "fa");
+                # capture the query-DB resolve handles of the unaffected and edited modules.
+                val rr_other_1: *res.ResolveResult = t_module_rr(?wA, rootA1, other_uri);
+                val rr_leaf_1:  *res.ResolveResult = t_module_rr(?wA, rootA1, leaf_uri);
+                if (rr_other_1 == nil || rr_leaf_1 == nil) { bad = 1; }
+
+                # edit leaf's public surface on disk and invalidate the root.
+                if (!t_write(leaf_path, leaf_v2)) { bad = 1; }
+                invalidate_uri(?wA, leaf_uri);
+
+                # incremental reload + re-resolve the buffer against the v2 graph.
+                val rootA2: *Root = root_for(?wA, main_uri);
+                if (rootA2 == nil) { bad = 1; }
+                or {
+                    val rrA2_r: Result[*res.ResolveResult, str] = resolve_doc(?wA, rootA2, fA);
+                    if (is_err[*res.ResolveResult, str](rrA2_r)) { bad = 1; }
+                    or {
+                        val fa_decl_post: u32 = t_imported_decl(?sA, unwrap_ok[*res.ResolveResult, str](rrA2_r), "fa");
+                        val rr_other_2: *res.ResolveResult = t_module_rr(?wA, rootA2, other_uri);
+                        val rr_leaf_2:  *res.ResolveResult = t_module_rr(?wA, rootA2, leaf_uri);
+
+                        # reuse: the unaffected module kept its Q_RESOLVE handle; the
+                        # edited one was recomputed (a fresh handle).
+                        if (rr_other_2 != rr_other_1) { bad = 1; }
+                        if (rr_leaf_2 == nil || rr_leaf_2 == rr_leaf_1) { bad = 1; }
+
+                        # propagation: the buffer's binding tracked fa's shifted decl.
+                        if (fa_decl_post == fa_decl_pre) { bad = 1; }
+                        if (fa_decl_post == 0xFFFFFFFF) { bad = 1; }
+
+                        # correctness: the incrementally-reloaded result equals a
+                        # from-scratch workspace built over the final on-disk graph.
+                        val fa_decl_fresh: u32 = t_buffer_fa_decl(?alloc, root, main_uri, main_text);
+                        if (fa_decl_post != fa_decl_fresh) { bad = 1; }
+                    }
+                }
+            }
+        }
+    }
+
+    dnit(?wA);
+    editor.dnit(?esA);
+    sess.dnit(?sA);
+    fs.remove_all(?alloc, root);
+    ret bad;
 }
