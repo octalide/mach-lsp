@@ -1,6 +1,6 @@
 # mach-lsp
 
-A language server for the [Mach](https://github.com/octalide/mach) programming
+A language server for the [Mach](https://github.com/briar-systems/mach) programming
 language, built directly on the compiler-as-library editor surface
 (`mach.lang.editor`).
 
